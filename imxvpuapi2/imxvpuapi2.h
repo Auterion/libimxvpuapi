@@ -2090,7 +2090,8 @@ typedef enum
 	 * signal range. The valid Y, U, and V values will be 0-255. If
 	 * this is not set, restricted ranges are used: the Y range is
 	 * 16-235, the U and V ranges are 16-240. */
-	IMX_VPU_API_ENC_H264_OPEN_PARAMS_FLAG_FULL_VIDEO_RANGE = (1 << 10)
+	IMX_VPU_API_ENC_H264_OPEN_PARAMS_FLAG_FULL_VIDEO_RANGE = (1 << 10),
+	IMX_VPU_API_ENC_H26x_OPEN_PARAMS_FLAG_USE_HRD = (1 << 11)
 }
 ImxVpuApiEncH264OpenParamsFlags;
 
@@ -2254,8 +2255,12 @@ typedef struct
 	/* Bitwise OR combination of flags from ImxVpuApiEncOpenParamsFlags. */
 	uint32_t flags;
 
+	uint16_t hrd_buffer_size;
+
+	int8_t intra_qp_delta;
+
 	/* Reserved bytes for ABI compatibility. */
-	uint8_t reserved[IMX_VPU_API_RESERVED_SIZE - sizeof(unsigned int) - sizeof(int) - sizeof(uint32_t)];
+	uint8_t reserved[IMX_VPU_API_RESERVED_SIZE - sizeof(unsigned int) - sizeof(int) - sizeof(uint32_t) - sizeof(uint16_t) - sizeof(int8_t)];
 }
 ImxVpuApiEncOpenParams;
 

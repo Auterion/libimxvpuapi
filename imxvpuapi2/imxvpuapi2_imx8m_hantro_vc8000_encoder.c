@@ -351,6 +351,9 @@ void imx_vpu_api_enc_set_default_open_params(ImxVpuApiCompressionFormat compress
 	open_params->min_intra_refresh_mb_count = 0;
 	open_params->frame_rate_numerator = 25;
 	open_params->frame_rate_denominator = 1;
+	open_params->flags &= ~IMX_VPU_API_ENC_H26x_OPEN_PARAMS_FLAG_USE_HRD;
+	open_params->hrd_buffer_size = 1000;
+	open_params->intra_qp_delta = 0;
 
 	switch (compression_format)
 	{
@@ -839,7 +842,8 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_open(ImxVpuApiEncoder **encoder, ImxVpuA
 		/* Make sure that the very first picture is encoded as an IDR frame. */
 		encoder_input->bIsIDR = HANTRO_TRUE;
 		/* At least for h.264, the generated AUD appear to be broken. */
-		encoder_input->sendAUD = (open_params->compression_format == IMX_VPU_API_COMPRESSION_FORMAT_H264)
+		/* For h.265 it is broken too */
+		encoder_input->sendAUD = (open_params->compression_format == IMX_VPU_API_COMPRESSION_FORMAT_H264 || open_params->compression_format == IMX_VPU_API_COMPRESSION_FORMAT_H265)
 		                       ? 0
 		                       : open_params->format_specific_open_params.h265_open_params.enable_access_unit_delimiters;
 		/* -1 means "no special index", which fits as a default initial value. */
@@ -957,9 +961,10 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_open(ImxVpuApiEncoder **encoder, ImxVpuA
 		 * to the defaults of the encoder.) Only nonzero defaults are
 		 * assigned here; fields that are set to zero by default are
 		 * already zero due to the memset() call above. */
-		rate_control_config.hrdCpbSize = 1000000;
+		rate_control_config.hrd = !!(open_params->flags & IMX_VPU_API_ENC_H26x_OPEN_PARAMS_FLAG_USE_HRD);
+		rate_control_config.hrdCpbSize = open_params->hrd_buffer_size * 1000;
 		rate_control_config.bitrateWindow = open_params->gop_size;
-		rate_control_config.intraQpDelta = -5;
+		rate_control_config.intraQpDelta = open_params->intra_qp_delta;
 		rate_control_config.tolMovingBitRate = 2000;
 		rate_control_config.rcQpDeltaRange = 10;
 		rate_control_config.rcBaseMBComplexity = 15;

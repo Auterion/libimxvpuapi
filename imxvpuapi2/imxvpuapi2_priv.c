@@ -437,6 +437,35 @@ static H264LevelTableItem const h264_level_table[] = {
 };
 static int const h264_level_table_size = sizeof(h264_level_table) / sizeof(H264LevelTableItem);
 
+typedef struct
+{
+	ImxVpuApiH265Level level;
+	int max_macroblocks_per_second;
+	int max_num_macroblocks_per_frame;
+	/* bitrates are given in kbps */
+	int max_bitrate;
+}
+H265LevelTableItem;
+
+#define MBC(l) ((l) >> 8)
+
+/* The items in this table are found in the spec ISO/IEC 23008-2 Table A.8 */
+static H265LevelTableItem const h265_level_table[] = {
+	{ IMX_VPU_API_H265_LEVEL_1,   MBC(552960),     MBC(36864),    128    },
+	{ IMX_VPU_API_H265_LEVEL_2,   MBC(3686400),    MBC(122880),   1500   },
+	{ IMX_VPU_API_H265_LEVEL_2_1, MBC(7372800),    MBC(245760),   3000   },
+	{ IMX_VPU_API_H265_LEVEL_3,   MBC(16588800),   MBC(552960),   6000   },
+	{ IMX_VPU_API_H265_LEVEL_3_1, MBC(33177600),   MBC(983040),   10000	 },
+	{ IMX_VPU_API_H265_LEVEL_4,   MBC(66846720),   MBC(2228224),  12000  },
+	{ IMX_VPU_API_H265_LEVEL_4_1, MBC(133693440),  MBC(2228224),  20000  },
+	{ IMX_VPU_API_H265_LEVEL_5,   MBC(267386880),  MBC(8912896),  25000  },
+	{ IMX_VPU_API_H265_LEVEL_5_1, MBC(534773760),  MBC(8912896),  40000  },
+	{ IMX_VPU_API_H265_LEVEL_5_2, MBC(1069547520), MBC(8912896),  60000  },
+	{ IMX_VPU_API_H265_LEVEL_6,   MBC(1069547520), MBC(35651584), 60000  },
+	{ IMX_VPU_API_H265_LEVEL_6_1, MBC(2139095040), MBC(35651584), 120000 },
+	{ IMX_VPU_API_H265_LEVEL_6_2, MBC(4278190080), MBC(35651584), 240000 }
+};
+static int const h265_level_table_size = sizeof(h265_level_table) / sizeof(H265LevelTableItem);
 
 ImxVpuApiH264Level imx_vpu_api_estimate_max_h264_level(int width, int height, int bitrate, int fps_num, int fps_denom, ImxVpuApiH264Profile profile)
 {
@@ -481,5 +510,21 @@ ImxVpuApiH264Level imx_vpu_api_estimate_max_h264_level(int width, int height, in
 
 ImxVpuApiH265Level imx_vpu_api_estimate_max_h265_level(int width, int height, int bitrate, int fps_num, int fps_denom, ImxVpuApiH265Profile profile)
 {
-	// TODO
+	int num_mb_per_frame, num_mb_per_second;
+
+	/* One macroblock consists of 16 x 16 pixels */
+	num_mb_per_frame = MBC(width * height);
+	num_mb_per_second = num_mb_per_frame * fps_num / fps_denom;
+
+	for (int i = 0; i < h265_level_table_size; ++i)
+	{
+		H265LevelTableItem const *item = &(h265_level_table[i]);
+
+		if ((num_mb_per_frame <= item->max_num_macroblocks_per_frame) &&
+		    (num_mb_per_second <= item->max_macroblocks_per_second) &&
+		    (bitrate <= item->max_bitrate))
+			return item->level;
+	}
+
+	return IMX_VPU_API_H265_LEVEL_UNDEFINED;
 }
