@@ -237,6 +237,17 @@ struct _ImxVpuApiEncoder
 	 * ImxVpuApiEncEncodedFrame structure when getting the encoded
 	 * frame with imx_vpu_api_enc_get_encoded_frame(). */
 	size_t encoded_frame_data_size;
+
+	/* Rolling intra slice/tile refresh state (H.265 / VC8000E only).
+	 * num_rolling_slices = 0 means disabled; 1 = auto (4 slices); 2..16 = explicit count.
+	 * num_rolling_tiles  = 0 means disabled; 1 = auto (2x2 grid); 2..16 = explicit even count.
+	 *                      (arranged in 2 fixed columns, ceil(N/2) rows).
+	 * cached_coding_ctrl holds the VCEncCodingCtrl captured right after
+	 * the initial VCEncSetCodingCtrl call so that roiMapDeltaQpEnable is
+	 * correct for all subsequent mid-stream SetCodingCtrl calls. */
+	int num_rolling_slices;
+	int num_rolling_tiles;
+	VCEncCodingCtrl cached_coding_ctrl;
 };
 
 
@@ -776,6 +787,10 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_open(ImxVpuApiEncoder **encoder, ImxVpuA
 
 
 	/* Prepare the encoder input information that will be used by encode(). */
+	int num_rolling_slices = open_params->num_rolling_slices;
+	if (num_rolling_slices == 1) num_rolling_slices = 4; /* auto */
+	int num_rolling_tiles = open_params->num_rolling_tiles;
+	if (num_rolling_tiles == 1) num_rolling_tiles = 4; /* auto → 2×2 grid */
 
 	{
 		int i;
@@ -789,7 +804,9 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_open(ImxVpuApiEncoder **encoder, ImxVpuA
 		encoder_input->gopConfig.size = 1;
 		encoder_input->gopConfig.special_size = 0;
 		encoder_input->gopConfig.pGopPicSpecialCfg = gop_pic_special_config;
-		encoder_input->gopConfig.idr_interval = open_params->gop_size;
+		encoder_input->gopConfig.idr_interval = ((num_rolling_slices > 0) || (num_rolling_tiles > 0)) ? INT32_MAX : open_params->gop_size;
+		if (open_params->flags & IMX_VPU_API_ENC_OPEN_PARAMS_FLAG_USE_INTRA_REFRESH)
+			encoder_input->gopConfig.gdrDuration = open_params->gop_size;
 		encoder_input->gopConfig.firstPic = 0;
 		encoder_input->gopConfig.lastPic = INT32_MAX;
 		encoder_input->gopConfig.outputRateNumer = open_params->frame_rate_numerator;
@@ -883,6 +900,10 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_open(ImxVpuApiEncoder **encoder, ImxVpuA
 		                         || (open_params->format_specific_open_params.h264_open_params.profile != IMX_VPU_API_H264_PROFILE_BASELINE);
 		coding_config.cirStart = 0;
 		coding_config.cirInterval = open_params->min_intra_refresh_mb_count;
+		if (open_params->flags & IMX_VPU_API_ENC_OPEN_PARAMS_FLAG_USE_INTRA_REFRESH)
+			coding_config.gdrDuration = open_params->gop_size;
+		else
+			coding_config.gdrDuration = 0;
 
 		/* These are set to the defaults specified in hevcencapi.h */
 		coding_config.noiseLow = 10;
@@ -897,13 +918,33 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_open(ImxVpuApiEncoder **encoder, ImxVpuA
 		coding_config.RoiQpDelta_ver = 1;
 		coding_config.streamMultiSegmentAmount = 1;
 
+
+		if (num_rolling_slices > 0)
+		{
+			const int ctu_rows = ((int)(open_params->frame_height) + 63) / 64;
+			const int rows_per_slice = (ctu_rows + num_rolling_slices - 1) / num_rolling_slices;
+			coding_config.sliceSize = rows_per_slice;
+		}
+		else if (num_rolling_tiles > 0)
+		{
+			const int ctu_rows = ((int)(open_params->frame_height) + 63) / 64;
+			const int num_tile_rows = (num_rolling_tiles + 1) / 2; /* 2 columns per row */
+			const int rows_per_tile_row = (ctu_rows + num_tile_rows - 1) / num_tile_rows;
+			coding_config.sliceSize = rows_per_tile_row;
+		}
+
 		enc_ret = VCEncSetCodingCtrl((*encoder)->encoder, &coding_config);
 		if (enc_ret != VCENC_OK)
 		{
 			IMX_VPU_API_ERROR("could not set coding configuration: %s (%d)", vcenc_retval_to_string(enc_ret), (int)enc_ret);
 			goto cleanup_after_error;
 		}
+
+		VCEncGetCodingCtrl((*encoder)->encoder, &((*encoder)->cached_coding_ctrl));
+		(*encoder)->num_rolling_slices = num_rolling_slices;
+		(*encoder)->num_rolling_tiles = num_rolling_tiles;
 	}
+
 
 
 	/* Set up rate control. */
@@ -923,7 +964,8 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_open(ImxVpuApiEncoder **encoder, ImxVpuA
 		/* If rate control is disabled, use the quantization
 		 * value for the QP values. */
 		rate_control_config.qpHdr = use_rate_control ? -1 : ((int)(open_params->quantization));
-		rate_control_config.qpMinPB = rate_control_config.qpMinI = use_rate_control ? 0 : open_params->quantization;
+		rate_control_config.qpMinI = use_rate_control ? (int)open_params->qp_min_intra : (int)open_params->quantization;
+		rate_control_config.qpMinPB = use_rate_control ? (int)open_params->qp_min_inter : (int)open_params->quantization;
 		rate_control_config.qpMaxPB = rate_control_config.qpMaxI = use_rate_control ? 51 : open_params->quantization;
 		/* Set the bitrate, in bps. open_params->bitrate is given
 		 * in kbps, so a multiplication by 1000 is necessary. */
@@ -1198,8 +1240,18 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 	requested_frame_type = encoder->staged_raw_frame.frame_types[0];
 	if (is_first_picture)
 	{
-		IMX_VPU_API_DEBUG("encoding the first picture as IDR frame");
-		requested_frame_type = IMX_VPU_API_FRAME_TYPE_IDR;
+		BOOL use_refresh_mode = (encoder->num_rolling_slices > 0)
+		                     || (encoder->num_rolling_tiles  > 0);
+		if (use_refresh_mode)
+		{
+			IMX_VPU_API_DEBUG("refresh mode: no IDR — first picture encoded as non-IDR I-frame");
+			requested_frame_type = IMX_VPU_API_FRAME_TYPE_I;
+		}
+		else
+		{
+			IMX_VPU_API_DEBUG("encoding the first picture as IDR frame");
+			requested_frame_type = IMX_VPU_API_FRAME_TYPE_IDR;
+		}
 	}
 	else if (encoder->force_IDR_frame)
 	{
@@ -1234,6 +1286,14 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 		 * prepend the header data to the encoded IDR frame. This is
 		 * crucial for cases where a decoder receives the encoded signal
 		 * mid-stream, after the initial header data has been sent. */
+		encoder->has_header = TRUE;
+	}
+
+	if (!encoder->has_header && (encoder->num_encoded_pictures > 0) &&
+	    ((encoder->num_rolling_slices > 0) || (encoder->num_rolling_tiles > 0)) &&
+	    (encoder->open_params.gop_size > 0) &&
+	    (((int)(encoder->num_encoded_pictures) % (int)(encoder->open_params.gop_size)) == 0))
+	{
 		encoder->has_header = TRUE;
 	}
 
@@ -1302,6 +1362,99 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 		{
 			IMX_VPU_API_ERROR("could not set updated rate control configuration: %s (%d)", vcenc_retval_to_string(enc_ret), (int)enc_ret);
 			goto error;
+		}
+	}
+
+	if ((encoder->num_rolling_slices > 0) && !is_idr &&
+	    (encoder->open_params.compression_format == IMX_VPU_API_COMPRESSION_FORMAT_H265))
+	{
+		int gop_size    = (int)(encoder->open_params.gop_size);
+		int num_slices  = encoder->num_rolling_slices;
+		int frame_h     = (int)(encoder->open_params.frame_height);
+		int frame_w     = (int)(encoder->open_params.frame_width);
+		int ctu_rows    = (frame_h + 63) / 64;
+		int ctu_cols    = (frame_w + 63) / 64;
+		int rows_per_slice = (ctu_rows + num_slices - 1) / num_slices;
+		int gop_pos     = (int)(encoder->num_encoded_pictures) % gop_size;
+		int slice_idx   = -1;
+		int i;
+
+		for (i = 0; i < num_slices; i++)
+		{
+			if (gop_pos == (i * gop_size) / num_slices)
+			{
+				slice_idx = i;
+				break;
+			}
+		}
+
+		if (slice_idx >= 0)
+		{
+			int top = slice_idx * rows_per_slice;
+			int bottom = top + rows_per_slice - 1;
+			if (bottom >= ctu_rows) bottom = ctu_rows - 1;
+			encoder->cached_coding_ctrl.intraArea.enable = 1;
+			encoder->cached_coding_ctrl.intraArea.left   = 0;
+			encoder->cached_coding_ctrl.intraArea.right  = ctu_cols - 1;
+			encoder->cached_coding_ctrl.intraArea.top    = top;
+			encoder->cached_coding_ctrl.intraArea.bottom = bottom;
+			VCEncSetCodingCtrl(encoder->encoder, &(encoder->cached_coding_ctrl));
+		}
+		else if (encoder->cached_coding_ctrl.intraArea.enable)
+		{
+			encoder->cached_coding_ctrl.intraArea.enable = 0;
+			VCEncSetCodingCtrl(encoder->encoder, &(encoder->cached_coding_ctrl));
+		}
+	}
+
+	if ((encoder->num_rolling_tiles > 0) && !is_idr &&
+	    (encoder->open_params.compression_format == IMX_VPU_API_COMPRESSION_FORMAT_H265))
+	{
+		int gop_size      = (int)(encoder->open_params.gop_size);
+		int num_tiles     = encoder->num_rolling_tiles;
+		int frame_h       = (int)(encoder->open_params.frame_height);
+		int frame_w       = (int)(encoder->open_params.frame_width);
+		int ctu_rows      = (frame_h + 63) / 64;
+		int ctu_cols      = (frame_w + 63) / 64;
+		int num_tile_cols = 2;
+		int num_tile_rows = (num_tiles + num_tile_cols - 1) / num_tile_cols;
+		int ctu_cols_per_tile = ctu_cols / num_tile_cols;
+		int ctu_rows_per_tile = ctu_rows / num_tile_rows;
+		int gop_pos       = (int)(encoder->num_encoded_pictures) % gop_size;
+		int tile_idx      = -1;
+		int i;
+
+		for (i = 0; i < num_tiles; i++)
+		{
+			if (gop_pos == (i * gop_size) / num_tiles)
+			{
+				tile_idx = i;
+				break;
+			}
+		}
+
+		if (tile_idx >= 0)
+		{
+			int tile_col  = tile_idx % num_tile_cols;
+			int tile_row  = tile_idx / num_tile_cols;
+			int left      = tile_col * ctu_cols_per_tile;
+			int right     = left + ctu_cols_per_tile - 1;
+			int top       = tile_row * ctu_rows_per_tile;
+			int bottom    = top + ctu_rows_per_tile - 1;
+			/* Extend last column/row to cover any remainder from integer division. */
+			if (tile_col == num_tile_cols - 1) right  = ctu_cols - 1;
+			if (tile_row == num_tile_rows - 1) bottom = ctu_rows - 1;
+			encoder->cached_coding_ctrl.intraArea.enable = 1;
+			encoder->cached_coding_ctrl.intraArea.left   = left;
+			encoder->cached_coding_ctrl.intraArea.right  = right;
+			encoder->cached_coding_ctrl.intraArea.top    = top;
+			encoder->cached_coding_ctrl.intraArea.bottom = bottom;
+			VCEncSetCodingCtrl(encoder->encoder, &(encoder->cached_coding_ctrl));
+		}
+		else if (encoder->cached_coding_ctrl.intraArea.enable)
+		{
+			encoder->cached_coding_ctrl.intraArea.enable = 0;
+			VCEncSetCodingCtrl(encoder->encoder, &(encoder->cached_coding_ctrl));
 		}
 	}
 
@@ -1399,6 +1552,7 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_get_encoded_frame_ext(ImxVpuApiEncoder *
 
 	encoded_frame->data_size = encoder->encoded_frame_data_size;
 	encoded_frame->has_header = encoder->has_header;
+	encoded_frame->header_size = encoder->has_header ? encoder->header_data_size : 0;
 	encoded_frame->frame_type = encoder->encoded_frame_type;
 	encoded_frame->context = encoder->encoded_frame_context;
 	encoded_frame->pts = encoder->encoded_frame_pts;
@@ -1407,13 +1561,19 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_get_encoded_frame_ext(ImxVpuApiEncoder *
 
 	if (is_sync_point)
 	{
-		/* In h.264 and h.265, only IDR frames (not I frames) are valid sync points. */
+		/* In h.264 and h.265, IDR frames are sync points. Non-IDR I-frames
+		 * are also treated as sync points when they carry inline headers
+		 * (has_header=TRUE), which happens at stream start and after a
+		 * flush.  This allows refresh-mode streams (which begin with a
+		 * non-IDR I-frame instead of an IDR) to preroll correctly in
+		 * GStreamer and be used as valid decoder entry points. */
 
 		switch (encoder->encoded_frame_type)
 		{
 			case IMX_VPU_API_COMPRESSION_FORMAT_H264:
 			case IMX_VPU_API_COMPRESSION_FORMAT_H265:
-				*is_sync_point = (encoder->encoded_frame_type == IMX_VPU_API_FRAME_TYPE_IDR);
+				*is_sync_point = (encoder->encoded_frame_type == IMX_VPU_API_FRAME_TYPE_IDR)
+				              || (encoder->encoded_frame_type == IMX_VPU_API_FRAME_TYPE_I && encoder->has_header);
 				break;
 			default:
 				*is_sync_point = (encoder->encoded_frame_type == IMX_VPU_API_FRAME_TYPE_I);

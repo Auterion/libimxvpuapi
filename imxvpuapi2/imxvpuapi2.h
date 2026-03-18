@@ -440,6 +440,11 @@ typedef struct
 	/* Nonzero if header data was prepended to the encoded frame data. */
 	int has_header;
 
+	/* Size in bytes of the header data prepended to the encoded frame
+	 * (VPS/SPS/PPS for H.265, SPS/PPS for H.264). Zero if no header
+	 * was prepended (has_header == 0). */
+	size_t header_size;
+
 	/* Frame type (I, P, B, ..) of the encoded frame. Filled by the encoder.
 	 * Unused by the decoder. */
 	ImxVpuApiFrameType frame_type;
@@ -2259,8 +2264,26 @@ typedef struct
 
 	int8_t intra_qp_delta;
 
+	/* Number of horizontal slices for rolling intra refresh.
+	 * 0 = automatic (4 slices), 1 = disabled, 2..16 = actual slice count.
+	 * Only used for H.265 encoding on VC8000E. */
+	uint8_t num_rolling_slices;
+
+	/* Number of 2D tiles (arranged in 2 columns) for rolling intra tile refresh.
+	 * 0 = automatic (4 tiles = 2×2 grid), 1 = disabled, 2/4/6/.../16 = tile count (even).
+	 * Only used for H.265 encoding on VC8000E. Mutually exclusive with num_rolling_slices. */
+	uint8_t num_rolling_tiles;
+
+	/* Minimum QP value for intra (I/IDR) frames. 0 = let rate control decide.
+	 * Setting this to e.g. 27 caps the quality of IDR frames, reducing peak size ~30%. */
+	uint8_t qp_min_intra;
+
+	/* Minimum QP value for inter (P/B) frames. 0 = let rate control decide.
+	 * Setting this caps the quality of P/B frames, reducing peak size in GDR/rolling-slice modes. */
+	uint8_t qp_min_inter;
+
 	/* Reserved bytes for ABI compatibility. */
-	uint8_t reserved[IMX_VPU_API_RESERVED_SIZE - sizeof(unsigned int) - sizeof(int) - sizeof(uint32_t) - sizeof(uint16_t) - sizeof(int8_t)];
+	uint8_t reserved[IMX_VPU_API_RESERVED_SIZE - sizeof(unsigned int) - sizeof(int) - sizeof(uint32_t) - sizeof(uint16_t) - sizeof(int8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t)];
 }
 ImxVpuApiEncOpenParams;
 
