@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <inttypes.h>
 #include <math.h>
+#include <unistd.h>
 
 #include <imxdmabuffer/imxdmabuffer.h>
 
@@ -248,6 +249,10 @@ struct _ImxVpuApiEncoder
 	int num_rolling_slices;
 	int num_rolling_tiles;
 	VCEncCodingCtrl cached_coding_ctrl;
+
+	BOOL skipped_frame_available;
+	void *skipped_frame_context;
+	uint64_t skipped_frame_pts, skipped_frame_dts;
 };
 
 
@@ -386,6 +391,265 @@ void imx_vpu_api_enc_set_default_open_params(ImxVpuApiCompressionFormat compress
 }
 
 
+static void init_encoder_input(ImxVpuApiEncoder *encoder,
+                               int num_rolling_slices,
+                               int num_rolling_tiles)
+{
+	ImxVpuApiEncOpenParams *open_params = &encoder->open_params;
+	VCEncIn *encoder_input = &encoder->encoder_input;
+	int i;
+
+	memset(encoder_input, 0, sizeof(VCEncIn));
+
+	encoder_input->gopConfig.pGopPicCfg = &encoder->gop_pic_config[0];
+	encoder_input->gopConfig.size = 1;
+	encoder_input->gopConfig.special_size = 0;
+	encoder_input->gopConfig.pGopPicSpecialCfg = &encoder->gop_pic_special_config[0];
+	encoder_input->gopConfig.idr_interval = ((num_rolling_slices > 0) || (num_rolling_tiles > 0)) ? INT32_MAX : open_params->gop_size;
+	if (open_params->flags & IMX_VPU_API_ENC_OPEN_PARAMS_FLAG_USE_INTRA_REFRESH)
+		encoder_input->gopConfig.gdrDuration = open_params->gop_size;
+	encoder_input->gopConfig.firstPic = 0;
+	encoder_input->gopConfig.lastPic = INT32_MAX;
+	encoder_input->gopConfig.outputRateNumer = open_params->frame_rate_numerator;
+	encoder_input->gopConfig.outputRateDenom = open_params->frame_rate_denominator;
+	encoder_input->gopConfig.inputRateNumer = open_params->frame_rate_numerator;
+	encoder_input->gopConfig.inputRateDenom = open_params->frame_rate_denominator;
+	encoder_input->gopConfig.gopCfgOffset[0] = 0;
+
+	encoder_input->gopCurrPicConfig.codingType = FRAME_TYPE_RESERVED;
+	encoder_input->gopCurrPicConfig.numRefPics = NUMREFPICS_RESERVED;
+	encoder_input->gopCurrPicConfig.poc = -1;
+	encoder_input->gopCurrPicConfig.QpFactor = QPFACTOR_RESERVED;
+	encoder_input->gopCurrPicConfig.QpOffset = QPOFFSET_RESERVED;
+	encoder_input->gopCurrPicConfig.temporalId = TEMPORALID_RESERVED;
+	for (i = 0; i < VCENC_MAX_REF_FRAMES; ++i)
+	{
+		encoder_input->gopCurrPicConfig.refPics[i].ref_pic = -1;
+		encoder_input->gopCurrPicConfig.refPics[i].used_by_cur = 0;
+	}
+
+	encoder_input->bIsPeriodUsingLTR = HANTRO_TRUE;
+	encoder_input->bIsPeriodUpdateLTR = HANTRO_TRUE;
+	for (i = 0; i < VCENC_MAX_LT_REF_FRAMES; ++i)
+		encoder_input->long_term_ref_pic[i] = -1;
+
+	encoder_input->vui_timing_info_enable = 1;
+	encoder_input->poc = 0;
+	encoder_input->gopSize = 1;
+	encoder_input->picture_cnt = 0;
+	encoder_input->last_idr_picture_cnt = 0;
+	encoder_input->bIsIDR = HANTRO_TRUE;
+	encoder_input->sendAUD = (open_params->compression_format == IMX_VPU_API_COMPRESSION_FORMAT_H264 || open_params->compression_format == IMX_VPU_API_COMPRESSION_FORMAT_H265)
+	                      ? 0
+	                      : open_params->format_specific_open_params.h265_open_params.enable_access_unit_delimiters;
+	encoder_input->i8SpecialRpsIdx = -1;
+
+	encoder_input->pOutBuf[1] = NULL;
+	encoder_input->busOutBuf[1] = 0;
+	encoder_input->outBufSize[1] = 0;
+}
+
+
+static ImxVpuApiEncReturnCodes init_vcenc_instance(ImxVpuApiEncoder *encoder,
+                                                   VCEncPictureType encoder_pixel_format,
+                                                   ImxVpuApiFramebufferMetrics const *fb_metrics,
+                                                   int num_rolling_slices,
+                                                   int num_rolling_tiles)
+{
+	ImxVpuApiEncOpenParams *open_params = &encoder->open_params;
+	VCEncConfig *encoder_config = &encoder->encoder_config;
+	VCEncRet enc_ret;
+
+	/* Initialize the actual encoder. */
+	enc_ret = VCEncInit(encoder_config, &encoder->encoder);
+	if (enc_ret != VCENC_OK)
+	{
+		IMX_VPU_API_ERROR("could not initialize encoder: %s (%d)", vcenc_retval_to_string(enc_ret), (int)enc_ret);
+		encoder->encoder = NULL;
+		return IMX_VPU_API_ENC_RETURN_CODE_ERROR;
+	}
+
+	/* Set up the encoder's coding configuration. */
+	{
+		VCEncCodingCtrl coding_config;
+		memset(&coding_config, 0, sizeof(coding_config));
+
+		/* Use the full 0..255 range for RGB -> YUV color space conversions.
+		 * Otherwise, the encoder assumes that the range is 16..235 for Y
+		 * and 16..240 for U and V. */
+		coding_config.videoFullRange = imx_vpu_api_is_color_format_rgb(open_params->color_format) ? 1 : 0;
+		/* Enable the sample adaptive offset (SAO) filter. */
+		coding_config.enableSao = 1;
+		/* h.264 baseline profile uses CAVLC instead of CABAC. */
+		coding_config.enableCabac = (open_params->compression_format != IMX_VPU_API_COMPRESSION_FORMAT_H264)
+		                         || (open_params->format_specific_open_params.h264_open_params.profile != IMX_VPU_API_H264_PROFILE_BASELINE);
+		coding_config.cirStart = 0;
+		coding_config.cirInterval = open_params->min_intra_refresh_mb_count;
+		if (open_params->flags & IMX_VPU_API_ENC_OPEN_PARAMS_FLAG_USE_INTRA_REFRESH)
+			coding_config.gdrDuration = open_params->gop_size;
+		else
+			coding_config.gdrDuration = 0;
+
+		/* These are set to the defaults specified in hevcencapi.h */
+		coding_config.noiseLow = 10;
+		coding_config.firstFrameSigma = 11;
+		/* Set these to what VCEncGetCodingCtrl() returns when called
+		 * right after opening the encoder. (In other words, set these
+		 * to the defaults of the encoder.) Only nonzero defaults are
+		 * assigned here; fields that are set to zero by default are
+		 * already zero due to the memset() call above. */
+		coding_config.tc_Offset = -2;
+		coding_config.beta_Offset = 5;
+		coding_config.RoiQpDelta_ver = 1;
+		coding_config.streamMultiSegmentAmount = 1;
+
+
+		if (num_rolling_slices > 0)
+		{
+			const int ctu_rows = ((int)(open_params->frame_height) + 63) / 64;
+			const int rows_per_slice = (ctu_rows + num_rolling_slices - 1) / num_rolling_slices;
+			coding_config.sliceSize = rows_per_slice;
+		}
+		else if (num_rolling_tiles > 0)
+		{
+			const int ctu_rows = ((int)(open_params->frame_height) + 63) / 64;
+			const int num_tile_rows = (num_rolling_tiles + 1) / 2; /* 2 columns per row */
+			const int rows_per_tile_row = (ctu_rows + num_tile_rows - 1) / num_tile_rows;
+			coding_config.sliceSize = rows_per_tile_row;
+		}
+
+		enc_ret = VCEncSetCodingCtrl(encoder->encoder, &coding_config);
+		if (enc_ret != VCENC_OK)
+		{
+			IMX_VPU_API_ERROR("could not set coding configuration: %s (%d)", vcenc_retval_to_string(enc_ret), (int)enc_ret);
+			VCEncRelease(encoder->encoder);
+			encoder->encoder = NULL;
+			return IMX_VPU_API_ENC_RETURN_CODE_ERROR;
+		}
+
+		VCEncGetCodingCtrl(encoder->encoder, &encoder->cached_coding_ctrl);
+		encoder->num_rolling_slices = num_rolling_slices;
+		encoder->num_rolling_tiles = num_rolling_tiles;
+	}
+
+
+
+	/* Set up rate control. */
+
+	{
+		VCEncRateCtrl rate_control_config;
+		memset(&rate_control_config, 0, sizeof(rate_control_config));
+		BOOL use_rate_control = (open_params->bitrate != 0);
+
+		if (use_rate_control)
+			IMX_VPU_API_INFO("using constant bitrate encoding with bitrate set to %u kbps", open_params->bitrate);
+		else
+			IMX_VPU_API_INFO("using constant quality encoding with quantization set to %u", open_params->quantization);
+
+		/* Enable rate control if a bitrate is given. */
+		rate_control_config.pictureRc = use_rate_control ? 1 : 0;
+		/* If rate control is disabled, use the quantization
+		 * value for the QP values. */
+		rate_control_config.qpHdr = use_rate_control ? -1 : ((int)(open_params->quantization));
+		rate_control_config.qpMinI = use_rate_control ? (int)open_params->qp_min_intra : (int)open_params->quantization;
+		rate_control_config.qpMinPB = use_rate_control ? (int)open_params->qp_min_inter : (int)open_params->quantization;
+		rate_control_config.qpMaxPB = rate_control_config.qpMaxI = use_rate_control ? 51 : open_params->quantization;
+		/* Set the bitrate, in bps. open_params->bitrate is given
+		 * in kbps, so a multiplication by 1000 is necessary. */
+		rate_control_config.bitPerSecond = open_params->bitrate * 1000;
+		/* Number of frames to monitor for a moving bitrate. Use
+		 * a timespan of one second. Since this is an integer,
+		 * we must convert the fps numerator/denominator
+		 * fraction and round it up. */
+		rate_control_config.monitorFrames = (open_params->frame_rate_numerator + open_params->frame_rate_denominator - 1) / open_params->frame_rate_denominator;
+		/* Enforce a minimum of 5 frames to monitor, otherwise
+		 * rate control may produce garbage. */
+		if (rate_control_config.monitorFrames < 5)
+			rate_control_config.monitorFrames = 5;
+		/* Enable VBR only if bitrate based rate control is not being used. */
+		rate_control_config.vbr = use_rate_control ? 0 : 1;
+
+		/* These defaults were taken from NXP's imx-vpuwrap library. */
+		rate_control_config.bitVarRangeI = 10000;
+		rate_control_config.bitVarRangeP = 10000;
+		rate_control_config.bitVarRangeB = 10000;
+		rate_control_config.u32StaticSceneIbitPercent = 80;
+		if (open_params->compression_format == IMX_VPU_API_COMPRESSION_FORMAT_H264)
+		{
+			rate_control_config.blockRCSize = 2;
+			rate_control_config.ctbRcRowQpStep = 4;
+		}
+		else
+		{
+			rate_control_config.blockRCSize = 0;
+			rate_control_config.ctbRcRowQpStep = 16;
+		}
+
+		/* Set these to what VCEncGetRateCtrl() returns when called
+		 * right after opening the encoder. (In other words, set these
+		 * to the defaults of the encoder.) Only nonzero defaults are
+		 * assigned here; fields that are set to zero by default are
+		 * already zero due to the memset() call above. */
+		rate_control_config.hrd = !!(open_params->flags & IMX_VPU_API_ENC_H26x_OPEN_PARAMS_FLAG_USE_HRD);
+		rate_control_config.hrdCpbSize = open_params->hrd_buffer_size * 1000;
+		rate_control_config.bitrateWindow = open_params->gop_size;
+		rate_control_config.intraQpDelta = open_params->intra_qp_delta;
+		rate_control_config.tolMovingBitRate = 2000;
+		rate_control_config.rcQpDeltaRange = 10;
+		rate_control_config.rcBaseMBComplexity = 15;
+		rate_control_config.picQpDeltaMin = -2;
+		rate_control_config.picQpDeltaMax = +3;
+		rate_control_config.tolCtbRcIntra = -1;
+
+		enc_ret = VCEncSetRateCtrl(encoder->encoder, &rate_control_config);
+		if (enc_ret != VCENC_OK)
+		{
+			IMX_VPU_API_ERROR("could not set rate control configuration: %s (%d)", vcenc_retval_to_string(enc_ret), (int)enc_ret);
+			VCEncRelease(encoder->encoder);
+			encoder->encoder = NULL;
+			return IMX_VPU_API_ENC_RETURN_CODE_ERROR;
+		}
+	}
+
+
+	/* Set up preprocessing configuration. */
+
+	{
+		VCEncPreProcessingCfg preprocessing_config;
+		memset(&preprocessing_config, 0, sizeof(preprocessing_config));
+
+		preprocessing_config.origWidth = fb_metrics->aligned_frame_width;
+		preprocessing_config.origHeight = fb_metrics->aligned_frame_height;
+		preprocessing_config.xOffset = 0;
+		preprocessing_config.yOffset = 0;
+		preprocessing_config.inputType = encoder_pixel_format;
+		preprocessing_config.rotation = VCENC_ROTATE_0;
+		preprocessing_config.mirror = VCENC_MIRROR_NO;
+		preprocessing_config.colorConversion.type = VCENC_RGBTOYUV_BT601_FULL_RANGE;
+		preprocessing_config.input_alignment = INPUT_ALIGNMENT;
+
+		/* Set these to what VCEncGetPreProcessing() returns when called
+		 * right after opening the encoder. (In other words, set these
+		 * to the defaults of the encoder.) Only nonzero defaults are
+		 * assigned here; fields that are set to zero by default are
+		 * already zero due to the memset() call above. */
+		preprocessing_config.constCb = 128;
+		preprocessing_config.constCr = 128;
+
+		enc_ret = VCEncSetPreProcessing(encoder->encoder, &preprocessing_config);
+		if (enc_ret != VCENC_OK)
+		{
+			IMX_VPU_API_ERROR("could not set preprocessing configuration: %s (%d)", vcenc_retval_to_string(enc_ret), (int)enc_ret);
+			VCEncRelease(encoder->encoder);
+			encoder->encoder = NULL;
+			return IMX_VPU_API_ENC_RETURN_CODE_ERROR;
+		}
+	}
+
+	return IMX_VPU_API_ENC_RETURN_CODE_OK;
+}
+
+
 ImxVpuApiEncReturnCodes imx_vpu_api_enc_open(ImxVpuApiEncoder **encoder, ImxVpuApiEncOpenParams *open_params, ImxDmaBuffer *stream_buffer)
 {
 	int err;
@@ -396,7 +660,6 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_open(ImxVpuApiEncoder **encoder, ImxVpuA
 	VCEncGopPicConfig *gop_pic_config;
 	VCEncGopPicSpecialConfig *gop_pic_special_config;
 	VCEncPictureType encoder_pixel_format;
-	VCEncRet enc_ret;
 	size_t stream_buffer_size;
 
 	assert(encoder != NULL);
@@ -792,268 +1055,11 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_open(ImxVpuApiEncoder **encoder, ImxVpuA
 	int num_rolling_tiles = open_params->num_rolling_tiles;
 	if (num_rolling_tiles == 1) num_rolling_tiles = 4; /* auto → 2×2 grid */
 
-	{
-		int i;
+	init_encoder_input(*encoder, num_rolling_slices, num_rolling_tiles);
 
-		VCEncIn *encoder_input = &((*encoder)->encoder_input);
-		memset(encoder_input, 0, sizeof(VCEncIn));
-
-		/* GOP configuration for 1 intra and 1 predicted frame.
-		 * See the explanation at the top for more details. */
-		encoder_input->gopConfig.pGopPicCfg = gop_pic_config;
-		encoder_input->gopConfig.size = 1;
-		encoder_input->gopConfig.special_size = 0;
-		encoder_input->gopConfig.pGopPicSpecialCfg = gop_pic_special_config;
-		encoder_input->gopConfig.idr_interval = ((num_rolling_slices > 0) || (num_rolling_tiles > 0)) ? INT32_MAX : open_params->gop_size;
-		if (open_params->flags & IMX_VPU_API_ENC_OPEN_PARAMS_FLAG_USE_INTRA_REFRESH)
-			encoder_input->gopConfig.gdrDuration = open_params->gop_size;
-		encoder_input->gopConfig.firstPic = 0;
-		encoder_input->gopConfig.lastPic = INT32_MAX;
-		encoder_input->gopConfig.outputRateNumer = open_params->frame_rate_numerator;
-		encoder_input->gopConfig.outputRateDenom = open_params->frame_rate_denominator;
-		encoder_input->gopConfig.inputRateNumer = open_params->frame_rate_numerator;
-		encoder_input->gopConfig.inputRateDenom = open_params->frame_rate_denominator;
-		encoder_input->gopConfig.gopCfgOffset[0] = 0;
-
-		/* Fill the gopCurrPicConfig structure with default starting values.
-		 * The encoder will automatically populate it with updated values
-		 * as it encodes pictures. */
-		encoder_input->gopCurrPicConfig.codingType = FRAME_TYPE_RESERVED;
-		encoder_input->gopCurrPicConfig.numRefPics = NUMREFPICS_RESERVED;
-		encoder_input->gopCurrPicConfig.poc = -1;
-		encoder_input->gopCurrPicConfig.QpFactor = QPFACTOR_RESERVED;
-		encoder_input->gopCurrPicConfig.QpOffset = QPOFFSET_RESERVED;
-		encoder_input->gopCurrPicConfig.temporalId = TEMPORALID_RESERVED;
-		for (i = 0; i < VCENC_MAX_REF_FRAMES; ++i)
-		{
-			encoder_input->gopCurrPicConfig.refPics[i].ref_pic = -1;
-			encoder_input->gopCurrPicConfig.refPics[i].used_by_cur = 0;
-		}
-
-		/* Fill LTR states.
-		 * Long-Term Reference (LTR) frames are a h.264 and h.265 feature. These
-		 * are reference frames that can be saved and referenced until they are
-		 * explicitly removed by the caller. Configure the encoder to periodically
-		 * use and update the LTR frame. */
-		encoder_input->bIsPeriodUsingLTR = HANTRO_TRUE;
-		encoder_input->bIsPeriodUpdateLTR = HANTRO_TRUE;
-		for (i = 0; i < VCENC_MAX_LT_REF_FRAMES; ++i)
-			encoder_input->long_term_ref_pic[i] = -1;
-
-		/* Set all the other parameters. */
-
-		/* Add Video Usability Information (VUI), specifically timing information,
-		 * to the bitstream. It will be inserted into the SPS data. */
-		encoder_input->vui_timing_info_enable = 1;
-		/* Set the initial POC value to 0. The encoder will automatically
-		 * increment it after each frame encoding. */
-		encoder_input->poc = 0;
-		/* See the explanation at the top for the reason why this is set to 1. */
-		encoder_input->gopSize = 1;
-		/* Encoded picture count. This is used here for detecting the very first
-		 * picture and for assigning values to last_idr_picture_cnt (when a picture
-		 * is encoded as IDR), which means that IDR generation depends on this.
-		 * Its value in turn is set to the value of num_encoded_pictures. */
-		encoder_input->picture_cnt = 0;
-		encoder_input->last_idr_picture_cnt = 0;
-		/* Make sure that the very first picture is encoded as an IDR frame. */
-		encoder_input->bIsIDR = HANTRO_TRUE;
-		/* At least for h.264, the generated AUD appear to be broken. */
-		/* For h.265 it is broken too */
-		encoder_input->sendAUD = (open_params->compression_format == IMX_VPU_API_COMPRESSION_FORMAT_H264 || open_params->compression_format == IMX_VPU_API_COMPRESSION_FORMAT_H265)
-		                       ? 0
-		                       : open_params->format_specific_open_params.h265_open_params.enable_access_unit_delimiters;
-		/* -1 means "no special index", which fits as a default initial value. */
-		encoder_input->i8SpecialRpsIdx = -1;
-
-		/* The VC8000E driver does not support two-stream buffers. */
-		encoder_input->pOutBuf[1] = NULL;
-		encoder_input->busOutBuf[1] = 0;
-		encoder_input->outBufSize[1] = 0;
-	}
-
-
-	/* Initialize the actual encoder. */
-
-	enc_ret = VCEncInit(encoder_config, &((*encoder)->encoder));
-	if (enc_ret != VCENC_OK)
-	{
-		IMX_VPU_API_ERROR("could not initialize encoder: %s (%d)", vcenc_retval_to_string(enc_ret), (int)enc_ret);
+	ret = init_vcenc_instance(*encoder, encoder_pixel_format, fb_metrics, num_rolling_slices, num_rolling_tiles);
+	if (ret != IMX_VPU_API_ENC_RETURN_CODE_OK)
 		goto cleanup_after_error;
-	}
-
-
-	/* Set up the encoder's coding configuration. */
-
-	{
-		VCEncCodingCtrl coding_config;
-		memset(&coding_config, 0, sizeof(coding_config));
-
-		/* Use the full 0..255 range for RGB -> YUV color space conversions.
-		 * Otherwise, the encoder assumes that the range is 16..235 for Y
-		 * and 16..240 for U and V. */
-		coding_config.videoFullRange = imx_vpu_api_is_color_format_rgb(open_params->color_format) ? 1 : 0;
-		/* Enable the sample adaptive offset (SAO) filter. */
-		coding_config.enableSao = 1;
-		/* h.264 baseline profile uses CAVLC instead of CABAC. */
-		coding_config.enableCabac = (open_params->compression_format != IMX_VPU_API_COMPRESSION_FORMAT_H264)
-		                         || (open_params->format_specific_open_params.h264_open_params.profile != IMX_VPU_API_H264_PROFILE_BASELINE);
-		coding_config.cirStart = 0;
-		coding_config.cirInterval = open_params->min_intra_refresh_mb_count;
-		if (open_params->flags & IMX_VPU_API_ENC_OPEN_PARAMS_FLAG_USE_INTRA_REFRESH)
-			coding_config.gdrDuration = open_params->gop_size;
-		else
-			coding_config.gdrDuration = 0;
-
-		/* These are set to the defaults specified in hevcencapi.h */
-		coding_config.noiseLow = 10;
-		coding_config.firstFrameSigma = 11;
-		/* Set these to what VCEncGetCodingCtrl() returns when called
-		 * right after opening the encoder. (In other words, set these
-		 * to the defaults of the encoder.) Only nonzero defaults are
-		 * assigned here; fields that are set to zero by default are
-		 * already zero due to the memset() call above. */
-		coding_config.tc_Offset = -2;
-		coding_config.beta_Offset = 5;
-		coding_config.RoiQpDelta_ver = 1;
-		coding_config.streamMultiSegmentAmount = 1;
-
-
-		if (num_rolling_slices > 0)
-		{
-			const int ctu_rows = ((int)(open_params->frame_height) + 63) / 64;
-			const int rows_per_slice = (ctu_rows + num_rolling_slices - 1) / num_rolling_slices;
-			coding_config.sliceSize = rows_per_slice;
-		}
-		else if (num_rolling_tiles > 0)
-		{
-			const int ctu_rows = ((int)(open_params->frame_height) + 63) / 64;
-			const int num_tile_rows = (num_rolling_tiles + 1) / 2; /* 2 columns per row */
-			const int rows_per_tile_row = (ctu_rows + num_tile_rows - 1) / num_tile_rows;
-			coding_config.sliceSize = rows_per_tile_row;
-		}
-
-		enc_ret = VCEncSetCodingCtrl((*encoder)->encoder, &coding_config);
-		if (enc_ret != VCENC_OK)
-		{
-			IMX_VPU_API_ERROR("could not set coding configuration: %s (%d)", vcenc_retval_to_string(enc_ret), (int)enc_ret);
-			goto cleanup_after_error;
-		}
-
-		VCEncGetCodingCtrl((*encoder)->encoder, &((*encoder)->cached_coding_ctrl));
-		(*encoder)->num_rolling_slices = num_rolling_slices;
-		(*encoder)->num_rolling_tiles = num_rolling_tiles;
-	}
-
-
-
-	/* Set up rate control. */
-
-	{
-		VCEncRateCtrl rate_control_config;
-		memset(&rate_control_config, 0, sizeof(rate_control_config));
-		BOOL use_rate_control = (open_params->bitrate != 0);
-
-		if (use_rate_control)
-			IMX_VPU_API_INFO("using constant bitrate encoding with bitrate set to %u kbps", open_params->bitrate);
-		else
-			IMX_VPU_API_INFO("using constant quality encoding with quantization set to %u", open_params->quantization);
-
-		/* Enable rate control if a bitrate is given. */
-		rate_control_config.pictureRc = use_rate_control ? 1 : 0;
-		/* If rate control is disabled, use the quantization
-		 * value for the QP values. */
-		rate_control_config.qpHdr = use_rate_control ? -1 : ((int)(open_params->quantization));
-		rate_control_config.qpMinI = use_rate_control ? (int)open_params->qp_min_intra : (int)open_params->quantization;
-		rate_control_config.qpMinPB = use_rate_control ? (int)open_params->qp_min_inter : (int)open_params->quantization;
-		rate_control_config.qpMaxPB = rate_control_config.qpMaxI = use_rate_control ? 51 : open_params->quantization;
-		/* Set the bitrate, in bps. open_params->bitrate is given
-		 * in kbps, so a multiplication by 1000 is necessary. */
-		rate_control_config.bitPerSecond = open_params->bitrate * 1000;
-		/* Number of frames to monitor for a moving bitrate. Use
-		 * a timespan of one second. Since this is an integer,
-		 * we must convert the fps numerator/denominator
-		 * fraction and round it up. */
-		rate_control_config.monitorFrames = (open_params->frame_rate_numerator + open_params->frame_rate_denominator - 1) / open_params->frame_rate_denominator;
-		/* Enforce a minimum of 5 frames to monitor, otherwise
-		 * rate control may produce garbage. */
-		if (rate_control_config.monitorFrames < 5)
-			rate_control_config.monitorFrames = 5;
-		/* Enable VBR only if bitrate based rate control is not being used. */
-		rate_control_config.vbr = use_rate_control ? 0 : 1;
-
-		/* These defaults were taken from NXP's imx-vpuwrap library. */
-		rate_control_config.bitVarRangeI = 10000;
-		rate_control_config.bitVarRangeP = 10000;
-		rate_control_config.bitVarRangeB = 10000;
-		rate_control_config.u32StaticSceneIbitPercent = 80;
-		if (open_params->compression_format == IMX_VPU_API_COMPRESSION_FORMAT_H264)
-		{
-			rate_control_config.blockRCSize = 2;
-			rate_control_config.ctbRcRowQpStep = 4;
-		}
-		else
-		{
-			rate_control_config.blockRCSize = 0;
-			rate_control_config.ctbRcRowQpStep = 16;
-		}
-
-		/* Set these to what VCEncGetRateCtrl() returns when called
-		 * right after opening the encoder. (In other words, set these
-		 * to the defaults of the encoder.) Only nonzero defaults are
-		 * assigned here; fields that are set to zero by default are
-		 * already zero due to the memset() call above. */
-		rate_control_config.hrd = !!(open_params->flags & IMX_VPU_API_ENC_H26x_OPEN_PARAMS_FLAG_USE_HRD);
-		rate_control_config.hrdCpbSize = open_params->hrd_buffer_size * 1000;
-		rate_control_config.bitrateWindow = open_params->gop_size;
-		rate_control_config.intraQpDelta = open_params->intra_qp_delta;
-		rate_control_config.tolMovingBitRate = 2000;
-		rate_control_config.rcQpDeltaRange = 10;
-		rate_control_config.rcBaseMBComplexity = 15;
-		rate_control_config.picQpDeltaMin = -2;
-		rate_control_config.picQpDeltaMax = +3;
-		rate_control_config.tolCtbRcIntra = -1;
-
-		enc_ret = VCEncSetRateCtrl((*encoder)->encoder, &rate_control_config);
-		if (enc_ret != VCENC_OK)
-		{
-			IMX_VPU_API_ERROR("could not set rate control configuration: %s (%d)", vcenc_retval_to_string(enc_ret), (int)enc_ret);
-			goto cleanup_after_error;
-		}
-	}
-
-
-	/* Set up preprocessing configuration. */
-
-	{
-		VCEncPreProcessingCfg preprocessing_config;
-		memset(&preprocessing_config, 0, sizeof(preprocessing_config));
-
-		preprocessing_config.origWidth = fb_metrics->aligned_frame_width;
-		preprocessing_config.origHeight = fb_metrics->aligned_frame_height;
-		preprocessing_config.xOffset = 0;
-		preprocessing_config.yOffset = 0;
-		preprocessing_config.inputType = encoder_pixel_format;
-		preprocessing_config.rotation = VCENC_ROTATE_0;
-		preprocessing_config.mirror = VCENC_MIRROR_NO;
-		preprocessing_config.colorConversion.type = VCENC_RGBTOYUV_BT601_FULL_RANGE;
-		preprocessing_config.input_alignment = INPUT_ALIGNMENT;
-
-		/* Set these to what VCEncGetPreProcessing() returns when called
-		 * right after opening the encoder. (In other words, set these
-		 * to the defaults of the encoder.) Only nonzero defaults are
-		 * assigned here; fields that are set to zero by default are
-		 * already zero due to the memset() call above. */
-		preprocessing_config.constCb = 128;
-		preprocessing_config.constCr = 128;
-
-		enc_ret = VCEncSetPreProcessing((*encoder)->encoder, &preprocessing_config);
-		if (enc_ret != VCENC_OK)
-		{
-			IMX_VPU_API_ERROR("could not set preprocessing configuration: %s (%d)", vcenc_retval_to_string(enc_ret), (int)enc_ret);
-			goto cleanup_after_error;
-		}
-	}
 
 
 	/* Finish & cleanup. */
@@ -1187,6 +1193,58 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_push_raw_frame(ImxVpuApiEncoder *encoder
 	encoder->staged_raw_frame_physical_address = imx_dma_buffer_get_physical_address(encoder->staged_raw_frame.fb_dma_buffer);
 
 	encoder->staged_raw_frame_set = TRUE;
+
+	return IMX_VPU_API_ENC_RETURN_CODE_OK;
+}
+
+
+static ImxVpuApiEncReturnCodes restart_encoder(ImxVpuApiEncoder *encoder)
+{
+	ImxVpuApiEncReturnCodes ret;
+	int num_rolling_slices;
+	int num_rolling_tiles;
+
+	IMX_VPU_API_INFO(
+		"VC8000E auto-recovery: releasing and re-initializing the encoder "
+		"after %d encoded frames",
+		(int)encoder->num_encoded_pictures
+	);
+
+	if (encoder->encoder != NULL)
+	{
+		VCEncRelease(encoder->encoder);
+		encoder->encoder = NULL;
+		usleep(50 * 1000);
+	}
+
+	free(encoder->header_data);
+	encoder->header_data = NULL;
+	encoder->header_data_size = 0;
+	encoder->has_header = FALSE;
+
+	encoder->num_encoded_pictures = 0;
+	encoder->next_coding_type = VCENC_NOTCODED_FRAME;
+	encoder->force_IDR_frame = FALSE;
+
+	num_rolling_slices = encoder->open_params.num_rolling_slices;
+	if (num_rolling_slices == 1) num_rolling_slices = 4;
+	num_rolling_tiles = encoder->open_params.num_rolling_tiles;
+	if (num_rolling_tiles == 1) num_rolling_tiles = 4;
+
+	init_encoder_input(encoder, num_rolling_slices, num_rolling_tiles);
+
+	ret = init_vcenc_instance(
+		encoder,
+		convert_to_vc8000e_pixel_format(encoder->open_params.color_format),
+		&encoder->stream_info.frame_encoding_framebuffer_metrics,
+		num_rolling_slices,
+		num_rolling_tiles
+	);
+	if (ret != IMX_VPU_API_ENC_RETURN_CODE_OK)
+	{
+		IMX_VPU_API_ERROR("encoder restart failed; subsequent encode calls will fail");
+		return ret;
+	}
 
 	return IMX_VPU_API_ENC_RETURN_CODE_OK;
 }
@@ -1462,7 +1520,27 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 	memset(&encoder_output, 0, sizeof(encoder_output));
 	enc_ret = VCEncStrmEncode(encoder->encoder, encoder_input, &encoder_output, NULL, NULL);
 	if (enc_ret != VCENC_FRAME_READY)
-		goto error;
+	{
+		IMX_VPU_API_WARNING(
+			"VCEncStrmEncode returned %s (%d); attempting auto-recovery via encoder restart",
+			vcenc_retval_to_string(enc_ret), (int)enc_ret
+		);
+
+		encoder->skipped_frame_context = encoder->staged_raw_frame.context;
+		encoder->skipped_frame_pts = encoder->staged_raw_frame.pts;
+		encoder->skipped_frame_dts = encoder->staged_raw_frame.dts;
+		encoder->skipped_frame_available = TRUE;
+
+		if (restart_encoder(encoder) != IMX_VPU_API_ENC_RETURN_CODE_OK)
+		{
+			IMX_VPU_API_ERROR("encoder auto-recovery failed; declaring fatal");
+			goto error;
+		}
+
+		*output_code = IMX_VPU_API_ENC_OUTPUT_CODE_FRAME_SKIPPED;
+		ret = IMX_VPU_API_ENC_RETURN_CODE_OK;
+		goto finish;
+	}
 
 	encoder->num_bytes_in_stream_buffer = encoder_output.streamSize;
 	*encoded_frame_size += encoder_output.streamSize;
@@ -1500,7 +1578,7 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 finish:
 	if (encoder->staged_raw_frame_set)
 	{
-		imx_dma_buffer_unmap(encoder->staged_raw_frame.fb_dma_buffer);
+		//imx_dma_buffer_unmap(encoder->staged_raw_frame.fb_dma_buffer);
 		encoder->staged_raw_frame_set = FALSE;
 	}
 
@@ -1594,12 +1672,15 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_get_encoded_frame_ext(ImxVpuApiEncoder *
 
 ImxVpuApiEncReturnCodes imx_vpu_api_enc_get_skipped_frame_info(ImxVpuApiEncoder *encoder, void **context, uint64_t *pts, uint64_t *dts)
 {
-	IMX_VPU_API_UNUSED_PARAM(encoder);
-	IMX_VPU_API_UNUSED_PARAM(context);
-	IMX_VPU_API_UNUSED_PARAM(pts);
-	IMX_VPU_API_UNUSED_PARAM(dts);
+	assert(encoder != NULL);
 
-	/* Frameskipping with VC8000 is not supported */
+	if (!encoder->skipped_frame_available)
+		return IMX_VPU_API_ENC_RETURN_CODE_INVALID_CALL;
 
-	return IMX_VPU_API_ENC_RETURN_CODE_INVALID_CALL;
+	if (context != NULL) *context = encoder->skipped_frame_context;
+	if (pts != NULL)     *pts = encoder->skipped_frame_pts;
+	if (dts != NULL)     *dts = encoder->skipped_frame_dts;
+
+	encoder->skipped_frame_available = FALSE;
+	return IMX_VPU_API_ENC_RETURN_CODE_OK;
 }
