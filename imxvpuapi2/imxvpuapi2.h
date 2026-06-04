@@ -2284,8 +2284,13 @@ typedef struct
 
 	uint16_t roll_size;
 
+	/* Percentage of extra bits the encoder spends on intra content in detected static
+	 * scenes (VC8000E u32StaticSceneIbitPercent). 0 = off (flat bitrate, no static-scene
+	 * refresh spike); higher = sharper static scenes at the cost of a bigger refresh spike. */
+	uint8_t static_scene_ibit_percent;
+
 	/* Reserved bytes for ABI compatibility. */
-	uint8_t reserved[IMX_VPU_API_RESERVED_SIZE - sizeof(unsigned int) - sizeof(int) - sizeof(uint32_t) - sizeof(uint16_t) - sizeof(uint16_t) - sizeof(int8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t)];
+	uint8_t reserved[IMX_VPU_API_RESERVED_SIZE - sizeof(unsigned int) - sizeof(int) - sizeof(uint32_t) - sizeof(uint16_t) - sizeof(uint16_t) - sizeof(int8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t)];
 }
 ImxVpuApiEncOpenParams;
 

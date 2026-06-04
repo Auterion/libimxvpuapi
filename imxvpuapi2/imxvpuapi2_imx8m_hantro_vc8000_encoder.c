@@ -764,6 +764,67 @@ static ImxVpuApiEncReturnCodes init_vcenc_instance(ImxVpuApiEncoder *encoder,
 		rate_control_config.picQpDeltaMax = +3;
 		rate_control_config.tolCtbRcIntra = -1;
 
+		/* Smooth-CBR mode: when HRD/VBV is enabled (use-hrd=1), tighten the otherwise very
+		 * loose rate-control limits so the output bitrate stays flat (low jitter for RTP over
+		 * constrained/radio links). hrdCpbSize (from hrd-buffer-size) is the hard CPB bound;
+		 * these reinforce it. Pair with use-intra-refresh so there are no IDR/full-intra
+		 * spikes either. Values are conservative defaults -- tune on-device for the
+		 * smoothness/quality trade-off. Only active when HRD is requested, so other modes
+		 * keep the original behaviour. */
+		if (rate_control_config.hrd)
+		{
+			rate_control_config.ctbRc = 1;             /* per-CTB QP: spread bits within a frame */
+			if (rate_control_config.blockRCSize == 0)
+				rate_control_config.blockRCSize = 1;    /* 32x32 CTB-RC blocks for HEVC */
+			rate_control_config.bitVarRangeI = 100;    /* was 10000: clamp per-frame variation */
+			rate_control_config.bitVarRangeP = 100;
+			rate_control_config.bitVarRangeB = 100;
+			rate_control_config.tolMovingBitRate = 50; /* was 2000: track target bitrate tightly */
+			/* Asymmetric per-frame QP authority (Hantro defaults -2..+3): fast UP
+			 * so the RC can re-price the periodic GDR refresh frame and motion
+			 * onsets within one frame (flat standstill bitrate; symmetric -10..+10
+			 * did this too), slow DOWN so the recovery cannot overshoot and
+			 * re-spike (-10 caused RC hunting under sustained motion). */
+			rate_control_config.picQpDeltaMin = -3;
+			rate_control_config.picQpDeltaMax = 10;
+			/* Cap the static-scene refresh spike: the VC8000E boosts intra bits in detected
+			 * static scenes (u32StaticSceneIbitPercent, default 80), and under CBR with idle
+			 * P-frames the rate control has surplus budget it dumps into the periodic GDR
+			 * refresh frame at a low QP -> a fat periodic spike when nothing moves. Disable
+			 * the static-scene intra boost and floor the P/B QP (qpMaxPB is already 51) so the
+			 * refresh P-frame cannot balloon; surplus then sags the rate slightly, not spikes. */
+			rate_control_config.u32StaticSceneIbitPercent = open_params->static_scene_ibit_percent; /* config: static-scene-ibit-percent */
+			/* qpMinPB comes from open_params->qp_min_inter (config: qp-min); set above. */
+
+			/* A CPB that cannot admit coded pictures makes the HRD (correctly)
+			 * skip every frame -> the stream freezes by configuration. Device
+			 * sweep: the VC8000E starves below ~4 average-frame budgets
+			 * (2 Mbps/30fps: 250 kbit freezes, 300 streams; 1.2 Mbps: 150
+			 * freezes, 200 streams). Floor the CPB at five frame budgets
+			 * (5 * bitrate/fps) so aggressive hrd-buffer-size settings degrade
+			 * to occasional skips instead of a dead stream. */
+			if ((rate_control_config.hrdCpbSize > 0) && (open_params->frame_rate_numerator > 0))
+			{
+				uint32_t min_cpb = (uint32_t)(((uint64_t)(rate_control_config.bitPerSecond) * 5u * open_params->frame_rate_denominator) / open_params->frame_rate_numerator);
+				if (rate_control_config.hrdCpbSize < min_cpb)
+				{
+					IMX_VPU_API_WARNING(
+						"hrd-buffer-size %u bits is below five frame budgets (%u bits) at %u bps / %u/%u fps; clamping - the VC8000E HRD starves below ~4 frame budgets (frozen stream)",
+						(unsigned int)(rate_control_config.hrdCpbSize), (unsigned int)min_cpb,
+						(unsigned int)(rate_control_config.bitPerSecond),
+						(unsigned int)(open_params->frame_rate_numerator), (unsigned int)(open_params->frame_rate_denominator)
+					);
+					rate_control_config.hrdCpbSize = min_cpb;
+				}
+			}
+
+			/* NOTE: on CPB overflow VCEncStrmEncode returns VCENC_HRD_ERROR;
+			 * that is the HRD's graceful per-picture skip and is handled as a
+			 * skipped frame in imx_vpu_api_enc_encode() - it must NOT trigger
+			 * the lost-IRQ auto-recovery restart (restart storm = frozen
+			 * stream under sustained overload, e.g. darkness sensor noise). */
+		}
+
 		enc_ret = VCEncSetRateCtrl(encoder->encoder, &rate_control_config);
 		if (enc_ret != VCENC_OK)
 		{
@@ -1801,6 +1862,26 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 	/* Perform the actual frame encoding. */
 	memset(&encoder_output, 0, sizeof(encoder_output));
 	enc_ret = VCEncStrmEncode(encoder->encoder, encoder_input, &encoder_output, NULL, NULL);
+	if (enc_ret == VCENC_HRD_ERROR)
+	{
+		/* HRD/CPB overflow: the hardware discarded this picture by design and
+		 * restored its internal state - this is the HRD's graceful skip, not
+		 * a hang. Do NOT run the lost-IRQ auto-recovery: a restart forces a
+		 * new bootstrap I-frame, which under sustained overload (e.g.
+		 * max-gain sensor noise in darkness) overflows the CPB again ->
+		 * restart storm -> frozen stream. Report a skipped frame and
+		 * continue; output resumes as soon as the CPB drains. */
+		IMX_VPU_API_INFO("HRD CPB overflow; picture skipped by rate control");
+
+		encoder->skipped_frame_context = encoder->staged_raw_frame.context;
+		encoder->skipped_frame_pts = encoder->staged_raw_frame.pts;
+		encoder->skipped_frame_dts = encoder->staged_raw_frame.dts;
+		encoder->skipped_frame_available = TRUE;
+
+		*output_code = IMX_VPU_API_ENC_OUTPUT_CODE_FRAME_SKIPPED;
+		ret = IMX_VPU_API_ENC_RETURN_CODE_OK;
+		goto finish;
+	}
 	if (enc_ret != VCENC_FRAME_READY)
 	{
 		IMX_VPU_API_WARNING(
@@ -1818,6 +1899,30 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 			IMX_VPU_API_ERROR("encoder auto-recovery failed; declaring fatal");
 			goto error;
 		}
+
+		*output_code = IMX_VPU_API_ENC_OUTPUT_CODE_FRAME_SKIPPED;
+		ret = IMX_VPU_API_ENC_RETURN_CODE_OK;
+		goto finish;
+	}
+
+	if (encoder_output.streamSize == 0)
+	{
+		/* With HRD enabled the VC8000E signals a CPB-overflow skip as a
+		 * SUCCESSFUL encode with zero output bytes (not VCENC_HRD_ERROR).
+		 * Without this check the zero-byte "frame" propagates with a bogus
+		 * frame context, the gst layer cannot map it to a queued frame and
+		 * discards it, and the queued GstVideoCodecFrame (plus its DMA input
+		 * buffer) leaks -> stream stalls/freezes and CMA memory runs out
+		 * under sustained overload (e.g. max-gain sensor noise in darkness).
+		 * Report it as a proper skipped frame instead; the gst skipped-frame
+		 * handler finishes/releases the queued frame and the stream resumes
+		 * as soon as the CPB drains. */
+		IMX_VPU_API_INFO("HRD CPB overflow: zero-byte encode; reporting picture as skipped");
+
+		encoder->skipped_frame_context = encoder->staged_raw_frame.context;
+		encoder->skipped_frame_pts = encoder->staged_raw_frame.pts;
+		encoder->skipped_frame_dts = encoder->staged_raw_frame.dts;
+		encoder->skipped_frame_available = TRUE;
 
 		*output_code = IMX_VPU_API_ENC_OUTPUT_CODE_FRAME_SKIPPED;
 		ret = IMX_VPU_API_ENC_RETURN_CODE_OK;
