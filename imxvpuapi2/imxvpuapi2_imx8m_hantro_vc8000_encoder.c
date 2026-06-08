@@ -391,6 +391,71 @@ void imx_vpu_api_enc_set_default_open_params(ImxVpuApiCompressionFormat compress
 }
 
 
+typedef struct { const uint8_t *d; size_t len; size_t bit; } VcBR;
+static unsigned vc_br_u1(VcBR *b){ unsigned v=0; if((b->bit>>3)<b->len) v=(b->d[b->bit>>3]>>(7-(b->bit&7)))&1u; b->bit++; return v; }
+static unsigned vc_br_un(VcBR *b,int n){ unsigned v=0; while(n-->0) v=(v<<1)|vc_br_u1(b); return v; }
+static unsigned vc_br_ue(VcBR *b){ int z=0; while(vc_br_u1(b)==0 && (b->bit>>3)<b->len) z++; unsigned v=(z<32)?((1u<<z)-1u):0xffffffffu; v+=vc_br_un(b,z); return v; }
+typedef struct { uint8_t *d; size_t cap; size_t bit; } VcBW;
+static void vc_bw_u1(VcBW *w,unsigned v){ size_t i=w->bit>>3; if(i<w->cap){ uint8_t m=(uint8_t)(1u<<(7-(w->bit&7))); if(v) w->d[i]|=m; else w->d[i]&=(uint8_t)~m; } w->bit++; }
+static void vc_bw_un(VcBW *w,unsigned v,int n){ for(int i=n-1;i>=0;i--) vc_bw_u1(w,(v>>i)&1u); }
+static void vc_bw_ue(VcBW *w,unsigned v){ unsigned val=v+1u; int n=0; unsigned t=val; while(t>1u){t>>=1;n++;} for(int i=0;i<n;i++) vc_bw_u1(w,0); for(int i=n;i>=0;i--) vc_bw_u1(w,(val>>i)&1u); }
+static void vc_cp_bits(VcBR*r,VcBW*w,int n){ while(n-->0) vc_bw_u1(w,vc_br_u1(r)); }
+static unsigned vc_cp_ue(VcBR*r,VcBW*w){ unsigned v=vc_br_ue(r); vc_bw_ue(w,v); return v; }
+static unsigned vc_cp_un(VcBR*r,VcBW*w,int n){ unsigned v=vc_br_un(r,n); vc_bw_un(w,v,n); return v; }
+static size_t vc_deemulate(const uint8_t*p,size_t n,uint8_t*rbsp,size_t cap){ size_t o=0,z=0; for(size_t i=0;i<n&&o<cap;i++){ if(z>=2&&p[i]==3){z=0;continue;} rbsp[o++]=p[i]; if(p[i]==0)z++; else z=0; } return o; }
+static size_t vc_emulate(const uint8_t*rbsp,size_t n,uint8_t*out,size_t cap){ size_t o=0,z=0; for(size_t i=0;i<n;i++){ if(z>=2&&rbsp[i]<=3){ if(o<cap)out[o++]=3; z=0; } if(o<cap)out[o++]=rbsp[i]; if(rbsp[i]==0)z++; else z=0; } return o; }
+static size_t vc_sps_rewrite_rbsp(const uint8_t*in,size_t in_len,uint8_t*out,size_t out_cap)
+{
+	long L=(long)in_len-1; while(L>=0&&in[L]==0)L--; if(L<0)return 0;
+	int r=0; while(((in[L]>>r)&1u)==0)r++;
+	size_t stop_bit=(size_t)L*8+(size_t)(7-r);
+	VcBR br={in,in_len,0}; VcBW bw={out,out_cap,0}; memset(out,0,out_cap);
+	vc_cp_un(&br,&bw,4); unsigned max_sub=vc_cp_un(&br,&bw,3); vc_cp_un(&br,&bw,1);
+	if(max_sub!=0) return 0;
+	vc_cp_bits(&br,&bw,96);
+	vc_cp_ue(&br,&bw);
+	unsigned chroma=vc_cp_ue(&br,&bw); if(chroma==3) vc_cp_un(&br,&bw,1);
+	vc_cp_ue(&br,&bw); vc_cp_ue(&br,&bw);
+	unsigned conf=vc_cp_un(&br,&bw,1); if(conf){ vc_cp_ue(&br,&bw); vc_cp_ue(&br,&bw); vc_cp_ue(&br,&bw); vc_cp_ue(&br,&bw); }
+	vc_cp_ue(&br,&bw); vc_cp_ue(&br,&bw); vc_cp_ue(&br,&bw);
+	vc_cp_un(&br,&bw,1);
+	vc_cp_ue(&br,&bw);
+	unsigned reorder=vc_br_ue(&br); vc_bw_ue(&bw,0);
+	vc_cp_ue(&br,&bw);
+	if(reorder==0) return 0;
+	while(br.bit<stop_bit) vc_bw_u1(&bw,vc_br_u1(&br));
+	vc_bw_u1(&bw,1); while(bw.bit&7) vc_bw_u1(&bw,0);
+	return bw.bit>>3;
+}
+static void vc8000_hevc_force_no_reorder(uint8_t *data,size_t *size)
+{
+	size_t sz=*size,p=0;
+	while(p+3<=sz && !(data[p]==0&&data[p+1]==0&&data[p+2]==1)) p++;
+	while(p+3<=sz && data[p]==0&&data[p+1]==0&&data[p+2]==1){
+		size_t nal=p+3,q=nal;
+		while(q+3<=sz && !(data[q]==0&&data[q+1]==0&&data[q+2]==1)) q++;
+		size_t nal_end=(q+3<=sz)?q:sz;
+		int type=(data[nal]>>1)&0x3f;
+		if(type==33 && nal_end-nal>2){
+			uint8_t rbsp[512],nr[512],em[560];
+			size_t rl=vc_deemulate(data+nal+2,(nal_end-nal)-2,rbsp,sizeof rbsp);
+			size_t nl=vc_sps_rewrite_rbsp(rbsp,rl,nr,sizeof nr);
+			if(nl>0){
+				size_t el=vc_emulate(nr,nl,em,sizeof em);
+				size_t new_nal=2+el, old_nal=nal_end-nal;
+				if(new_nal<=old_nal){
+					memcpy(data+nal+2,em,el);
+					size_t delta=old_nal-new_nal;
+					if(delta){ memmove(data+nal+new_nal,data+nal_end,sz-nal_end); sz-=delta; }
+					*size=sz;
+				}
+			}
+			return;
+		}
+		p=nal_end;
+	}
+}
+
 static void init_encoder_input(ImxVpuApiEncoder *encoder,
                                int num_rolling_slices,
                                int num_rolling_tiles)
@@ -1387,6 +1452,14 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 		imx_dma_buffer_stop_sync_session(encoder->stream_buffer);
 
 		encoder->header_data_size = encoder_output.streamSize;
+
+		if (encoder->open_params.compression_format == IMX_VPU_API_COMPRESSION_FORMAT_H265)
+		{
+			size_t before = encoder->header_data_size;
+			vc8000_hevc_force_no_reorder(encoder->header_data, &encoder->header_data_size);
+			IMX_VPU_API_LOG("HEVC SPS no-reorder rewrite: header %zu -> %zu bytes",
+			                before, encoder->header_data_size);
+		}
 
 		encoder->has_header = TRUE;
 	}
