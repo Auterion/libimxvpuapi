@@ -2282,8 +2282,10 @@ typedef struct
 	 * Setting this caps the quality of P/B frames, reducing peak size in GDR/rolling-slice modes. */
 	uint8_t qp_min_inter;
 
+	uint16_t roll_size;
+
 	/* Reserved bytes for ABI compatibility. */
-	uint8_t reserved[IMX_VPU_API_RESERVED_SIZE - sizeof(unsigned int) - sizeof(int) - sizeof(uint32_t) - sizeof(uint16_t) - sizeof(int8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t)];
+	uint8_t reserved[IMX_VPU_API_RESERVED_SIZE - sizeof(unsigned int) - sizeof(int) - sizeof(uint32_t) - sizeof(uint16_t) - sizeof(uint16_t) - sizeof(int8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t)];
 }
 ImxVpuApiEncOpenParams;
 
@@ -2598,6 +2600,8 @@ void imx_vpu_api_enc_flush(ImxVpuApiEncoder *encoder);
  * though rate control was disabled in the encoder's ImxVpuApiEncOpenParams.
  */
 ImxVpuApiEncReturnCodes imx_vpu_api_enc_set_bitrate(ImxVpuApiEncoder *encoder, unsigned int bitrate);
+
+void imx_vpu_api_enc_set_intra_refresh_region(ImxVpuApiEncoder *encoder, unsigned int first_ctb_row, unsigned int num_ctb_rows);
 
 /* Sets the current encoding frame rate to this new value, in kbps.
  *

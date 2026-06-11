@@ -5,6 +5,7 @@
 #include <assert.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <inttypes.h>
 #include <math.h>
 #include <unistd.h>
@@ -140,6 +141,9 @@ static VCEncPictureType convert_to_vc8000e_pixel_format(ImxVpuApiColorFormat col
 /************************************************/
 
 
+#define FORCED_INTRA_QUEUE_SIZE 32
+#define MAX_ROLLING_SLICES 64
+
 struct _ImxVpuApiEncoder
 {
 	/* Hantro VC8000E encoder that is in use. */
@@ -249,6 +253,14 @@ struct _ImxVpuApiEncoder
 	int num_rolling_slices;
 	int num_rolling_tiles;
 	VCEncCodingCtrl cached_coding_ctrl;
+
+	struct { uint32_t first; uint32_t num; } forced_intra_q[FORCED_INTRA_QUEUE_SIZE];
+	int forced_intra_q_head;
+	int forced_intra_q_count;
+
+	int roll_size;
+	int last_refresh_picture;
+	int slice_last_refresh[MAX_ROLLING_SLICES];
 
 	BOOL skipped_frame_available;
 	void *skipped_frame_context;
@@ -595,6 +607,16 @@ static ImxVpuApiEncReturnCodes init_vcenc_instance(ImxVpuApiEncoder *encoder,
 		VCEncGetCodingCtrl(encoder->encoder, &encoder->cached_coding_ctrl);
 		encoder->num_rolling_slices = num_rolling_slices;
 		encoder->num_rolling_tiles = num_rolling_tiles;
+
+		encoder->roll_size = (int)encoder->open_params.roll_size;
+		encoder->last_refresh_picture = -1000000;
+		{
+			int i;
+			for (i = 0; i < MAX_ROLLING_SLICES; i++)
+				encoder->slice_last_refresh[i] = -1000000;
+		}
+		encoder->forced_intra_q_head = 0;
+		encoder->forced_intra_q_count = 0;
 	}
 
 
@@ -1231,6 +1253,44 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_set_bitrate(ImxVpuApiEncoder *encoder, u
 }
 
 
+void imx_vpu_api_enc_set_intra_refresh_region(ImxVpuApiEncoder *encoder, unsigned int first_ctb_row, unsigned int num_ctb_rows)
+{
+	assert(encoder != NULL);
+
+	if (num_ctb_rows == 0)
+	{
+		encoder->forced_intra_q_count = 0;
+		encoder->forced_intra_q_head = 0;
+		return;
+	}
+
+	for (int i = 0; i < encoder->forced_intra_q_count; i++)
+	{
+		int idx = (encoder->forced_intra_q_head + i) % FORCED_INTRA_QUEUE_SIZE;
+		if ((encoder->forced_intra_q[idx].first == first_ctb_row) &&
+		    (encoder->forced_intra_q[idx].num == num_ctb_rows))
+			return;
+	}
+
+	if (encoder->forced_intra_q_count >= FORCED_INTRA_QUEUE_SIZE)
+	{
+		IMX_VPU_API_WARNING("forced intra refresh queue full; dropping rows %u..%u",
+		                    first_ctb_row, first_ctb_row + num_ctb_rows - 1);
+		return;
+	}
+
+	{
+		int tail = (encoder->forced_intra_q_head + encoder->forced_intra_q_count) % FORCED_INTRA_QUEUE_SIZE;
+		encoder->forced_intra_q[tail].first = first_ctb_row;
+		encoder->forced_intra_q[tail].num = num_ctb_rows;
+		encoder->forced_intra_q_count++;
+	}
+
+	IMX_VPU_API_TRACE("forced intra refresh queued: rows %u..%u (queue depth %d)",
+	                  first_ctb_row, first_ctb_row + num_ctb_rows - 1, encoder->forced_intra_q_count);
+}
+
+
 ImxVpuApiEncReturnCodes imx_vpu_api_enc_set_frame_rate(ImxVpuApiEncoder *encoder, unsigned int frame_rate_numerator, unsigned int frame_rate_denominator)
 {
 	// TODO
@@ -1496,6 +1556,8 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 		}
 	}
 
+	int sei_refresh = 0, sei_top = 0, sei_bottom = 0;
+
 	if ((encoder->num_rolling_slices > 0) && !is_idr &&
 	    (encoder->open_params.compression_format == IMX_VPU_API_COMPRESSION_FORMAT_H265))
 	{
@@ -1505,24 +1567,61 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 		int frame_w     = (int)(encoder->open_params.frame_width);
 		int ctu_rows    = (frame_h + 63) / 64;
 		int ctu_cols    = (frame_w + 63) / 64;
-		int rows_per_slice = (ctu_rows + num_slices - 1) / num_slices;
-		int gop_pos     = (int)(encoder->num_encoded_pictures) % gop_size;
-		int slice_idx   = -1;
-		int i;
+		int rows_per_slice;
+		int roll        = (encoder->roll_size > 0) ? encoder->roll_size : gop_size;
+		int pic         = (int)(encoder->num_encoded_pictures);
+		int min_gap;
+		int top = 0, bottom = -1;
+		int from_forced = 0;
 
-		for (i = 0; i < num_slices; i++)
+		if (num_slices > MAX_ROLLING_SLICES) num_slices = MAX_ROLLING_SLICES;
+		rows_per_slice = (ctu_rows + num_slices - 1) / num_slices;
+		if (roll > gop_size) roll = gop_size;
+		min_gap = roll / num_slices;
+		if (min_gap < 1) min_gap = 1;
+
 		{
-			if (gop_pos == (i * gop_size) / num_slices)
+			int s, oldest = 0, oldest_age, emergency;
+
+			for (s = 1; s < num_slices; s++)
 			{
-				slice_idx = i;
-				break;
+				if (encoder->slice_last_refresh[s] < encoder->slice_last_refresh[oldest])
+					oldest = s;
+			}
+			oldest_age = pic - encoder->slice_last_refresh[oldest];
+			emergency = (oldest_age >= roll);
+
+			if (encoder->forced_intra_q_count > 0 && !emergency)
+			{
+				int idx = encoder->forced_intra_q_head;
+				int cb;
+				top    = (int)encoder->forced_intra_q[idx].first;
+				bottom = top + (int)encoder->forced_intra_q[idx].num - 1;
+				encoder->forced_intra_q_head = (idx + 1) % FORCED_INTRA_QUEUE_SIZE;
+				encoder->forced_intra_q_count--;
+				from_forced = 1;
+
+				cb = (bottom < ctu_rows) ? bottom : (ctu_rows - 1);
+				for (s = 0; s < num_slices; s++)
+				{
+					int s_top = s * rows_per_slice;
+					int s_bot = s_top + rows_per_slice - 1;
+					if (!(s_bot < top || s_top > cb))
+						encoder->slice_last_refresh[s] = pic;
+				}
+			}
+			else if (emergency || (pic - encoder->last_refresh_picture >= min_gap))
+			{
+				top = oldest * rows_per_slice;
+				bottom = top + rows_per_slice - 1;
+				encoder->slice_last_refresh[oldest] = pic;
+				encoder->last_refresh_picture = pic;
 			}
 		}
 
-		if (slice_idx >= 0)
+		if (bottom >= top)
 		{
-			int top = slice_idx * rows_per_slice;
-			int bottom = top + rows_per_slice - 1;
+			if (top < 0) top = 0;
 			if (bottom >= ctu_rows) bottom = ctu_rows - 1;
 			encoder->cached_coding_ctrl.intraArea.enable = 1;
 			encoder->cached_coding_ctrl.intraArea.left   = 0;
@@ -1530,6 +1629,11 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 			encoder->cached_coding_ctrl.intraArea.top    = top;
 			encoder->cached_coding_ctrl.intraArea.bottom = bottom;
 			VCEncSetCodingCtrl(encoder->encoder, &(encoder->cached_coding_ctrl));
+			sei_refresh = 1; sei_top = top; sei_bottom = bottom;
+			if (getenv("VR_FORCED_INTRA_DEBUG"))
+				fprintf(stderr, "VR refresh applied: CTB rows %d..%d (frame %d, %s, qdepth %d)\n",
+				        top, bottom, (int)encoder->num_encoded_pictures,
+				        from_forced ? "forced" : "wave", encoder->forced_intra_q_count);
 		}
 		else if (encoder->cached_coding_ctrl.intraArea.enable)
 		{
@@ -1586,6 +1690,27 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 		{
 			encoder->cached_coding_ctrl.intraArea.enable = 0;
 			VCEncSetCodingCtrl(encoder->encoder, &(encoder->cached_coding_ctrl));
+		}
+	}
+
+	if ((encoder->open_params.compression_format == IMX_VPU_API_COMPRESSION_FORMAT_H265) &&
+	    !(getenv("VR_RECOVERY_SEI") && getenv("VR_RECOVERY_SEI")[0] == '0'))
+	{
+		if (sei_refresh)
+		{
+			static const uint8_t kRecoveryUuid[16] =
+				{ 'V','R','-','S','L','I','-','R','E','C','O','V','R','Y','0','1' };
+			uint8_t sei[20];
+			memcpy(sei, kRecoveryUuid, 16);
+			sei[16] = 1;
+			sei[17] = (uint8_t)sei_top;
+			sei[18] = (uint8_t)(sei_bottom - sei_top + 1);
+			sei[19] = (uint8_t)(encoder->num_encoded_pictures & 0xFF);
+			VCEncSetSeiUserData(encoder->encoder, sei, sizeof(sei));
+		}
+		else
+		{
+			VCEncSetSeiUserData(encoder->encoder, NULL, 0);
 		}
 	}
 

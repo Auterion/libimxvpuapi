@@ -95,6 +95,14 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_set_bitrate(ImxVpuApiEncoder *encoder, u
 }
 
 
+void imx_vpu_api_enc_set_intra_refresh_region(ImxVpuApiEncoder *encoder, unsigned int first_ctb_row, unsigned int num_ctb_rows)
+{
+	IMX_VPU_API_UNUSED_PARAM(encoder);
+	IMX_VPU_API_UNUSED_PARAM(first_ctb_row);
+	IMX_VPU_API_UNUSED_PARAM(num_ctb_rows);
+}
+
+
 ImxVpuApiEncReturnCodes imx_vpu_api_enc_set_quantization(ImxVpuApiEncoder *encoder, unsigned int quantization)
 {
 	IMX_VPU_API_UNUSED_PARAM(encoder);
