@@ -1549,7 +1549,8 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 	}
 
 	if (!encoder->has_header && (encoder->num_encoded_pictures > 0) &&
-	    ((encoder->num_rolling_slices > 0) || (encoder->num_rolling_tiles > 0)) &&
+	    ((encoder->num_rolling_slices > 0) || (encoder->num_rolling_tiles > 0) ||
+	     (encoder->open_params.flags & IMX_VPU_API_ENC_OPEN_PARAMS_FLAG_USE_INTRA_REFRESH)) &&
 	    (encoder->open_params.gop_size > 0) &&
 	    (((int)(encoder->num_encoded_pictures) % (int)(encoder->open_params.gop_size)) == 0))
 	{
