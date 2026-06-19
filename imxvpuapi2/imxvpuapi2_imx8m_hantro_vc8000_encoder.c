@@ -468,6 +468,82 @@ static void vc8000_hevc_force_no_reorder(uint8_t *data,size_t *size)
 	}
 }
 
+static int vc_cp_hrd(VcBR*r,VcBW*w){
+	unsigned cpb=vc_cp_ue(r,w); vc_cp_un(r,w,4); vc_cp_un(r,w,4);
+	for(unsigned i=0;i<=cpb && i<32;i++){ vc_cp_ue(r,w); vc_cp_ue(r,w); vc_cp_un(r,w,1); }
+	vc_cp_un(r,w,5); vc_cp_un(r,w,5); vc_cp_un(r,w,5); vc_cp_un(r,w,5);
+	return 1;
+}
+static size_t vc_sps_rewrite_rbsp_h264(const uint8_t*in,size_t in_len,uint8_t*out,size_t out_cap)
+{
+	long L=(long)in_len-1; while(L>=0&&in[L]==0)L--; if(L<0)return 0;
+	int rr=0; while(((in[L]>>rr)&1u)==0)rr++;
+	size_t stop_bit=(size_t)L*8+(size_t)(7-rr);
+	VcBR br={in,in_len,0}; VcBW bw={out,out_cap,0}; memset(out,0,out_cap);
+	unsigned prof=vc_cp_un(&br,&bw,8); vc_cp_un(&br,&bw,8); vc_cp_un(&br,&bw,8);
+	vc_cp_ue(&br,&bw);
+	if(prof==100||prof==110||prof==122||prof==244||prof==44||prof==83||prof==86||prof==118||prof==128||prof==138||prof==139||prof==134||prof==135){
+		unsigned cf=vc_cp_ue(&br,&bw); if(cf==3) vc_cp_un(&br,&bw,1);
+		vc_cp_ue(&br,&bw); vc_cp_ue(&br,&bw); vc_cp_un(&br,&bw,1);
+		if(vc_cp_un(&br,&bw,1)) return 0;
+	}
+	vc_cp_ue(&br,&bw);
+	unsigned poc=vc_cp_ue(&br,&bw);
+	if(poc==0) vc_cp_ue(&br,&bw);
+	else if(poc==1){ vc_cp_un(&br,&bw,1); vc_cp_ue(&br,&bw); vc_cp_ue(&br,&bw); unsigned n=vc_cp_ue(&br,&bw); for(unsigned i=0;i<n && i<256;i++) vc_cp_ue(&br,&bw); }
+	vc_cp_ue(&br,&bw); vc_cp_un(&br,&bw,1); vc_cp_ue(&br,&bw); vc_cp_ue(&br,&bw);
+	if(!vc_cp_un(&br,&bw,1)) vc_cp_un(&br,&bw,1);
+	vc_cp_un(&br,&bw,1);
+	if(vc_cp_un(&br,&bw,1)){ vc_cp_ue(&br,&bw); vc_cp_ue(&br,&bw); vc_cp_ue(&br,&bw); vc_cp_ue(&br,&bw); }
+	if(!vc_cp_un(&br,&bw,1)) return 0;
+	if(vc_cp_un(&br,&bw,1)){ if(vc_cp_un(&br,&bw,8)==255){ vc_cp_un(&br,&bw,16); vc_cp_un(&br,&bw,16); } }
+	if(vc_cp_un(&br,&bw,1)) vc_cp_un(&br,&bw,1);
+	if(vc_cp_un(&br,&bw,1)){ vc_cp_un(&br,&bw,3); vc_cp_un(&br,&bw,1); if(vc_cp_un(&br,&bw,1)){ vc_cp_un(&br,&bw,8); vc_cp_un(&br,&bw,8); vc_cp_un(&br,&bw,8); } }
+	if(vc_cp_un(&br,&bw,1)){ vc_cp_ue(&br,&bw); vc_cp_ue(&br,&bw); }
+	if(vc_cp_un(&br,&bw,1)){ vc_cp_bits(&br,&bw,32); vc_cp_bits(&br,&bw,32); vc_cp_un(&br,&bw,1); }
+	unsigned nal_hrd=vc_cp_un(&br,&bw,1); if(nal_hrd) vc_cp_hrd(&br,&bw);
+	unsigned vcl_hrd=vc_cp_un(&br,&bw,1); if(vcl_hrd) vc_cp_hrd(&br,&bw);
+	if(nal_hrd||vcl_hrd) vc_cp_un(&br,&bw,1);
+	vc_cp_un(&br,&bw,1);
+	if(!vc_cp_un(&br,&bw,1)) return 0;
+	vc_cp_un(&br,&bw,1); vc_cp_ue(&br,&bw); vc_cp_ue(&br,&bw); vc_cp_ue(&br,&bw); vc_cp_ue(&br,&bw);
+	unsigned reorder=vc_br_ue(&br); vc_bw_ue(&bw,0);
+	vc_cp_ue(&br,&bw);
+	if(reorder==0) return 0;
+	if(br.bit>stop_bit+1) return 0;
+	while(br.bit<stop_bit) vc_bw_u1(&bw,vc_br_u1(&br));
+	vc_bw_u1(&bw,1); while(bw.bit&7) vc_bw_u1(&bw,0);
+	return bw.bit>>3;
+}
+static void vc8000_h264_force_no_reorder(uint8_t *data,size_t *size)
+{
+	size_t sz=*size,p=0;
+	while(p+3<=sz && !(data[p]==0&&data[p+1]==0&&data[p+2]==1)) p++;
+	while(p+3<=sz && data[p]==0&&data[p+1]==0&&data[p+2]==1){
+		size_t nal=p+3,q=nal;
+		while(q+3<=sz && !(data[q]==0&&data[q+1]==0&&data[q+2]==1)) q++;
+		size_t nal_end=(q+3<=sz)?q:sz;
+		int type=data[nal]&0x1f;
+		if(type==7 && nal_end-nal>1){
+			uint8_t rbsp[512],nr[512],em[560];
+			size_t rl=vc_deemulate(data+nal+1,(nal_end-nal)-1,rbsp,sizeof rbsp);
+			size_t nl=vc_sps_rewrite_rbsp_h264(rbsp,rl,nr,sizeof nr);
+			if(nl>0){
+				size_t el=vc_emulate(nr,nl,em,sizeof em);
+				size_t new_nal=1+el, old_nal=nal_end-nal;
+				if(new_nal<=old_nal){
+					memcpy(data+nal+1,em,el);
+					size_t delta=old_nal-new_nal;
+					if(delta){ memmove(data+nal+new_nal,data+nal_end,sz-nal_end); sz-=delta; }
+					*size=sz;
+				}
+			}
+			return;
+		}
+		p=nal_end;
+	}
+}
+
 static void init_encoder_input(ImxVpuApiEncoder *encoder,
                                int num_rolling_slices,
                                int num_rolling_tiles)
@@ -1518,6 +1594,13 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 			size_t before = encoder->header_data_size;
 			vc8000_hevc_force_no_reorder(encoder->header_data, &encoder->header_data_size);
 			IMX_VPU_API_LOG("HEVC SPS no-reorder rewrite: header %zu -> %zu bytes",
+			                before, encoder->header_data_size);
+		}
+		else if (encoder->open_params.compression_format == IMX_VPU_API_COMPRESSION_FORMAT_H264)
+		{
+			size_t before = encoder->header_data_size;
+			vc8000_h264_force_no_reorder(encoder->header_data, &encoder->header_data_size);
+			IMX_VPU_API_LOG("H264 SPS no-reorder rewrite: header %zu -> %zu bytes",
 			                before, encoder->header_data_size);
 		}
 
