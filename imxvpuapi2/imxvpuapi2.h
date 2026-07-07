@@ -2289,8 +2289,14 @@ typedef struct
 	 * refresh spike); higher = sharper static scenes at the cost of a bigger refresh spike. */
 	uint8_t static_scene_ibit_percent;
 
+	/* GDR/intra-refresh period in frames: how often the intra-refresh sweep + recovery-point SEI
+	 * cycle completes, decoupled from gop_size (which stays the rate-control window). 0 = use gop_size
+	 * (legacy). Smaller = smaller periodic refresh spike + faster mid-stream join at a small refresh-tax
+	 * cost; quality plateaus around 16. Only affects use-intra-refresh (GDR) mode. */
+	uint8_t gdr_refresh_period;
+
 	/* Reserved bytes for ABI compatibility. */
-	uint8_t reserved[IMX_VPU_API_RESERVED_SIZE - sizeof(unsigned int) - sizeof(int) - sizeof(uint32_t) - sizeof(uint16_t) - sizeof(uint16_t) - sizeof(int8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t)];
+	uint8_t reserved[IMX_VPU_API_RESERVED_SIZE - sizeof(unsigned int) - sizeof(int) - sizeof(uint32_t) - sizeof(uint16_t) - sizeof(uint16_t) - sizeof(int8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t)  - sizeof(uint8_t)];
 }
 ImxVpuApiEncOpenParams;
 

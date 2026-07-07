@@ -560,7 +560,12 @@ static void init_encoder_input(ImxVpuApiEncoder *encoder,
 	encoder_input->gopConfig.pGopPicSpecialCfg = &encoder->gop_pic_special_config[0];
 	encoder_input->gopConfig.idr_interval = ((num_rolling_slices > 0) || (num_rolling_tiles > 0)) ? INT32_MAX : open_params->gop_size;
 	if (open_params->flags & IMX_VPU_API_ENC_OPEN_PARAMS_FLAG_USE_INTRA_REFRESH)
-		encoder_input->gopConfig.gdrDuration = open_params->gop_size;
+	{
+		/* Refresh period decoupled from gop_size (RC window). 0 => gop_size (legacy). */
+		unsigned gdr_period = (open_params->gdr_refresh_period > 0) ? (unsigned)open_params->gdr_refresh_period : (unsigned)open_params->gop_size;
+		encoder_input->gopConfig.gdrDuration = gdr_period;
+		encoder_input->gopConfig.idr_interval = gdr_period;
+	}
 	encoder_input->gopConfig.firstPic = 0;
 	encoder_input->gopConfig.lastPic = INT32_MAX;
 	encoder_input->gopConfig.outputRateNumer = open_params->frame_rate_numerator;
@@ -639,7 +644,7 @@ static ImxVpuApiEncReturnCodes init_vcenc_instance(ImxVpuApiEncoder *encoder,
 		coding_config.cirStart = 0;
 		coding_config.cirInterval = open_params->min_intra_refresh_mb_count;
 		if (open_params->flags & IMX_VPU_API_ENC_OPEN_PARAMS_FLAG_USE_INTRA_REFRESH)
-			coding_config.gdrDuration = open_params->gop_size;
+			coding_config.gdrDuration = (open_params->gdr_refresh_period > 0) ? open_params->gdr_refresh_period : open_params->gop_size;
 		else
 			coding_config.gdrDuration = 0;
 
