@@ -164,7 +164,7 @@ class PlatformIMX8M:
 				features = ['c'],
 				includes = ['.'],
 				uselib = ['IMXDMABUFFER', 'C99', 'HANTRO', 'HANTRO_ENC'],
-				source = ['imxvpuapi2/imxvpuapi2_imx8m_hantro_vc8000_encoder.c'],
+				source = ['imxvpuapi2/imxvpuapi2_imx8m_hantro_vc8000_encoder.c', 'imxvpuapi2/ext_rate_control.c'],
 				name = 'imx8_encoder'
 			)
 		else:

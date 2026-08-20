@@ -2289,10 +2289,13 @@ typedef struct
 	 * refresh spike); higher = sharper static scenes at the cost of a bigger refresh spike. */
 	uint8_t static_scene_ibit_percent;
 
-	/* GDR/intra-refresh period in frames: how often the intra-refresh sweep + recovery-point SEI
-	 * cycle completes, decoupled from gop_size (which stays the rate-control window). 0 = use gop_size
-	 * (legacy). Smaller = smaller periodic refresh spike + faster mid-stream join at a small refresh-tax
-	 * cost; quality plateaus around 16. Only affects use-intra-refresh (GDR) mode. */
+	/* GDR/intra-refresh period in frames: how many pictures one full-frame refresh sweep is
+	 * spread over, decoupled from gop_size (which stays the rate-control window). 0 = use gop_size.
+	 * The sweep refreshes two CTB rows at a time and its steps are distributed evenly across the
+	 * period, so this really is the sweep length and not just a restart interval: a decoder joining
+	 * at a recovery point has a complete picture after this many frames. Shorter = faster mid-stream
+	 * join, but more of every picture is intra, so quality at a fixed bitrate falls. Only affects
+	 * use-intra-refresh (GDR) mode. */
 	uint8_t gdr_refresh_period;
 
 	/* If nonzero, the encoder pre-processor rotates the picture by 180 degrees
@@ -2303,8 +2306,31 @@ typedef struct
 	 * Only implemented for the VC8000E (i.MX8MP); other encoders ignore it. */
 	uint8_t rotation_180;
 
+	/* Which rate control drives the encoder.
+	 * 0 = the encoder's built-in rate control (default; everything above
+	 *     applies as documented).
+	 * 1 = new CBR: the built-in picture rate control is switched off and
+	 *     the QP of every picture is chosen by the rate control in
+	 *     ext_rate_control.c instead. It aims at a leaky bucket of
+	 *     hrd_buffer_size - the same buffer the HRD describes, enforced by
+	 *     the rate control rather than by the encoder - and re-encodes any
+	 *     picture large enough to threaten it.
+	 * Only implemented for the VC8000E. */
+	uint8_t rate_control_mode;
+
+	/* Maximum QP value for intra (I/IDR) frames. 0 = let the codec decide
+	 * (51, i.e. no ceiling). Lowering it puts a floor under the quality of
+	 * intra frames, at the cost of letting them grow. */
+	uint8_t qp_max_intra;
+
+	/* Maximum QP value for inter (P/B) frames. 0 = let the codec decide
+	 * (51, i.e. no ceiling). Lowering it puts a floor under the quality of
+	 * P/B frames; with rate_control_mode 1 it also bounds how far the
+	 * per-picture ceiling may push a picture that breaches it. */
+	uint8_t qp_max_inter;
+
 	/* Reserved bytes for ABI compatibility. */
-	uint8_t reserved[IMX_VPU_API_RESERVED_SIZE - sizeof(unsigned int) - sizeof(int) - sizeof(uint32_t) - sizeof(uint16_t) - sizeof(uint16_t) - sizeof(int8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t)  - sizeof(uint8_t) - sizeof(uint8_t)];
+	uint8_t reserved[IMX_VPU_API_RESERVED_SIZE - sizeof(unsigned int) - sizeof(int) - sizeof(uint32_t) - sizeof(uint16_t) - sizeof(uint16_t) - sizeof(int8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t)];
 }
 ImxVpuApiEncOpenParams;
 

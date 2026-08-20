@@ -50,6 +50,12 @@
 #include "hantro_VC8000E_enc/enccommon.h"
 #include "hantro_VC8000E_enc/base_type.h"
 
+/* New CBR (open_params.rate_control_mode == 1). Include order matters:
+ * vc8000e-shim.h (pulled in by the rate control header) only defines its
+ * VCEncOut conversion helper if the vendor header was seen first. */
+#include "vc8000e-shim.h"
+#include "ext_rate_control.h"
+
 
 
 
@@ -263,9 +269,35 @@ struct _ImxVpuApiEncoder
 	int last_refresh_picture;
 	int slice_last_refresh[MAX_ROLLING_SLICES];
 
+	/* Intra refresh (GDR) sweep state. The sweep is driven from here rather
+	 * than by the encoder's own gdrDuration, because the vendor's sweep
+	 * cannot be configured to do what this mode needs; see gdr_sweep_band().
+	 * gdr_sweep_pic counts pictures within the current sweep, gdr_sweep_step
+	 * is the index of the band that was refreshed last (-1 before the first
+	 * one). */
+	int gdr_sweep_pic;
+	int gdr_sweep_step;
+	/* recovery_point SEI emitted ahead of the picture that starts a sweep.
+	 * The encoder's own GDR used to produce this; driving the sweep from
+	 * here means producing it here too, or a decoder joining mid-stream has
+	 * nothing standard telling it when the picture will be complete. */
+	uint8_t recovery_sei[24];
+	size_t recovery_sei_size;
+
 	BOOL skipped_frame_available;
 	void *skipped_frame_context;
 	uint64_t skipped_frame_pts, skipped_frame_dts;
+
+	/* New CBR (open_params.rate_control_mode == 1). The encoder's own
+	 * picture rate control is switched off in that mode, and new_cbr picks
+	 * the QP for every picture instead. cached_rate_ctrl is the full
+	 * VCEncRateCtrl that was accepted at open time; per-picture updates
+	 * modify only its qpHdr and set it back, because VCEncGetRateCtrl does
+	 * not write every field of the struct (crf in particular) and a
+	 * get-modify-set would therefore apply values nobody asked for. */
+	BOOL new_cbr_active;
+	ExtRateControl new_cbr;
+	VCEncRateCtrl cached_rate_ctrl;
 };
 
 
@@ -545,6 +577,159 @@ static void vc8000_h264_force_no_reorder(uint8_t *data,size_t *size)
 	}
 }
 
+static void bitbuf_put(uint8_t *buf, unsigned *pos, uint32_t value, int num_bits)
+{
+	int i;
+
+	for (i = num_bits - 1; i >= 0; --i)
+	{
+		unsigned const bit = (value >> i) & 1u;
+
+		buf[*pos >> 3] |= (uint8_t)(bit << (7 - (*pos & 7)));
+		(*pos)++;
+	}
+}
+
+
+static void bitbuf_put_ue(uint8_t *buf, unsigned *pos, uint32_t value)
+{
+	uint32_t const shifted = value + 1;
+	int num_bits = 0;
+
+	while ((shifted >> num_bits) != 0)
+		num_bits++;
+
+	bitbuf_put(buf, pos, 0, num_bits - 1);
+	bitbuf_put(buf, pos, shifted, num_bits);
+}
+
+
+static void bitbuf_put_se(uint8_t *buf, unsigned *pos, int32_t value)
+{
+	bitbuf_put_ue(buf, pos, (value > 0) ? (uint32_t)(2 * value - 1) : (uint32_t)(-2 * value));
+}
+
+
+/* A recovery_point SEI in its own prefix NAL unit, to be sent immediately
+ * ahead of the picture that begins an intra refresh sweep. recovery_count is
+ * how many further pictures the decoder has to take before the picture is
+ * fully refreshed: recovery_frame_cnt for h.264, recovery_poc_cnt for h.265.
+ * Returns the number of bytes written.
+ *
+ * No emulation prevention is applied. The payload is two bytes, the first of
+ * which always has its top bit set (the leading one of the ue/se prefix), so
+ * the three byte sequences it would have to escape cannot occur. */
+static size_t build_recovery_point_sei(uint8_t *out, int recovery_count, BOOL is_h264)
+{
+	uint8_t payload[8];
+	unsigned pos = 0;
+	size_t payload_size;
+	size_t n = 0;
+
+	memset(payload, 0, sizeof(payload));
+
+	if (is_h264)
+	{
+		bitbuf_put_ue(payload, &pos, (uint32_t)recovery_count);   /* recovery_frame_cnt */
+		bitbuf_put(payload, &pos, 1, 1);                          /* exact_match_flag */
+		bitbuf_put(payload, &pos, 0, 1);                          /* broken_link_flag */
+		bitbuf_put(payload, &pos, 0, 2);                          /* changing_slice_group_idc */
+	}
+	else
+	{
+		bitbuf_put_se(payload, &pos, recovery_count);             /* recovery_poc_cnt */
+		bitbuf_put(payload, &pos, 1, 1);                          /* exact_match_flag */
+		bitbuf_put(payload, &pos, 0, 1);                          /* broken_link_flag */
+	}
+
+	bitbuf_put(payload, &pos, 1, 1);                              /* payload alignment */
+	while ((pos & 7) != 0)
+		bitbuf_put(payload, &pos, 0, 1);
+	payload_size = pos / 8;
+
+	out[n++] = 0x00; out[n++] = 0x00; out[n++] = 0x00; out[n++] = 0x01;
+	if (is_h264)
+	{
+		out[n++] = 0x06;             /* nal_ref_idc 0, nal_unit_type 6 (SEI) */
+	}
+	else
+	{
+		out[n++] = 0x4E;             /* nal_unit_type 39 (PREFIX_SEI), layer 0 */
+		out[n++] = 0x01;             /* temporal_id_plus1 */
+	}
+	out[n++] = 6;                    /* payloadType: recovery point */
+	out[n++] = (uint8_t)payload_size;
+	memcpy(out + n, payload, payload_size);
+	n += payload_size;
+	out[n++] = 0x80;                 /* rbsp_trailing_bits */
+
+	return n;
+}
+
+
+/* One step of the intra refresh sweep: the CTB rows band number
+ * "step" covers, when the picture's ctb_rows rows are split into
+ * num_steps contiguous bands of as equal a height as they divide into.
+ *
+ * The bands do not overlap and together they cover the picture exactly, which
+ * is the whole point of computing them here instead of letting the encoder do
+ * it. The encoder's own sweep (hevcencapi.c:6357-6371) makes the band one CTB
+ * row taller than the distance it advances, because bottom_pos is inclusive
+ * and it adds a full gdrAverageMBRows to it. Every row is therefore coded
+ * intra twice per sweep, and at 720p, where gdrAverageMBRows rounds down to
+ * zero and the band is two rows advancing by one, that is 22 row refreshes to
+ * cover 12 rows. Measured cost of the duplication: 0.67-0.70 dB of PSNR at a
+ * fixed bitrate.
+ *
+ * The encoder's sweep also advances exactly once per coded picture and cannot
+ * be slowed down, so gdr_refresh_period only decides how often a sweep
+ * restarts, not how long it takes. A sweep is over in ctb_rows-1 pictures and
+ * the rest of the period refreshes nothing, which concentrates all the intra
+ * coding of a period into a burst. Spreading the same refreshes evenly across
+ * the period instead is worth 30-60 ms of p99 queueing delay. */
+static void gdr_sweep_band(int ctb_rows, int num_steps, int step, int *top, int *bottom)
+{
+	int const base = ctb_rows / num_steps;
+	int const rem = ctb_rows % num_steps;
+	int const height = base + ((step < rem) ? 1 : 0);
+
+	*top = step * base + ((step < rem) ? step : rem);
+	*bottom = *top + height - 1;
+}
+
+
+/* How many bands one sweep is split into: two CTB rows per band, which is also
+ * what the rolling modes end up with at 720p, so the two are comparable.
+ *
+ * The hardware can address a single row, but a one row band measures worse
+ * than every coarser one tried, on both test clips and with either rate
+ * control - it is the shape with the least intra prediction context to work
+ * with, and it needs twice as many refresh pictures to cover the picture.
+ * Above two rows the differences are inside the run to run spread. A sweep
+ * still cannot have more steps than it has pictures to spread them over. */
+static int gdr_sweep_num_steps(int ctb_rows, int period)
+{
+	int num_steps = (ctb_rows + 1) / 2;
+
+	if (num_steps > period)
+		num_steps = period;
+	if (num_steps < 1)
+		num_steps = 1;
+
+	return num_steps;
+}
+
+
+static int gdr_sweep_period(ImxVpuApiEncOpenParams const *open_params)
+{
+	int period = (open_params->gdr_refresh_period > 0)
+	           ? open_params->gdr_refresh_period
+	           : (int)(open_params->gop_size);
+
+	return (period > 0) ? period : 1;
+}
+
+
 static void init_encoder_input(ImxVpuApiEncoder *encoder,
                                int num_rolling_slices,
                                int num_rolling_tiles)
@@ -559,14 +744,16 @@ static void init_encoder_input(ImxVpuApiEncoder *encoder,
 	encoder_input->gopConfig.size = 1;
 	encoder_input->gopConfig.special_size = 0;
 	encoder_input->gopConfig.pGopPicSpecialCfg = &encoder->gop_pic_special_config[0];
-	encoder_input->gopConfig.idr_interval = ((num_rolling_slices > 0) || (num_rolling_tiles > 0)) ? INT32_MAX : open_params->gop_size;
-	if (open_params->flags & IMX_VPU_API_ENC_OPEN_PARAMS_FLAG_USE_INTRA_REFRESH)
-	{
-		/* Refresh period decoupled from gop_size (RC window). 0 => gop_size (legacy). */
-		unsigned gdr_period = (open_params->gdr_refresh_period > 0) ? (unsigned)open_params->gdr_refresh_period : (unsigned)open_params->gop_size;
-		encoder_input->gopConfig.gdrDuration = gdr_period;
-		encoder_input->gopConfig.idr_interval = gdr_period;
-	}
+	/* Intra refresh is driven from this file (see gdr_sweep_band()), so it
+	 * wants the same gopConfig as the rolling modes: no periodic IDR, and
+	 * gdrDuration left at zero so VCEncFindNextPic() never asks for an intra
+	 * picture. Leaving the encoder's own GDR on would take the intra area
+	 * away - it overwrites intraArea and roi1Area on every picture
+	 * (hevcencapi.c:6340-6394) and rejects any intraArea set from here. */
+	encoder_input->gopConfig.idr_interval = ((num_rolling_slices > 0) || (num_rolling_tiles > 0)
+	                                      || (open_params->flags & IMX_VPU_API_ENC_OPEN_PARAMS_FLAG_USE_INTRA_REFRESH))
+	                                      ? INT32_MAX : open_params->gop_size;
+	encoder_input->gopConfig.gdrDuration = 0;
 	encoder_input->gopConfig.firstPic = 0;
 	encoder_input->gopConfig.lastPic = INT32_MAX;
 	encoder_input->gopConfig.outputRateNumer = open_params->frame_rate_numerator;
@@ -644,10 +831,11 @@ static ImxVpuApiEncReturnCodes init_vcenc_instance(ImxVpuApiEncoder *encoder,
 		                         || (open_params->format_specific_open_params.h264_open_params.profile != IMX_VPU_API_H264_PROFILE_BASELINE);
 		coding_config.cirStart = 0;
 		coding_config.cirInterval = open_params->min_intra_refresh_mb_count;
-		if (open_params->flags & IMX_VPU_API_ENC_OPEN_PARAMS_FLAG_USE_INTRA_REFRESH)
-			coding_config.gdrDuration = (open_params->gdr_refresh_period > 0) ? open_params->gdr_refresh_period : open_params->gop_size;
-		else
-			coding_config.gdrDuration = 0;
+		/* Always zero: the sweep is run from this file. A nonzero value here
+		 * also silently forces cu_qp_delta_enabled_flag on in the PPS
+		 * (hevcencapi.c:2324) and stamps roi1DeltaQp onto the refresh band,
+		 * neither of which this mode wants. */
+		coding_config.gdrDuration = 0;
 
 		/* These are set to the defaults specified in hevcencapi.h */
 		coding_config.noiseLow = 10;
@@ -692,6 +880,8 @@ static ImxVpuApiEncReturnCodes init_vcenc_instance(ImxVpuApiEncoder *encoder,
 
 		encoder->roll_size = (int)encoder->open_params.roll_size;
 		encoder->last_refresh_picture = -1000000;
+		encoder->gdr_sweep_pic = 0;
+		encoder->gdr_sweep_step = -1;
 		{
 			int i;
 			for (i = 0; i < MAX_ROLLING_SLICES; i++)
@@ -709,6 +899,54 @@ static ImxVpuApiEncReturnCodes init_vcenc_instance(ImxVpuApiEncoder *encoder,
 		VCEncRateCtrl rate_control_config;
 		memset(&rate_control_config, 0, sizeof(rate_control_config));
 		BOOL use_rate_control = (open_params->bitrate != 0);
+		BOOL use_new_cbr = (open_params->rate_control_mode == 1) && use_rate_control;
+
+		/* This runs again on an auto-recovery restart, so the controller is
+		 * always rebuilt from scratch rather than resumed - a restart is a
+		 * new stream, and the bucket level from before it describes a link
+		 * state that no longer applies. */
+		encoder->new_cbr_active = FALSE;
+
+		if (use_new_cbr)
+		{
+			ExtRateControlParams rc_params;
+
+			memset(&rc_params, 0, sizeof(rc_params));
+			rc_params.bitrate_bps = open_params->bitrate * 1000;
+			rc_params.frame_rate_numerator = open_params->frame_rate_numerator;
+			rc_params.frame_rate_denominator = open_params->frame_rate_denominator;
+			rc_params.frame_width = open_params->frame_width;
+			rc_params.frame_height = open_params->frame_height;
+			/* Same buffer the HRD describes, in kbits. Both rate controls
+			 * are sizing the coded data allowed in flight; this one just
+			 * enforces it itself instead of leaving it to the encoder, so
+			 * the USE_HRD flag is not needed with it. */
+			rc_params.buffer_bits = (unsigned int)(open_params->hrd_buffer_size) * 1000u;
+			rc_params.qp_min_inter = open_params->qp_min_inter;
+			rc_params.qp_max_inter = open_params->qp_max_inter;
+			rc_params.qp_min_intra = open_params->qp_min_intra;
+			rc_params.qp_max_intra = open_params->qp_max_intra;
+
+			if (ext_rate_control_init(&encoder->new_cbr, &rc_params) != 0)
+			{
+				IMX_VPU_API_ERROR("could not initialize the new CBR rate control; falling back to the encoder's own");
+				use_new_cbr = FALSE;
+			}
+			else
+			{
+				encoder->new_cbr_active = TRUE;
+				IMX_VPU_API_INFO(
+					"new CBR: %u kbps, %.2f fps, %.0f bit bucket (%.0f ms at this rate), cap %.0f bits/picture, QP %d..%d",
+					open_params->bitrate,
+					encoder->new_cbr.frame_rate,
+					encoder->new_cbr.bucket_cap,
+					encoder->new_cbr.bucket_cap * 1000.0 / (double)(open_params->bitrate * 1000),
+					encoder->new_cbr.bucket_cap * encoder->new_cbr.cap_share,
+					encoder->new_cbr.qp_min_inter,
+					encoder->new_cbr.qp_max_inter
+				);
+			}
+		}
 
 		if (use_rate_control)
 			IMX_VPU_API_INFO("using constant bitrate encoding with bitrate set to %u kbps", open_params->bitrate);
@@ -722,7 +960,12 @@ static ImxVpuApiEncReturnCodes init_vcenc_instance(ImxVpuApiEncoder *encoder,
 		rate_control_config.qpHdr = use_rate_control ? -1 : ((int)(open_params->quantization));
 		rate_control_config.qpMinI = use_rate_control ? (int)open_params->qp_min_intra : (int)open_params->quantization;
 		rate_control_config.qpMinPB = use_rate_control ? (int)open_params->qp_min_inter : (int)open_params->quantization;
-		rate_control_config.qpMaxPB = rate_control_config.qpMaxI = use_rate_control ? 51 : open_params->quantization;
+		rate_control_config.qpMaxI = use_rate_control
+		                           ? ((open_params->qp_max_intra > 0) ? (int)open_params->qp_max_intra : 51)
+		                           : (int)open_params->quantization;
+		rate_control_config.qpMaxPB = use_rate_control
+		                            ? ((open_params->qp_max_inter > 0) ? (int)open_params->qp_max_inter : 51)
+		                            : (int)open_params->quantization;
 		/* Set the bitrate, in bps. open_params->bitrate is given
 		 * in kbps, so a multiplication by 1000 is necessary. */
 		rate_control_config.bitPerSecond = open_params->bitrate * 1000;
@@ -777,7 +1020,7 @@ static ImxVpuApiEncReturnCodes init_vcenc_instance(ImxVpuApiEncoder *encoder,
 		 * spikes either. Values are conservative defaults -- tune on-device for the
 		 * smoothness/quality trade-off. Only active when HRD is requested, so other modes
 		 * keep the original behaviour. */
-		if (rate_control_config.hrd)
+		if (rate_control_config.hrd && !use_new_cbr)
 		{
 			rate_control_config.ctbRc = 1;             /* per-CTB QP: spread bits within a frame */
 			if (rate_control_config.blockRCSize == 0)
@@ -831,6 +1074,48 @@ static ImxVpuApiEncReturnCodes init_vcenc_instance(ImxVpuApiEncoder *encoder,
 			 * stream under sustained overload, e.g. darkness sensor noise). */
 		}
 
+		if (use_new_cbr)
+		{
+			/* Everything that would otherwise decide a QP is switched off
+			 * here, because the QP comes from ext_rate_control_pre()
+			 * instead and any second opinion silently overrides it. */
+
+			/* With pictureRc on, qpHdr is only a suggestion: the encoder
+			 * quietly uses its own value, and every setting we make below
+			 * produces byte-identical output. */
+			rate_control_config.pictureRc = 0;
+			rate_control_config.ctbRc = 0;
+			rate_control_config.vbr = 0;
+			rate_control_config.pictureSkip = 0;
+			/* Our own leaky bucket does this job, and it does it without
+			 * dropping pictures: the hardware HRD skips a picture after
+			 * committing its POC, which leaves the decoder hunting for a
+			 * reference that was never coded. */
+			rate_control_config.hrd = 0;
+			rate_control_config.hrdCpbSize = 0;
+			/* VCEncGetRateCtrl does not write this field, so after the
+			 * memset above it reads 0, which the encoder takes as "CRF
+			 * enabled at QP 0". It has to be disabled explicitly. */
+			rate_control_config.crf = -1;
+			/* The intra QP bias would code intra pictures at a QP nobody
+			 * asked for, which is exactly what the caller is trying to
+			 * control here. */
+			rate_control_config.intraQpDelta = 0;
+			rate_control_config.fixedIntraQp = 0;
+			rate_control_config.u32StaticSceneIbitPercent = 0;
+			/* The full 0..51 range, bounded by the rate control itself.
+			 * An arbitrary floor is not harmless: easy content at a
+			 * generous bitrate genuinely needs the bottom of the range,
+			 * and with a floor of 10 most pictures of gentle aerial
+			 * footage sit pinned at it and the stream lands far under the
+			 * requested rate. */
+			rate_control_config.qpMinI  = encoder->new_cbr.qp_min_intra;
+			rate_control_config.qpMaxI  = encoder->new_cbr.qp_max_intra;
+			rate_control_config.qpMinPB = encoder->new_cbr.qp_min_inter;
+			rate_control_config.qpMaxPB = encoder->new_cbr.qp_max_inter;
+			rate_control_config.qpHdr = ext_rate_control_pre(&encoder->new_cbr, 1);
+		}
+
 		enc_ret = VCEncSetRateCtrl(encoder->encoder, &rate_control_config);
 		if (enc_ret != VCENC_OK)
 		{
@@ -839,6 +1124,11 @@ static ImxVpuApiEncReturnCodes init_vcenc_instance(ImxVpuApiEncoder *encoder,
 			encoder->encoder = NULL;
 			return IMX_VPU_API_ENC_RETURN_CODE_ERROR;
 		}
+
+		/* Keep the configuration that was accepted, so per-picture QP
+		 * updates can be made against it rather than against whatever
+		 * VCEncGetRateCtrl happens to fill in. */
+		encoder->cached_rate_ctrl = rate_control_config;
 	}
 
 
@@ -1321,6 +1611,33 @@ void imx_vpu_api_enc_close(ImxVpuApiEncoder *encoder)
 
 	IMX_VPU_API_DEBUG("closing encoder");
 
+	/* The rate control's own account of the stream it just produced. The
+	 * bucket is charged the coded bits plus whatever the content terms
+	 * decided not to ask for, so in steady state the stream's rate is the
+	 * configured rate minus the unspent share - which makes "trimmed" the
+	 * first number to look at when the output lands under the bitrate that
+	 * was requested. */
+	if (encoder->new_cbr_active && (encoder->new_cbr.num_pictures > 0))
+	{
+		ExtRateControl const *rc = &encoder->new_cbr;
+		double const pictures = (double)(rc->num_pictures);
+
+		IMX_VPU_API_INFO(
+			"new CBR summary: %lu pictures, %.0f kbps of %.0f kbps configured, "
+			"trimmed %lu pictures by %.0f kbps on average, %lu re-encodes, "
+			"bucket empty on %lu pictures, fill mean %.2f max %.2f",
+			rc->num_pictures,
+			rc->sum_bits / pictures * rc->frame_rate / 1000.0,
+			rc->bit_per_pic * rc->frame_rate / 1000.0,
+			rc->num_trimmed,
+			rc->sum_unspent / pictures * rc->frame_rate / 1000.0,
+			rc->num_reencodes,
+			rc->num_bucket_empty,
+			rc->sum_fill / pictures,
+			rc->max_fill
+		);
+	}
+
 	if (encoder->encoder != NULL)
 		VCEncRelease(encoder->encoder);
 
@@ -1520,6 +1837,44 @@ static ImxVpuApiEncReturnCodes restart_encoder(ImxVpuApiEncoder *encoder)
 }
 
 
+/* The Hantro VC8000E blob prints unconditional stdout debug while assembling the
+ * bitstream ("RecoveryPoint sei size=%d", "PicTiming sei size=%d", "BufferingSei
+ * sei size=%d", "UserDataUnreg sei size=%d", ...). With a per-picture recovery SEI
+ * (use-intra-refresh / gdr_refresh_period) and/or use-hrd timing SEIs this is several
+ * lines per frame, flooding the service journal. The blob has no trace toggle (it does
+ * not link getenv) and reports real errors via return codes + stderr, not these prints,
+ * so mute only fd 1 (stdout) for the duration of this one call.
+ * NOTE: fd 1 is process-global. This is safe because the encode loop is single-threaded
+ * per encoder instance; concurrent encoder instances in one process would need a shared
+ * lock around the swap to avoid clobbering each other's saved fd. */
+static VCEncRet encode_one_picture(ImxVpuApiEncoder *encoder, VCEncIn *encoder_input, VCEncOut *encoder_output)
+{
+	VCEncRet enc_ret;
+	int saved_stdout_fd = -1;
+	int devnull_fd = open("/dev/null", O_WRONLY);
+
+	if (devnull_fd >= 0)
+	{
+		fflush(stdout);
+		saved_stdout_fd = dup(STDOUT_FILENO);
+		(void)dup2(devnull_fd, STDOUT_FILENO);
+	}
+
+	enc_ret = VCEncStrmEncode(encoder->encoder, encoder_input, encoder_output, NULL, NULL);
+
+	if (saved_stdout_fd >= 0)
+	{
+		fflush(stdout);
+		(void)dup2(saved_stdout_fd, STDOUT_FILENO);
+		close(saved_stdout_fd);
+	}
+	if (devnull_fd >= 0)
+		close(devnull_fd);
+
+	return enc_ret;
+}
+
+
 ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t *encoded_frame_size, ImxVpuApiEncOutputCodes *output_code)
 {
 	ImxVpuApiFramebufferMetrics *fb_metrics;
@@ -1569,7 +1924,8 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 	if (is_first_picture)
 	{
 		BOOL use_refresh_mode = (encoder->num_rolling_slices > 0)
-		                     || (encoder->num_rolling_tiles  > 0);
+		                     || (encoder->num_rolling_tiles  > 0)
+		                     || (encoder->open_params.flags & IMX_VPU_API_ENC_OPEN_PARAMS_FLAG_USE_INTRA_REFRESH);
 		if (use_refresh_mode)
 		{
 			IMX_VPU_API_DEBUG("refresh mode: no IDR — first picture encoded as non-IDR I-frame");
@@ -1637,6 +1993,7 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 
 	*encoded_frame_size = 0;
 	encoder->num_bytes_in_stream_buffer = 0;
+	encoder->recovery_sei_size = 0;
 
 	if (is_first_picture)
 	{
@@ -1691,25 +2048,113 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 
 		IMX_VPU_API_DEBUG("updating rate control configuration to use new bitrate");
 
-		enc_ret = VCEncGetRateCtrl(encoder->encoder, &rate_control_config);
-		if (enc_ret != VCENC_OK)
+		/* In new-CBR mode the encoder's copy of the bitrate is not what
+		 * drives anything - our own controller is - but keep the two in
+		 * step so a later VCEncGetRateCtrl still reports the truth. */
+		if (encoder->new_cbr_active)
 		{
-			IMX_VPU_API_ERROR("could not get current rate control configuration: %s (%d)", vcenc_retval_to_string(enc_ret), (int)enc_ret);
-			goto error;
+			ext_rate_control_set_bitrate(&encoder->new_cbr, encoder->new_bitrate);
+			encoder->cached_rate_ctrl.bitPerSecond = encoder->new_bitrate;
+			encoder->new_bitrate = 0;
+
+			enc_ret = VCEncSetRateCtrl(encoder->encoder, &(encoder->cached_rate_ctrl));
+			if (enc_ret != VCENC_OK)
+			{
+				IMX_VPU_API_ERROR("could not set updated rate control configuration: %s (%d)", vcenc_retval_to_string(enc_ret), (int)enc_ret);
+				goto error;
+			}
 		}
-
-		rate_control_config.bitPerSecond = encoder->new_bitrate;
-		encoder->new_bitrate = 0;
-
-		enc_ret = VCEncSetRateCtrl(encoder->encoder, &rate_control_config);
-		if (enc_ret != VCENC_OK)
+		else
 		{
-			IMX_VPU_API_ERROR("could not set updated rate control configuration: %s (%d)", vcenc_retval_to_string(enc_ret), (int)enc_ret);
-			goto error;
+			enc_ret = VCEncGetRateCtrl(encoder->encoder, &rate_control_config);
+			if (enc_ret != VCENC_OK)
+			{
+				IMX_VPU_API_ERROR("could not get current rate control configuration: %s (%d)", vcenc_retval_to_string(enc_ret), (int)enc_ret);
+				goto error;
+			}
+
+			rate_control_config.bitPerSecond = encoder->new_bitrate;
+			encoder->new_bitrate = 0;
+
+			enc_ret = VCEncSetRateCtrl(encoder->encoder, &rate_control_config);
+			if (enc_ret != VCENC_OK)
+			{
+				IMX_VPU_API_ERROR("could not set updated rate control configuration: %s (%d)", vcenc_retval_to_string(enc_ret), (int)enc_ret);
+				goto error;
+			}
 		}
 	}
 
 	int sei_refresh = 0, sei_top = 0, sei_bottom = 0;
+
+	if ((encoder->open_params.flags & IMX_VPU_API_ENC_OPEN_PARAMS_FLAG_USE_INTRA_REFRESH) && !is_idr &&
+	    (encoder->open_params.compression_format == IMX_VPU_API_COMPRESSION_FORMAT_H265))
+	{
+		int const frame_h  = (int)(encoder->open_params.frame_height);
+		int const frame_w  = (int)(encoder->open_params.frame_width);
+		int const ctu_rows = (frame_h + 63) / 64;
+		int const ctu_cols = (frame_w + 63) / 64;
+		int const period   = gdr_sweep_period(&(encoder->open_params));
+		int const num_steps = gdr_sweep_num_steps(ctu_rows, period);
+		/* Which band this picture belongs to. Stepping on the change of this
+		 * quotient spreads num_steps refreshes across period pictures as
+		 * evenly as they divide, with no idle tail. */
+		int const step = (encoder->gdr_sweep_pic * num_steps) / period;
+
+		if (step != encoder->gdr_sweep_step)
+		{
+			int top, bottom;
+
+			if (step == 0)
+			{
+				/* Pictures from this one to the one carrying the last band.
+				 * The steps are spread by the same quotient used above, so
+				 * the last one lands on ceil((num_steps-1) * period / num_steps). */
+				int const recovery_count =
+					((num_steps - 1) * period + num_steps - 1) / num_steps;
+
+				encoder->recovery_sei_size = build_recovery_point_sei(
+					encoder->recovery_sei, recovery_count,
+					encoder->open_params.compression_format == IMX_VPU_API_COMPRESSION_FORMAT_H264);
+			}
+
+			gdr_sweep_band(ctu_rows, num_steps, step, &top, &bottom);
+			if (bottom >= ctu_rows)
+				bottom = ctu_rows - 1;
+
+			encoder->gdr_sweep_step = step;
+			encoder->cached_coding_ctrl.intraArea.enable = 1;
+			encoder->cached_coding_ctrl.intraArea.left   = 0;
+			encoder->cached_coding_ctrl.intraArea.right  = ctu_cols - 1;
+			encoder->cached_coding_ctrl.intraArea.top    = top;
+			encoder->cached_coding_ctrl.intraArea.bottom = bottom;
+
+			enc_ret = VCEncSetCodingCtrl(encoder->encoder, &(encoder->cached_coding_ctrl));
+			if (enc_ret != VCENC_OK)
+			{
+				IMX_VPU_API_ERROR("could not set intra refresh band, CTB rows %d..%d: %s (%d)",
+				                  top, bottom, vcenc_retval_to_string(enc_ret), (int)enc_ret);
+				goto error;
+			}
+
+			sei_refresh = 1; sei_top = top; sei_bottom = bottom;
+			if (getenv("VR_FORCED_INTRA_DEBUG"))
+				fprintf(stderr, "VR intra refresh: CTB rows %d..%d (frame %d, step %d/%d)\n",
+				        top, bottom, (int)encoder->num_encoded_pictures, step, num_steps);
+		}
+		else if (encoder->cached_coding_ctrl.intraArea.enable)
+		{
+			encoder->cached_coding_ctrl.intraArea.enable = 0;
+			VCEncSetCodingCtrl(encoder->encoder, &(encoder->cached_coding_ctrl));
+		}
+
+		encoder->gdr_sweep_pic++;
+		if (encoder->gdr_sweep_pic >= period)
+		{
+			encoder->gdr_sweep_pic = 0;
+			encoder->gdr_sweep_step = -1;
+		}
+	}
 
 	if ((encoder->num_rolling_slices > 0) && !is_idr &&
 	    (encoder->open_params.compression_format == IMX_VPU_API_COMPRESSION_FORMAT_H265))
@@ -1867,39 +2312,59 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 		}
 	}
 
+	/* New CBR: pick this picture's QP before handing it to the encoder. */
+	if (encoder->new_cbr_active)
+	{
+		int qp = ext_rate_control_pre(&encoder->new_cbr, (encoder_input->codingType == VCENC_INTRA_FRAME));
+
+		encoder->cached_rate_ctrl.qpHdr = qp;
+		enc_ret = VCEncSetRateCtrl(encoder->encoder, &(encoder->cached_rate_ctrl));
+		if (enc_ret != VCENC_OK)
+		{
+			IMX_VPU_API_ERROR("could not set QP %d for picture %" PRId32 ": %s (%d)",
+			                  qp, encoder->num_encoded_pictures,
+			                  vcenc_retval_to_string(enc_ret), (int)enc_ret);
+			goto error;
+		}
+	}
+
 	/* Perform the actual frame encoding. */
 	memset(&encoder_output, 0, sizeof(encoder_output));
-	/* The Hantro VC8000E blob prints unconditional stdout debug while assembling the
-	 * bitstream ("RecoveryPoint sei size=%d", "PicTiming sei size=%d", "BufferingSei
-	 * sei size=%d", "UserDataUnreg sei size=%d", ...). With a per-picture recovery SEI
-	 * (use-intra-refresh / gdr_refresh_period) and/or use-hrd timing SEIs this is several
-	 * lines per frame, flooding the service journal. The blob has no trace toggle (it does
-	 * not link getenv) and reports real errors via return codes + stderr, not these prints,
-	 * so mute only fd 1 (stdout) for the duration of this one call.
-	 * NOTE: fd 1 is process-global. This is safe because the encode loop is single-threaded
-	 * per encoder instance; concurrent encoder instances in one process would need a shared
-	 * lock around the swap to avoid clobbering each other's saved fd. */
+	enc_ret = encode_one_picture(encoder, encoder_input, &encoder_output);
+
+	/* New CBR: a picture past the ceiling is re-encoded coarser. Only the
+	 * attempt that is kept is reported to the rate control, so its model
+	 * never sees the discarded ones. Re-encoding is deterministic and leaves
+	 * the reference chain intact - the encoder has not been told to advance
+	 * yet, which is what VCEncFindNextPic() below does. */
+	if (encoder->new_cbr_active && (enc_ret == VCENC_FRAME_READY))
 	{
-		int saved_stdout_fd = -1;
-		int devnull_fd = open("/dev/null", O_WRONLY);
-		if (devnull_fd >= 0)
+		int const is_intra = (encoder_output.codingType == VCENC_INTRA_FRAME);
+		int kept_qp = encoder->cached_rate_ctrl.qpHdr;
+		int qp;
+
+		while ((qp = ext_rate_control_check(&encoder->new_cbr, (size_t)(encoder_output.streamSize) * 8, is_intra)) > 0)
 		{
-			fflush(stdout);
-			saved_stdout_fd = dup(STDOUT_FILENO);
-			(void)dup2(devnull_fd, STDOUT_FILENO);
+			VCEncOut retry_output;
+
+			encoder->cached_rate_ctrl.qpHdr = qp;
+			if (VCEncSetRateCtrl(encoder->encoder, &(encoder->cached_rate_ctrl)) != VCENC_OK)
+				break;
+
+			memset(&retry_output, 0, sizeof(retry_output));
+			if (encode_one_picture(encoder, encoder_input, &retry_output) != VCENC_FRAME_READY)
+				break;
+
+			encoder_output = retry_output;
+			kept_qp = qp;
 		}
 
-		enc_ret = VCEncStrmEncode(encoder->encoder, encoder_input, &encoder_output, NULL, NULL);
-
-		if (saved_stdout_fd >= 0)
-		{
-			fflush(stdout);
-			(void)dup2(saved_stdout_fd, STDOUT_FILENO);
-			close(saved_stdout_fd);
-		}
-		if (devnull_fd >= 0)
-			close(devnull_fd);
+		/* An attempt that was proposed but never produced output must not be
+		 * what the model learns from - the QP the kept bits were coded at is
+		 * the only one that describes them. */
+		encoder->new_cbr.current_qp = kept_qp;
 	}
+
 	if (enc_ret == VCENC_HRD_ERROR)
 	{
 		/* HRD/CPB overflow: the hardware discarded this picture by design and
@@ -1968,7 +2433,39 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 	}
 
 	encoder->num_bytes_in_stream_buffer = encoder_output.streamSize;
-	*encoded_frame_size += encoder_output.streamSize;
+	*encoded_frame_size += encoder_output.streamSize + encoder->recovery_sei_size;
+
+	/* New CBR: report the attempt that was kept. Only the picture's own bits
+	 * are counted, not a header that may be prepended to it - the header is
+	 * ~90 bytes against several kilobytes of picture, and charging it would
+	 * teach the model that a refresh picture is more expensive than it is. */
+	if (encoder->new_cbr_active)
+	{
+		ExtRateControlStats cu_stats;
+		unsigned int total_blocks = (unsigned int)((encoder->open_params.frame_width / 8) * (encoder->open_params.frame_height / 8));
+
+		vc8000e_fill_rc_stats(&cu_stats, &encoder_output, total_blocks);
+		ext_rate_control_post(
+			&encoder->new_cbr,
+			(size_t)(encoder_output.streamSize) * 8,
+			(encoder_output.codingType == VCENC_INTRA_FRAME),
+			&cu_stats
+		);
+
+		IMX_VPU_API_LOG(
+			"new CBR: picture %" PRId32 " qp %d target %d bits %u (%+d%%) bucket %.0f/%.0f coded %u/%u",
+			encoder->num_encoded_pictures,
+			encoder->new_cbr.current_qp,
+			ext_rate_control_target(&encoder->new_cbr),
+			(unsigned int)(encoder_output.streamSize * 8),
+						(ext_rate_control_target(&encoder->new_cbr) > 0)
+				? (int)(((double)(encoder_output.streamSize) * 8.0 - ext_rate_control_target(&encoder->new_cbr))
+				        * 100.0 / ext_rate_control_target(&encoder->new_cbr))
+				: 0,
+			encoder->new_cbr.bucket, encoder->new_cbr.bucket_cap,
+			total_blocks - cu_stats.skip_blocks, total_blocks
+		);
+	}
 
 	/* Request the coding type for the next frame. This must be called, even
 	 * when encoding h.264 (contrary to the comments in the hevcencapi.h header),
@@ -2041,6 +2538,14 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_get_encoded_frame_ext(ImxVpuApiEncoder *
 	{
 		memcpy(encoded_data, encoder->header_data, encoder->header_data_size);
 		encoded_data += encoder->header_data_size;
+	}
+
+	/* After the parameter sets, before the slice: a prefix SEI has to precede
+	 * the first VCL NAL of the picture it applies to. */
+	if (encoder->recovery_sei_size > 0)
+	{
+		memcpy(encoded_data, encoder->recovery_sei, encoder->recovery_sei_size);
+		encoded_data += encoder->recovery_sei_size;
 	}
 
 
