@@ -83,10 +83,35 @@ int ext_rate_control_init(ExtRateControl *rc, ExtRateControlParams const *params
 	if (rc->qp_max_intra < rc->qp_min_intra) rc->qp_max_intra = rc->qp_min_intra;
 
 	/* How hard the bucket level pulls the target around, and the level it is
-	 * held at. Sitting at 0.15 rather than half full keeps most of the
-	 * bucket free for a burst, which is what it is for. */
-	rc->gain = env_double("EXT_RC_GAIN", 0.5);
-	rc->setpoint = env_double("EXT_RC_SET", 0.15);
+	 * held at.
+	 *
+	 * The bucket is the accumulated difference between what was coded and
+	 * what the link drained, so this term is integral action on rate error
+	 * and the setpoint is a standing queue the controller is content to
+	 * carry. Both matter more than they look: the queue it settles at *is*
+	 * the latency. It settles where gain * (fill - setpoint) cancels
+	 * whatever the content term is asking for above budget, so a low gain
+	 * buys a high equilibrium fill.
+	 *
+	 * At the original 0.5 and 0.15 that equilibrium was far away from the
+	 * setpoint. On harbour_4cif at 600 kbps the fill settled at 0.82 of the
+	 * buffer, the stream ran 5.4% over the target rate, and p99 queueing
+	 * delay was 588 ms against the encoder's own rate control at 211 ms -
+	 * with the frame sizes themselves innocent: drained at the rate it
+	 * actually produced, that same stream measures 190 ms. The excess *was*
+	 * the standing queue.
+	 *
+	 * 4.0 and 0.05 pull the equilibrium down to 0.21 and the rate to within
+	 * 1%, and p99 to 157 ms. Measured over the classic sequences the trade
+	 * is latency roughly halved for 0.06-0.63 dB, with per-picture PSNR
+	 * spread no wider than the encoder's own; on the 720p aerial footage it
+	 * is better on both axes (fpv 339 -> 142 ms and mountain 297 -> 123 ms
+	 * at a 714 ms buffer, PSNR within 0.01 dB). Raising the gain further
+	 * keeps buying a little latency for a little quality - 8.0 reaches
+	 * 120 ms on harbour - so this is a chosen operating point rather than an
+	 * optimum. */
+	rc->gain = env_double("EXT_RC_GAIN", 4.0);
+	rc->setpoint = env_double("EXT_RC_SET", 0.05);
 	/* Floor and ceiling on the target, as fractions of the nominal budget.
 	 * The floor bounds how far the content terms may pull the target down;
 	 * at 0.25 it capped them at 4x, i.e. 7.4 QP, which pinned easy content
@@ -97,21 +122,78 @@ int ext_rate_control_init(ExtRateControl *rc, ExtRateControlParams const *params
 	 * content that needs it and charges the bucket for the trim, for no
 	 * gain. Snap it to 1 and leave both alone. */
 	rc->deadband = env_double("EXT_RC_DEAD", 0.90);
-	/* How much of what was not requested is still charged to the bucket.
-	 * 1.0 forfeits the lot. This is load bearing rather than a refinement:
-	 * without it a drained bucket re-inflates the next target and QP walks
-	 * back down to where the spikes come from. */
-	rc->unspent_share = env_double("EXT_RC_UNSPENT", 1.0);
+	/* How much of what the content terms did not ask for is still charged to
+	 * the bucket, so that a calm stretch cannot bank credit for the first
+	 * hard picture to spend all at once.
+	 *
+	 * Off. The reasoning was sound and the implementation was not: the
+	 * charge is bit_per_pic * (1 - scale), which ignores what the picture
+	 * actually cost, and at a share of 1.0 it cancels the bit_per_pic drain
+	 * term outright - the bucket stops being a leaky bucket and becomes a
+	 * pure integrator. On content whose scale sits persistently below 1 the
+	 * result was a stream delivering a quarter to a half of the bitrate it
+	 * was asked for: 82 kbps of a 150 kbps target on foreman_cif, and the
+	 * accounting identity "delivered = configured - trimmed" held exactly,
+	 * so it was doing precisely what it says. Turning it off recovered 27 to
+	 * 50 percentage points of rate utilisation across the classic
+	 * sequences.
+	 *
+	 * What it was defending against is real, and the bucket term at the gain
+	 * above now does that job: an unspent picture leaves the bucket low, a
+	 * low bucket raises the next target, and the raise is bounded rather
+	 * than a forfeit. A charge that accumulates and is relaxed gradually is
+	 * the better shape of the original idea and is not written yet. */
+	rc->unspent_share = env_double("EXT_RC_UNSPENT", 0.0);
+	/* Ceiling on the very first picture, as a share of the buffer.
+	 *
+	 * It is the one picture with no model behind it: pre() has nothing to
+	 * predict from and falls back to a fixed QP 32, and the discretionary
+	 * cap below deliberately exempts intra pictures, so the only thing
+	 * bounding it is buffer overflow - the whole buffer. That guess suits
+	 * 720p at 1400 kbps and nothing else. On 4CIF at 600 kbps it produced
+	 * 253 kbit into a 429 kbit buffer, 59% of the buffer in one picture,
+	 * which then takes ~250 pictures to drain and sets p99 for the entire
+	 * run: 471 ms against the 159 ms of the encoder's own rate control.
+	 *
+	 * 0.15 is the standing queue the bucket term is willing to carry anyway
+	 * (EXT_RC_SET), so an intra picture that fits inside it cannot be what
+	 * sets the delay. Measured on soccer_4cif: p99 471 -> 227 ms at the same
+	 * bitrate and the same mean QP, because it is one picture in 600. The
+	 * knee is at about 19% of the buffer, so this has a little margin.
+	 *
+	 * Deliberately not tied to setpoint: retuning the standing queue should
+	 * not silently retune what an intra picture may cost. 0 disables it. */
+	rc->first_intra_share = env_double("EXT_RC_FIRST_INTRA", 0.15);
 	/* Bounds on the relative-complexity term, so one anomalous picture
 	 * cannot hand the next one an unbounded budget or starve it. */
 	rc->cplx_min = env_double("EXT_RC_CPLX_MIN", 0.25);
 	rc->cplx_max = env_double("EXT_RC_CPLX_MAX", 4.00);
 	/* Absolute term: how much of the picture actually needed coding, against
-	 * a reference for busy content. Linear in the coded fraction is not
-	 * steep enough - a picture coding a quarter of its blocks wants far less
-	 * than a quarter of the budget - so the exponent shapes the curve. */
+	 * a reference for busy content, with the exponent shaping the curve.
+	 *
+	 * Off, because it is a positive feedback loop. coded_prev is
+	 * total_blocks - skip_blocks from the previous picture, and SKIP is a
+	 * decision the quantiser drives: a high QP sends blocks to SKIP, the
+	 * smaller coded fraction shrinks the next target, the smaller target
+	 * raises QP again. rcprobe/README.md predicted exactly this before the
+	 * term shipped - "SKIP decisions are themselves QP driven, so the active
+	 * fraction measures our own QP rather than the content" - and it is what
+	 * happens off the clip it was fitted to.
+	 *
+	 * 0.75 is the FPV clip's own operating point: at QP 29 it codes 73% of
+	 * its blocks, so the term evaluates to 0.97 and does nothing, which is
+	 * why the defect was invisible there. On soccer_4cif at 600 kbps the
+	 * loop settled at a coded fraction of 0.192 and a target of 0.30 of
+	 * budget, delivering 178 kbps with QP pinned at 50; a quarter of the
+	 * pictures sat on the target floor and 41% at QP 51. Setting coded_pow
+	 * to 0 put it on 599.9 kbps at QP 40.56, against the encoder's own rate
+	 * control at 599.5 and 40.24.
+	 *
+	 * Normalising the *complexity estimate* by coded area is a different
+	 * matter and may still be worth having; scaling the target by it is not.
+	 * coded_ref is kept so the term can be re-enabled and re-fitted. */
 	rc->coded_ref = env_double("EXT_RC_CODED_REF", 0.75);
-	rc->coded_pow = env_double("EXT_RC_CODED_POW", 1.0);
+	rc->coded_pow = env_double("EXT_RC_CODED_POW", 0.0);
 	rc->alpha = env_double("EXT_RC_ALPHA", 0.3);
 	rc->deadband_first = env_int("EXT_RC_DEAD_FIRST", 0);
 	rc->bucket_clamp = env_int("EXT_RC_BUCKET_CLAMP", 0);
@@ -273,6 +355,17 @@ int ext_rate_control_check(ExtRateControl *rc, size_t bits, int is_intra)
 	{
 		double const soft = rc->bucket_cap * rc->cap_share;
 		if (soft < ceiling) ceiling = soft;
+	}
+
+	/* Except the first one, which has no model behind it and would otherwise
+	 * be bounded only by the whole buffer. Only the first: every later intra
+	 * picture is predicted from a complexity estimate that exists by then,
+	 * and holding those to a fraction of the buffer would be the
+	 * refresh-starving mistake this cap is not trying to make. */
+	if (is_intra && (rc->num_pictures == 0) && (rc->first_intra_share > 0.0))
+	{
+		double const first = rc->bucket_cap * rc->first_intra_share;
+		if (first < ceiling) ceiling = first;
 	}
 
 	if ((double)bits <= ceiling)
