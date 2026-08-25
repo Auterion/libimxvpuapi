@@ -55,6 +55,7 @@
  * VCEncOut conversion helper if the vendor header was seen first. */
 #include "vc8000e-shim.h"
 #include "ext_rate_control.h"
+#include "intra_refresh.h"
 
 
 
@@ -149,7 +150,6 @@ static VCEncPictureType convert_to_vc8000e_pixel_format(ImxVpuApiColorFormat col
 
 
 #define FORCED_INTRA_QUEUE_SIZE 32
-#define MAX_ROLLING_SLICES 64
 
 struct _ImxVpuApiEncoder
 {
@@ -250,33 +250,28 @@ struct _ImxVpuApiEncoder
 	 * frame with imx_vpu_api_enc_get_encoded_frame(). */
 	size_t encoded_frame_data_size;
 
-	/* Rolling intra slice/tile refresh state (H.265 / VC8000E only).
-	 * num_rolling_slices = 0 means disabled; 1 = auto (4 slices); 2..16 = explicit count.
-	 * num_rolling_tiles  = 0 means disabled; 1 = auto (2x2 grid); 2..16 = explicit even count.
-	 *                      (arranged in 2 fixed columns, ceil(N/2) rows).
-	 * cached_coding_ctrl holds the VCEncCodingCtrl captured right after
-	 * the initial VCEncSetCodingCtrl call so that roiMapDeltaQpEnable is
+	/* cached_coding_ctrl holds the VCEncCodingCtrl captured right after the
+	 * initial VCEncSetCodingCtrl call so that roiMapDeltaQpEnable is
 	 * correct for all subsequent mid-stream SetCodingCtrl calls. */
-	int num_rolling_slices;
-	int num_rolling_tiles;
 	VCEncCodingCtrl cached_coding_ctrl;
 
 	struct { uint32_t first; uint32_t num; } forced_intra_q[FORCED_INTRA_QUEUE_SIZE];
 	int forced_intra_q_head;
 	int forced_intra_q_count;
 
-	int roll_size;
-	int last_refresh_picture;
-	int slice_last_refresh[MAX_ROLLING_SLICES];
-
-	/* Intra refresh (GDR) sweep state. The sweep is driven from here rather
-	 * than by the encoder's own gdrDuration, because the vendor's sweep
-	 * cannot be configured to do what this mode needs; see gdr_sweep_band().
-	 * gdr_sweep_pic counts pictures within the current sweep, gdr_sweep_step
-	 * is the index of the band that was refreshed last (-1 before the first
-	 * one). */
-	int gdr_sweep_pic;
-	int gdr_sweep_step;
+	/* Intra refresh. The sweep is driven from here rather than by the
+	 * encoder's own gdrDuration, because the vendor's sweep cannot be
+	 * configured to do what this mode needs - see intra_refresh.c. It is
+	 * one scheduler for what used to be three separate modes; the
+	 * deprecated open_params fields are mapped onto refresh_cfg by
+	 * resolve_refresh_config(). */
+	BOOL refresh_active;
+	ImxVpuApiIntraRefreshCfg refresh_cfg;
+	ImxVpuApiIntraRefreshState refresh_state;
+	/* Slice height in CTB rows that was programmed, 0 = one slice. Kept
+	 * because sliceSize is set once at open time and the refresh schedule
+	 * no longer implies it. */
+	int slice_size;
 	/* recovery_point SEI emitted ahead of the picture that starts a sweep.
 	 * The encoder's own GDR used to produce this; driving the sweep from
 	 * here means producing it here too, or a decoder joining mid-stream has
@@ -667,72 +662,86 @@ static size_t build_recovery_point_sei(uint8_t *out, int recovery_count, BOOL is
 }
 
 
-/* One step of the intra refresh sweep: the CTB rows band number
- * "step" covers, when the picture's ctb_rows rows are split into
- * num_steps contiguous bands of as equal a height as they divide into.
+/* Work out what shape the refresh sweep has, from the unified open_params
+ * fields plus the deprecated ones they replaced, and program the slice height
+ * that used to be a side effect of the rolling modes.
  *
- * The bands do not overlap and together they cover the picture exactly, which
- * is the whole point of computing them here instead of letting the encoder do
- * it. The encoder's own sweep (hevcencapi.c:6357-6371) makes the band one CTB
- * row taller than the distance it advances, because bottom_pos is inclusive
- * and it adds a full gdrAverageMBRows to it. Every row is therefore coded
- * intra twice per sweep, and at 720p, where gdrAverageMBRows rounds down to
- * zero and the band is two rows advancing by one, that is 22 row refreshes to
- * cover 12 rows. Measured cost of the duplication: 0.67-0.70 dB of PSNR at a
- * fixed bitrate.
- *
- * The encoder's sweep also advances exactly once per coded picture and cannot
- * be slowed down, so gdr_refresh_period only decides how often a sweep
- * restarts, not how long it takes. A sweep is over in ctb_rows-1 pictures and
- * the rest of the period refreshes nothing, which concentrates all the intra
- * coding of a period into a burst. Spreading the same refreshes evenly across
- * the period instead is worth 30-60 ms of p99 queueing delay. */
-static void gdr_sweep_band(int ctb_rows, int num_steps, int step, int *top, int *bottom)
+ * The mapping itself lives in intra_refresh.c so that this file, rcprobe and
+ * anything else configuring the encoder cannot disagree about what
+ * use-rolling-slices meant. The three modes those fields selected -
+ * use_intra_refresh, rolling slices and rolling tiles - were never actually
+ * different mechanisms: all three forced VCEncCodingCtrl's intraArea over a
+ * band of CTB rows, and differed only in how the band was placed and whether
+ * they also set sliceSize. So they become configurations of one scheduler, and
+ * the schedules they produced are unchanged - which
+ * tools/common/intra_refresh_test.c checks band for band. */
+static void resolve_refresh_config(ImxVpuApiEncoder *encoder)
 {
-	int const base = ctb_rows / num_steps;
-	int const rem = ctb_rows % num_steps;
-	int const height = base + ((step < rem) ? 1 : 0);
+	ImxVpuApiEncOpenParams *open_params = &encoder->open_params;
+	ImxVpuApiIntraRefreshRequest req;
+	ImxVpuApiIntraRefreshPlan plan;
 
-	*top = step * base + ((step < rem) ? step : rem);
-	*bottom = *top + height - 1;
+	/* The encoder counts geometry in its own coding units, and they are
+	 * codec dependent: 64 pixels for h.265, 16 for h.264
+	 * (hevcencapi.c:8593-8613, ceil on each dimension). Using the h.265
+	 * unit on an h.264 stream does not fail - the band lands inside the
+	 * picture and is accepted - it just refreshes the top quarter of it
+	 * forever. */
+	int const unit = (open_params->compression_format == IMX_VPU_API_COMPRESSION_FORMAT_H264)
+	               ? 16 : 64;
+
+	memset(&req, 0, sizeof(req));
+	req.unit_pixels = unit;
+	req.ctb_rows = ((int)(open_params->frame_height) + unit - 1) / unit;
+	req.ctb_cols = ((int)(open_params->frame_width) + unit - 1) / unit;
+	req.gop_size = (int)(open_params->gop_size);
+	req.enable = !!(open_params->flags & IMX_VPU_API_ENC_OPEN_PARAMS_FLAG_USE_INTRA_REFRESH);
+	req.period = open_params->intra_refresh_period;
+	req.duration = open_params->intra_refresh_duration;
+	req.rows = open_params->intra_refresh_rows;
+	req.slice_height = open_params->slice_height;
+	req.slice_count = open_params->slice_count;
+	req.gdr_refresh_period = open_params->gdr_refresh_period;
+	req.num_rolling_slices = open_params->num_rolling_slices;
+	req.num_rolling_tiles = open_params->num_rolling_tiles;
+	req.roll_size = open_params->roll_size;
+
+	imx_vpu_api_intra_refresh_plan(&req, &(encoder->refresh_cfg), &plan);
+
+	encoder->refresh_active = plan.active;
+	encoder->slice_size = plan.slice_size;
+	memset(&(encoder->refresh_state), 0, sizeof(encoder->refresh_state));
+
+	if (!plan.active)
+		return;
+
+	imx_vpu_api_intra_refresh_init(&(encoder->refresh_state), &(encoder->refresh_cfg));
+
+	/* Both of these silently changed the caller's configuration before, and
+	 * both change what the result means, so say so. */
+	if (plan.wanted_steps > plan.num_steps)
+		IMX_VPU_API_INFO("intra refresh: a %d picture sweep cannot hold %d regions; "
+		                 "using %d row(s) of %d, so bands are %d CTB rows not %d",
+		                 encoder->refresh_cfg.duration, plan.wanted_steps,
+		                 plan.row_steps, plan.col_steps,
+		                 encoder->refresh_cfg.ctb_rows / plan.row_steps,
+		                 encoder->refresh_cfg.rows);
+	if ((open_params->slice_count > 1) && (plan.slice_count != (int)(open_params->slice_count)))
+		IMX_VPU_API_INFO("slice-count %u is not achievable at %d CTB rows; "
+		                 "using %d slices of %d rows",
+		                 open_params->slice_count, encoder->refresh_cfg.ctb_rows,
+		                 plan.slice_count, plan.slice_size);
+
+	IMX_VPU_API_DEBUG("intra refresh: period %d, duration %d, %d region(s) of "
+	                  "%d row(s) x %d col(s) of %d px, %d slice(s) of %d row(s)",
+	                  encoder->refresh_cfg.period, encoder->refresh_cfg.duration,
+	                  plan.num_steps, encoder->refresh_cfg.rows,
+	                  encoder->refresh_cfg.columns, unit,
+	                  plan.slice_count, plan.slice_size);
 }
 
 
-/* How many bands one sweep is split into: two CTB rows per band, which is also
- * what the rolling modes end up with at 720p, so the two are comparable.
- *
- * The hardware can address a single row, but a one row band measures worse
- * than every coarser one tried, on both test clips and with either rate
- * control - it is the shape with the least intra prediction context to work
- * with, and it needs twice as many refresh pictures to cover the picture.
- * Above two rows the differences are inside the run to run spread. A sweep
- * still cannot have more steps than it has pictures to spread them over. */
-static int gdr_sweep_num_steps(int ctb_rows, int period)
-{
-	int num_steps = (ctb_rows + 1) / 2;
-
-	if (num_steps > period)
-		num_steps = period;
-	if (num_steps < 1)
-		num_steps = 1;
-
-	return num_steps;
-}
-
-
-static int gdr_sweep_period(ImxVpuApiEncOpenParams const *open_params)
-{
-	int period = (open_params->gdr_refresh_period > 0)
-	           ? open_params->gdr_refresh_period
-	           : (int)(open_params->gop_size);
-
-	return (period > 0) ? period : 1;
-}
-
-
-static void init_encoder_input(ImxVpuApiEncoder *encoder,
-                               int num_rolling_slices,
-                               int num_rolling_tiles)
+static void init_encoder_input(ImxVpuApiEncoder *encoder)
 {
 	ImxVpuApiEncOpenParams *open_params = &encoder->open_params;
 	VCEncIn *encoder_input = &encoder->encoder_input;
@@ -744,14 +753,13 @@ static void init_encoder_input(ImxVpuApiEncoder *encoder,
 	encoder_input->gopConfig.size = 1;
 	encoder_input->gopConfig.special_size = 0;
 	encoder_input->gopConfig.pGopPicSpecialCfg = &encoder->gop_pic_special_config[0];
-	/* Intra refresh is driven from this file (see gdr_sweep_band()), so it
-	 * wants the same gopConfig as the rolling modes: no periodic IDR, and
-	 * gdrDuration left at zero so VCEncFindNextPic() never asks for an intra
-	 * picture. Leaving the encoder's own GDR on would take the intra area
-	 * away - it overwrites intraArea and roi1Area on every picture
-	 * (hevcencapi.c:6340-6394) and rejects any intraArea set from here. */
-	encoder_input->gopConfig.idr_interval = ((num_rolling_slices > 0) || (num_rolling_tiles > 0)
-	                                      || (open_params->flags & IMX_VPU_API_ENC_OPEN_PARAMS_FLAG_USE_INTRA_REFRESH))
+	/* Intra refresh is driven from this file (see intra_refresh.c), so it
+	 * wants no periodic IDR, and gdrDuration left at zero so
+	 * VCEncFindNextPic() never asks for an intra picture. Leaving the
+	 * encoder's own GDR on would take the intra area away - it overwrites
+	 * intraArea and roi1Area on every picture (hevcencapi.c:6340-6394) and
+	 * rejects any intraArea set from here. */
+	encoder_input->gopConfig.idr_interval = encoder->refresh_active
 	                                      ? INT32_MAX : open_params->gop_size;
 	encoder_input->gopConfig.gdrDuration = 0;
 	encoder_input->gopConfig.firstPic = 0;
@@ -798,9 +806,7 @@ static void init_encoder_input(ImxVpuApiEncoder *encoder,
 
 static ImxVpuApiEncReturnCodes init_vcenc_instance(ImxVpuApiEncoder *encoder,
                                                    VCEncPictureType encoder_pixel_format,
-                                                   ImxVpuApiFramebufferMetrics const *fb_metrics,
-                                                   int num_rolling_slices,
-                                                   int num_rolling_tiles)
+                                                   ImxVpuApiFramebufferMetrics const *fb_metrics)
 {
 	ImxVpuApiEncOpenParams *open_params = &encoder->open_params;
 	VCEncConfig *encoder_config = &encoder->encoder_config;
@@ -851,19 +857,12 @@ static ImxVpuApiEncReturnCodes init_vcenc_instance(ImxVpuApiEncoder *encoder,
 		coding_config.streamMultiSegmentAmount = 1;
 
 
-		if (num_rolling_slices > 0)
-		{
-			const int ctu_rows = ((int)(open_params->frame_height) + 63) / 64;
-			const int rows_per_slice = (ctu_rows + num_rolling_slices - 1) / num_rolling_slices;
-			coding_config.sliceSize = rows_per_slice;
-		}
-		else if (num_rolling_tiles > 0)
-		{
-			const int ctu_rows = ((int)(open_params->frame_height) + 63) / 64;
-			const int num_tile_rows = (num_rolling_tiles + 1) / 2; /* 2 columns per row */
-			const int rows_per_tile_row = (ctu_rows + num_tile_rows - 1) / num_tile_rows;
-			coding_config.sliceSize = rows_per_tile_row;
-		}
+		/* Slices are full width horizontal bands and nothing else, and
+		 * only the height is programmable - the hardware derives the
+		 * count as ceil(ctbPerCol / sliceSize) (hevcencapi.c:1780).
+		 * resolve_refresh_config() has already turned a requested count
+		 * into a height that exists. */
+		coding_config.sliceSize = encoder->slice_size;
 
 		enc_ret = VCEncSetCodingCtrl(encoder->encoder, &coding_config);
 		if (enc_ret != VCENC_OK)
@@ -875,18 +874,8 @@ static ImxVpuApiEncReturnCodes init_vcenc_instance(ImxVpuApiEncoder *encoder,
 		}
 
 		VCEncGetCodingCtrl(encoder->encoder, &encoder->cached_coding_ctrl);
-		encoder->num_rolling_slices = num_rolling_slices;
-		encoder->num_rolling_tiles = num_rolling_tiles;
 
-		encoder->roll_size = (int)encoder->open_params.roll_size;
-		encoder->last_refresh_picture = -1000000;
-		encoder->gdr_sweep_pic = 0;
-		encoder->gdr_sweep_step = -1;
-		{
-			int i;
-			for (i = 0; i < MAX_ROLLING_SLICES; i++)
-				encoder->slice_last_refresh[i] = -1000000;
-		}
+		imx_vpu_api_intra_refresh_init(&(encoder->refresh_state), &(encoder->refresh_cfg));
 		encoder->forced_intra_q_head = 0;
 		encoder->forced_intra_q_count = 0;
 	}
@@ -1572,14 +1561,11 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_open(ImxVpuApiEncoder **encoder, ImxVpuA
 
 
 	/* Prepare the encoder input information that will be used by encode(). */
-	int num_rolling_slices = open_params->num_rolling_slices;
-	if (num_rolling_slices == 1) num_rolling_slices = 4; /* auto */
-	int num_rolling_tiles = open_params->num_rolling_tiles;
-	if (num_rolling_tiles == 1) num_rolling_tiles = 4; /* auto → 2×2 grid */
+	resolve_refresh_config(*encoder);
 
-	init_encoder_input(*encoder, num_rolling_slices, num_rolling_tiles);
+	init_encoder_input(*encoder);
 
-	ret = init_vcenc_instance(*encoder, encoder_pixel_format, fb_metrics, num_rolling_slices, num_rolling_tiles);
+	ret = init_vcenc_instance(*encoder, encoder_pixel_format, fb_metrics);
 	if (ret != IMX_VPU_API_ENC_RETURN_CODE_OK)
 		goto cleanup_after_error;
 
@@ -1691,6 +1677,13 @@ void imx_vpu_api_enc_flush(ImxVpuApiEncoder *encoder)
 	encoder->force_IDR_frame = TRUE;
 	encoder->staged_raw_frame_set = FALSE;
 	encoder->encoded_frame_available = FALSE;
+
+	/* That IDR refreshes the whole picture, so the sweep starts over with
+	 * it rather than carrying on from wherever it had got to - and any
+	 * region a receiver had asked for is moot now. */
+	imx_vpu_api_intra_refresh_init(&(encoder->refresh_state), &(encoder->refresh_cfg));
+	encoder->forced_intra_q_head = 0;
+	encoder->forced_intra_q_count = 0;
 }
 
 
@@ -1788,8 +1781,6 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_push_raw_frame(ImxVpuApiEncoder *encoder
 static ImxVpuApiEncReturnCodes restart_encoder(ImxVpuApiEncoder *encoder)
 {
 	ImxVpuApiEncReturnCodes ret;
-	int num_rolling_slices;
-	int num_rolling_tiles;
 
 	IMX_VPU_API_INFO(
 		"VC8000E auto-recovery: releasing and re-initializing the encoder "
@@ -1813,19 +1804,14 @@ static ImxVpuApiEncReturnCodes restart_encoder(ImxVpuApiEncoder *encoder)
 	encoder->next_coding_type = VCENC_NOTCODED_FRAME;
 	encoder->force_IDR_frame = FALSE;
 
-	num_rolling_slices = encoder->open_params.num_rolling_slices;
-	if (num_rolling_slices == 1) num_rolling_slices = 4;
-	num_rolling_tiles = encoder->open_params.num_rolling_tiles;
-	if (num_rolling_tiles == 1) num_rolling_tiles = 4;
+	resolve_refresh_config(encoder);
 
-	init_encoder_input(encoder, num_rolling_slices, num_rolling_tiles);
+	init_encoder_input(encoder);
 
 	ret = init_vcenc_instance(
 		encoder,
 		convert_to_vc8000e_pixel_format(encoder->open_params.color_format),
-		&encoder->stream_info.frame_encoding_framebuffer_metrics,
-		num_rolling_slices,
-		num_rolling_tiles
+		&encoder->stream_info.frame_encoding_framebuffer_metrics
 	);
 	if (ret != IMX_VPU_API_ENC_RETURN_CODE_OK)
 	{
@@ -1923,10 +1909,7 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 	requested_frame_type = encoder->staged_raw_frame.frame_types[0];
 	if (is_first_picture)
 	{
-		BOOL use_refresh_mode = (encoder->num_rolling_slices > 0)
-		                     || (encoder->num_rolling_tiles  > 0)
-		                     || (encoder->open_params.flags & IMX_VPU_API_ENC_OPEN_PARAMS_FLAG_USE_INTRA_REFRESH);
-		if (use_refresh_mode)
+		if (encoder->refresh_active)
 		{
 			IMX_VPU_API_DEBUG("refresh mode: no IDR — first picture encoded as non-IDR I-frame");
 			requested_frame_type = IMX_VPU_API_FRAME_TYPE_I;
@@ -1974,8 +1957,7 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 	}
 
 	if (!encoder->has_header && (encoder->num_encoded_pictures > 0) &&
-	    ((encoder->num_rolling_slices > 0) || (encoder->num_rolling_tiles > 0) ||
-	     (encoder->open_params.flags & IMX_VPU_API_ENC_OPEN_PARAMS_FLAG_USE_INTRA_REFRESH)) &&
+	    encoder->refresh_active &&
 	    (encoder->open_params.gop_size > 0) &&
 	    (((int)(encoder->num_encoded_pictures) % (int)(encoder->open_params.gop_size)) == 0))
 	{
@@ -2087,151 +2069,83 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 
 	int sei_refresh = 0, sei_top = 0, sei_bottom = 0;
 
-	if ((encoder->open_params.flags & IMX_VPU_API_ENC_OPEN_PARAMS_FLAG_USE_INTRA_REFRESH) && !is_idr &&
-	    (encoder->open_params.compression_format == IMX_VPU_API_COMPRESSION_FORMAT_H265))
+	/* One refresh scheduler for what used to be three modes. An IDR
+	 * refreshes the whole picture by itself, so the sweep sits that picture
+	 * out without losing its place. */
+	if (encoder->refresh_active && !is_idr)
 	{
-		int const frame_h  = (int)(encoder->open_params.frame_height);
-		int const frame_w  = (int)(encoder->open_params.frame_width);
-		int const ctu_rows = (frame_h + 63) / 64;
-		int const ctu_cols = (frame_w + 63) / 64;
-		int const period   = gdr_sweep_period(&(encoder->open_params));
-		int const num_steps = gdr_sweep_num_steps(ctu_rows, period);
-		/* Which band this picture belongs to. Stepping on the change of this
-		 * quotient spreads num_steps refreshes across period pictures as
-		 * evenly as they divide, with no idle tail. */
-		int const step = (encoder->gdr_sweep_pic * num_steps) / period;
+		ImxVpuApiIntraRefreshBand band;
+		int forced_first = 0, forced_num = 0;
 
-		if (step != encoder->gdr_sweep_step)
+		/* Regions asked for through
+		 * imx_vpu_api_enc_set_intra_refresh_region(), which is how a
+		 * receiver reports what it lost. Offer the head of the queue,
+		 * and only take it off if the scheduler used it - it declines on
+		 * a picture the sweep itself needs, and a request that keeps
+		 * getting declined has to stay queued rather than be dropped. */
+		if (encoder->forced_intra_q_count > 0)
 		{
-			int top, bottom;
+			int const idx = encoder->forced_intra_q_head;
 
-			if (step == 0)
-			{
-				/* Pictures from this one to the one carrying the last band.
-				 * The steps are spread by the same quotient used above, so
-				 * the last one lands on ceil((num_steps-1) * period / num_steps). */
-				int const recovery_count =
-					((num_steps - 1) * period + num_steps - 1) / num_steps;
+			forced_first = (int)(encoder->forced_intra_q[idx].first);
+			forced_num = (int)(encoder->forced_intra_q[idx].num);
+		}
 
-				encoder->recovery_sei_size = build_recovery_point_sei(
-					encoder->recovery_sei, recovery_count,
-					encoder->open_params.compression_format == IMX_VPU_API_COMPRESSION_FORMAT_H264);
-			}
+		imx_vpu_api_intra_refresh_step(&(encoder->refresh_state), &(encoder->refresh_cfg),
+		                               forced_first, forced_num, &band);
 
-			gdr_sweep_band(ctu_rows, num_steps, step, &top, &bottom);
-			if (bottom >= ctu_rows)
-				bottom = ctu_rows - 1;
+		if (band.forced)
+		{
+			encoder->forced_intra_q_head = (encoder->forced_intra_q_head + 1)
+			                             % FORCED_INTRA_QUEUE_SIZE;
+			encoder->forced_intra_q_count--;
+		}
 
-			encoder->gdr_sweep_step = step;
+		if (band.recovery_count > 0)
+		{
+			encoder->recovery_sei_size = build_recovery_point_sei(
+				encoder->recovery_sei, band.recovery_count,
+				encoder->open_params.compression_format == IMX_VPU_API_COMPRESSION_FORMAT_H264);
+		}
+
+		if (band.apply)
+		{
 			encoder->cached_coding_ctrl.intraArea.enable = 1;
-			encoder->cached_coding_ctrl.intraArea.left   = 0;
-			encoder->cached_coding_ctrl.intraArea.right  = ctu_cols - 1;
-			encoder->cached_coding_ctrl.intraArea.top    = top;
-			encoder->cached_coding_ctrl.intraArea.bottom = bottom;
+			encoder->cached_coding_ctrl.intraArea.left   = band.left;
+			encoder->cached_coding_ctrl.intraArea.right  = band.right;
+			encoder->cached_coding_ctrl.intraArea.top    = band.top;
+			encoder->cached_coding_ctrl.intraArea.bottom = band.bottom;
 
 			enc_ret = VCEncSetCodingCtrl(encoder->encoder, &(encoder->cached_coding_ctrl));
 			if (enc_ret != VCENC_OK)
 			{
-				IMX_VPU_API_ERROR("could not set intra refresh band, CTB rows %d..%d: %s (%d)",
-				                  top, bottom, vcenc_retval_to_string(enc_ret), (int)enc_ret);
+				IMX_VPU_API_ERROR("could not set intra refresh region, CTB rows %d..%d "
+				                  "cols %d..%d: %s (%d)",
+				                  band.top, band.bottom, band.left, band.right,
+				                  vcenc_retval_to_string(enc_ret), (int)enc_ret);
 				goto error;
 			}
 
-			sei_refresh = 1; sei_top = top; sei_bottom = bottom;
+			/* The refresh SEI describes a full width band, so a region
+			 * narrowed to a column range - the deprecated tiles
+			 * mapping, and nothing else - deliberately does not get
+			 * one. A receiver told that rows N..M are clean when only
+			 * half their width is would treat stale macroblocks as
+			 * recovered. */
+			if ((band.left == 0) && (band.right == (encoder->refresh_cfg.ctb_cols - 1)))
+			{
+				sei_refresh = 1;
+				sei_top = band.top;
+				sei_bottom = band.bottom;
+			}
+
 			if (getenv("VR_FORCED_INTRA_DEBUG"))
-				fprintf(stderr, "VR intra refresh: CTB rows %d..%d (frame %d, step %d/%d)\n",
-				        top, bottom, (int)encoder->num_encoded_pictures, step, num_steps);
-		}
-		else if (encoder->cached_coding_ctrl.intraArea.enable)
-		{
-			encoder->cached_coding_ctrl.intraArea.enable = 0;
-			VCEncSetCodingCtrl(encoder->encoder, &(encoder->cached_coding_ctrl));
-		}
-
-		encoder->gdr_sweep_pic++;
-		if (encoder->gdr_sweep_pic >= period)
-		{
-			encoder->gdr_sweep_pic = 0;
-			encoder->gdr_sweep_step = -1;
-		}
-	}
-
-	if ((encoder->num_rolling_slices > 0) && !is_idr &&
-	    (encoder->open_params.compression_format == IMX_VPU_API_COMPRESSION_FORMAT_H265))
-	{
-		int gop_size    = (int)(encoder->open_params.gop_size);
-		int num_slices  = encoder->num_rolling_slices;
-		int frame_h     = (int)(encoder->open_params.frame_height);
-		int frame_w     = (int)(encoder->open_params.frame_width);
-		int ctu_rows    = (frame_h + 63) / 64;
-		int ctu_cols    = (frame_w + 63) / 64;
-		int rows_per_slice;
-		int roll        = (encoder->roll_size > 0) ? encoder->roll_size : gop_size;
-		int pic         = (int)(encoder->num_encoded_pictures);
-		int min_gap;
-		int top = 0, bottom = -1;
-		int from_forced = 0;
-
-		if (num_slices > MAX_ROLLING_SLICES) num_slices = MAX_ROLLING_SLICES;
-		rows_per_slice = (ctu_rows + num_slices - 1) / num_slices;
-		if (roll > gop_size) roll = gop_size;
-		min_gap = roll / num_slices;
-		if (min_gap < 1) min_gap = 1;
-
-		{
-			int s, oldest = 0, oldest_age, emergency;
-
-			for (s = 1; s < num_slices; s++)
-			{
-				if (encoder->slice_last_refresh[s] < encoder->slice_last_refresh[oldest])
-					oldest = s;
-			}
-			oldest_age = pic - encoder->slice_last_refresh[oldest];
-			emergency = (oldest_age >= roll);
-
-			if (encoder->forced_intra_q_count > 0 && !emergency)
-			{
-				int idx = encoder->forced_intra_q_head;
-				int cb;
-				top    = (int)encoder->forced_intra_q[idx].first;
-				bottom = top + (int)encoder->forced_intra_q[idx].num - 1;
-				encoder->forced_intra_q_head = (idx + 1) % FORCED_INTRA_QUEUE_SIZE;
-				encoder->forced_intra_q_count--;
-				from_forced = 1;
-
-				cb = (bottom < ctu_rows) ? bottom : (ctu_rows - 1);
-				for (s = 0; s < num_slices; s++)
-				{
-					int s_top = s * rows_per_slice;
-					int s_bot = s_top + rows_per_slice - 1;
-					if (!(s_bot < top || s_top > cb))
-						encoder->slice_last_refresh[s] = pic;
-				}
-			}
-			else if (emergency || (pic - encoder->last_refresh_picture >= min_gap))
-			{
-				top = oldest * rows_per_slice;
-				bottom = top + rows_per_slice - 1;
-				encoder->slice_last_refresh[oldest] = pic;
-				encoder->last_refresh_picture = pic;
-			}
-		}
-
-		if (bottom >= top)
-		{
-			if (top < 0) top = 0;
-			if (bottom >= ctu_rows) bottom = ctu_rows - 1;
-			encoder->cached_coding_ctrl.intraArea.enable = 1;
-			encoder->cached_coding_ctrl.intraArea.left   = 0;
-			encoder->cached_coding_ctrl.intraArea.right  = ctu_cols - 1;
-			encoder->cached_coding_ctrl.intraArea.top    = top;
-			encoder->cached_coding_ctrl.intraArea.bottom = bottom;
-			VCEncSetCodingCtrl(encoder->encoder, &(encoder->cached_coding_ctrl));
-			sei_refresh = 1; sei_top = top; sei_bottom = bottom;
-			if (getenv("VR_FORCED_INTRA_DEBUG"))
-				fprintf(stderr, "VR refresh applied: CTB rows %d..%d (frame %d, %s, qdepth %d)\n",
-				        top, bottom, (int)encoder->num_encoded_pictures,
-				        from_forced ? "forced" : "wave", encoder->forced_intra_q_count);
+				fprintf(stderr, "VR intra refresh: CTB rows %d..%d cols %d..%d "
+				        "(frame %d, %s, qdepth %d)\n",
+				        band.top, band.bottom, band.left, band.right,
+				        (int)encoder->num_encoded_pictures,
+				        band.forced ? "requested" : "sweep",
+				        encoder->forced_intra_q_count);
 		}
 		else if (encoder->cached_coding_ctrl.intraArea.enable)
 		{
@@ -2240,58 +2154,7 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 		}
 	}
 
-	if ((encoder->num_rolling_tiles > 0) && !is_idr &&
-	    (encoder->open_params.compression_format == IMX_VPU_API_COMPRESSION_FORMAT_H265))
-	{
-		int gop_size      = (int)(encoder->open_params.gop_size);
-		int num_tiles     = encoder->num_rolling_tiles;
-		int frame_h       = (int)(encoder->open_params.frame_height);
-		int frame_w       = (int)(encoder->open_params.frame_width);
-		int ctu_rows      = (frame_h + 63) / 64;
-		int ctu_cols      = (frame_w + 63) / 64;
-		int num_tile_cols = 2;
-		int num_tile_rows = (num_tiles + num_tile_cols - 1) / num_tile_cols;
-		int ctu_cols_per_tile = ctu_cols / num_tile_cols;
-		int ctu_rows_per_tile = ctu_rows / num_tile_rows;
-		int gop_pos       = (int)(encoder->num_encoded_pictures) % gop_size;
-		int tile_idx      = -1;
-		int i;
-
-		for (i = 0; i < num_tiles; i++)
-		{
-			if (gop_pos == (i * gop_size) / num_tiles)
-			{
-				tile_idx = i;
-				break;
-			}
-		}
-
-		if (tile_idx >= 0)
-		{
-			int tile_col  = tile_idx % num_tile_cols;
-			int tile_row  = tile_idx / num_tile_cols;
-			int left      = tile_col * ctu_cols_per_tile;
-			int right     = left + ctu_cols_per_tile - 1;
-			int top       = tile_row * ctu_rows_per_tile;
-			int bottom    = top + ctu_rows_per_tile - 1;
-			/* Extend last column/row to cover any remainder from integer division. */
-			if (tile_col == num_tile_cols - 1) right  = ctu_cols - 1;
-			if (tile_row == num_tile_rows - 1) bottom = ctu_rows - 1;
-			encoder->cached_coding_ctrl.intraArea.enable = 1;
-			encoder->cached_coding_ctrl.intraArea.left   = left;
-			encoder->cached_coding_ctrl.intraArea.right  = right;
-			encoder->cached_coding_ctrl.intraArea.top    = top;
-			encoder->cached_coding_ctrl.intraArea.bottom = bottom;
-			VCEncSetCodingCtrl(encoder->encoder, &(encoder->cached_coding_ctrl));
-		}
-		else if (encoder->cached_coding_ctrl.intraArea.enable)
-		{
-			encoder->cached_coding_ctrl.intraArea.enable = 0;
-			VCEncSetCodingCtrl(encoder->encoder, &(encoder->cached_coding_ctrl));
-		}
-	}
-
-	if ((encoder->open_params.compression_format == IMX_VPU_API_COMPRESSION_FORMAT_H265) &&
+	if (encoder->refresh_active &&
 	    !(getenv("VR_RECOVERY_SEI") && getenv("VR_RECOVERY_SEI")[0] == '0'))
 	{
 		if (sei_refresh)

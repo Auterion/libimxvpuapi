@@ -2264,14 +2264,17 @@ typedef struct
 
 	int8_t intra_qp_delta;
 
-	/* Number of horizontal slices for rolling intra refresh.
-	 * 0 = automatic (4 slices), 1 = disabled, 2..16 = actual slice count.
-	 * Only used for H.265 encoding on VC8000E. */
+	/* DEPRECATED, use the intra_refresh_* fields. Number of horizontal
+	 * slices for rolling intra refresh. 0 = disabled, 1 = automatic
+	 * (4 slices), 2..16 = actual slice count. Mapped onto
+	 * intra_refresh_rows plus slice_count. */
 	uint8_t num_rolling_slices;
 
-	/* Number of 2D tiles (arranged in 2 columns) for rolling intra tile refresh.
-	 * 0 = automatic (4 tiles = 2×2 grid), 1 = disabled, 2/4/6/.../16 = tile count (even).
-	 * Only used for H.265 encoding on VC8000E. Mutually exclusive with num_rolling_slices. */
+	/* DEPRECATED, use the intra_refresh_* fields. Number of 2D tiles
+	 * (arranged in 2 columns) for rolling intra tile refresh. 0 = disabled,
+	 * 1 = automatic (4 tiles = 2x2 grid), 2/4/6/.../16 = tile count (even).
+	 * Mapped onto intra_refresh_rows plus intra_refresh_columns. Mutually
+	 * exclusive with num_rolling_slices. */
 	uint8_t num_rolling_tiles;
 
 	/* Minimum QP value for intra (I/IDR) frames. 0 = let rate control decide.
@@ -2282,6 +2285,8 @@ typedef struct
 	 * Setting this caps the quality of P/B frames, reducing peak size in GDR/rolling-slice modes. */
 	uint8_t qp_min_inter;
 
+	/* DEPRECATED, use intra_refresh_period. Sweep period in frames for the
+	 * rolling modes; 0 = use gop_size. */
 	uint16_t roll_size;
 
 	/* Percentage of extra bits the encoder spends on intra content in detected static
@@ -2295,7 +2300,11 @@ typedef struct
 	 * period, so this really is the sweep length and not just a restart interval: a decoder joining
 	 * at a recovery point has a complete picture after this many frames. Shorter = faster mid-stream
 	 * join, but more of every picture is intra, so quality at a fixed bitrate falls. Only affects
-	 * use-intra-refresh (GDR) mode. */
+	 * use-intra-refresh (GDR) mode.
+	 *
+	 * DEPRECATED, use intra_refresh_period, which is the same thing without
+	 * the 255 frame ceiling. Whichever of the two is nonzero wins; if both
+	 * are, intra_refresh_period does. */
 	uint8_t gdr_refresh_period;
 
 	/* If nonzero, the encoder pre-processor rotates the picture by 180 degrees
@@ -2329,8 +2338,56 @@ typedef struct
 	 * per-picture ceiling may push a picture that breaches it. */
 	uint8_t qp_max_inter;
 
+	/* Intra refresh: a band of CTB rows is coded intra in every picture,
+	 * sweeping the picture top to bottom, so that the stream stays
+	 * decodable without a periodic IDR. Enabled by
+	 * IMX_VPU_API_ENC_OPEN_PARAMS_FLAG_USE_INTRA_REFRESH; these say what
+	 * shape the sweep has. They replace num_rolling_slices,
+	 * num_rolling_tiles, roll_size and gdr_refresh_period, which are now
+	 * mapped onto them.
+	 *
+	 * How often a sweep starts, in frames. 0 = gdr_refresh_period, or
+	 * gop_size when that is 0 too. */
+	uint16_t intra_refresh_period;
+
+	/* How many frames one sweep is spread over. 0 = intra_refresh_period,
+	 * which spreads the refresh evenly with no idle tail and is what every
+	 * measurement so far says to use. A shorter duration finishes the sweep
+	 * sooner - lower join latency at the same average refresh cost - in
+	 * exchange for the frame size jitter of bunching the same refreshes
+	 * into fewer pictures. Longer than the period is clamped down to it. */
+	uint8_t intra_refresh_duration;
+
+	/* Target band height in CTB rows, 0 = 2. It is a target: the sweep is
+	 * split into ceil(ctb_rows / this) bands of as equal a height as they
+	 * divide into, so that they cover the picture exactly. A one row band
+	 * measures worse than every coarser height tried. */
+	uint8_t intra_refresh_rows;
+
+	/* Region width in CTB columns, 0 = full width. Only the deprecated
+	 * rolling tiles mapping sets this; no property exposes it, because a
+	 * band narrower than the picture breaks what receivers assume about a
+	 * refreshed band and the refresh SEI has nowhere to put a column. */
+	uint8_t intra_refresh_columns;
+
+	/* Slice height in CTB rows, 0 = one slice per picture. Slices confine
+	 * loss and give finer RTP fragmentation, and cost 0.19 dB on FPV
+	 * footage and 0.70 dB on distant aerial footage at a fixed bitrate, so
+	 * one slice is the default. */
+	uint8_t slice_height;
+
+	/* Slices per picture, as an alternative to naming the height. 0 or 1 =
+	 * one slice. Only the height is programmable - the hardware derives the
+	 * count as ceil(ctb_rows / height) - so most counts are not achievable
+	 * and this rounds down to one that is: at 720p only 1, 2, 3, 4, 6 and
+	 * 12 exist. Ignored when slice_height is set. */
+	uint8_t slice_count;
+
 	/* Reserved bytes for ABI compatibility. */
-	uint8_t reserved[IMX_VPU_API_RESERVED_SIZE - sizeof(unsigned int) - sizeof(int) - sizeof(uint32_t) - sizeof(uint16_t) - sizeof(uint16_t) - sizeof(int8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t)];
+
+
+	/* Reserved bytes for ABI compatibility. */
+	uint8_t reserved[IMX_VPU_API_RESERVED_SIZE - sizeof(unsigned int) - sizeof(int) - sizeof(uint32_t) - sizeof(uint16_t) - sizeof(uint16_t) - sizeof(int8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t)];
 }
 ImxVpuApiEncOpenParams;
 
