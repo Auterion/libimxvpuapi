@@ -118,86 +118,28 @@ int ext_rate_control_init(ExtRateControl *rc, ExtRateControlParams const *params
 	 * near QP 19 no matter how anything else was tuned. */
 	rc->target_min = env_double("EXT_RC_TMIN", 0.15);
 	rc->target_max = env_double("EXT_RC_TMAX", 2.50);
-	/* A scale this close to 1 is not worth acting on: it trims the budget of
-	 * content that needs it and charges the bucket for the trim, for no
-	 * gain. Snap it to 1 and leave both alone. */
-	rc->deadband = env_double("EXT_RC_DEAD", 0.90);
-	/* How much of what the content terms did not ask for is still charged to
-	 * the bucket, so that a calm stretch cannot bank credit for the first
-	 * hard picture to spend all at once.
-	 *
-	 * Off. The reasoning was sound and the implementation was not: the
-	 * charge is bit_per_pic * (1 - scale), which ignores what the picture
-	 * actually cost, and at a share of 1.0 it cancels the bit_per_pic drain
-	 * term outright - the bucket stops being a leaky bucket and becomes a
-	 * pure integrator. On content whose scale sits persistently below 1 the
-	 * result was a stream delivering a quarter to a half of the bitrate it
-	 * was asked for: 82 kbps of a 150 kbps target on foreman_cif, and the
-	 * accounting identity "delivered = configured - trimmed" held exactly,
-	 * so it was doing precisely what it says. Turning it off recovered 27 to
-	 * 50 percentage points of rate utilisation across the classic
-	 * sequences.
-	 *
-	 * What it was defending against is real, and the bucket term at the gain
-	 * above now does that job: an unspent picture leaves the bucket low, a
-	 * low bucket raises the next target, and the raise is bounded rather
-	 * than a forfeit. A charge that accumulates and is relaxed gradually is
-	 * the better shape of the original idea and is not written yet. */
-	rc->unspent_share = env_double("EXT_RC_UNSPENT", 0.0);
 	/* Ceiling on the very first picture, as a share of the buffer.
 	 *
 	 * It is the one picture with no model behind it: pre() has nothing to
 	 * predict from and falls back to a fixed QP 32, and the discretionary
-	 * cap below deliberately exempts intra pictures, so the only thing
-	 * bounding it is buffer overflow - the whole buffer. That guess suits
-	 * 720p at 1400 kbps and nothing else. On 4CIF at 600 kbps it produced
-	 * 253 kbit into a 429 kbit buffer, 59% of the buffer in one picture,
-	 * which then takes ~250 pictures to drain and sets p99 for the entire
-	 * run: 471 ms against the 159 ms of the encoder's own rate control.
+	 * cap in ext_rate_control_cap() exempts intra pictures, so the only
+	 * thing bounding it is buffer overflow - the whole buffer. That guess
+	 * suits 720p at 1400 kbps and nothing else. On 4CIF at 600 kbps it
+	 * produced 253 kbit into a 429 kbit buffer, 59% of the buffer in one
+	 * picture, which then takes ~250 pictures to drain and sets p99 for the
+	 * entire run: 471 ms against the encoder's own rate control at 159 ms.
 	 *
-	 * 0.15 is the standing queue the bucket term is willing to carry anyway
-	 * (EXT_RC_SET), so an intra picture that fits inside it cannot be what
-	 * sets the delay. Measured on soccer_4cif: p99 471 -> 227 ms at the same
-	 * bitrate and the same mean QP, because it is one picture in 600. The
-	 * knee is at about 19% of the buffer, so this has a little margin.
-	 *
-	 * Deliberately not tied to setpoint: retuning the standing queue should
-	 * not silently retune what an intra picture may cost. 0 disables it. */
+	 * 0.15 is the standing queue the bucket term carries anyway, so an intra
+	 * picture that fits inside it cannot be what sets the delay. Measured on
+	 * soccer_4cif: p99 471 -> 227 ms at the same bitrate and the same mean
+	 * QP, because it is one picture in 600. The knee is at about 19% of the
+	 * buffer, so this has a little margin. 0 disables it. */
 	rc->first_intra_share = env_double("EXT_RC_FIRST_INTRA", 0.15);
 	/* Bounds on the relative-complexity term, so one anomalous picture
 	 * cannot hand the next one an unbounded budget or starve it. */
 	rc->cplx_min = env_double("EXT_RC_CPLX_MIN", 0.25);
 	rc->cplx_max = env_double("EXT_RC_CPLX_MAX", 4.00);
-	/* Absolute term: how much of the picture actually needed coding, against
-	 * a reference for busy content, with the exponent shaping the curve.
-	 *
-	 * Off, because it is a positive feedback loop. coded_prev is
-	 * total_blocks - skip_blocks from the previous picture, and SKIP is a
-	 * decision the quantiser drives: a high QP sends blocks to SKIP, the
-	 * smaller coded fraction shrinks the next target, the smaller target
-	 * raises QP again. rcprobe/README.md predicted exactly this before the
-	 * term shipped - "SKIP decisions are themselves QP driven, so the active
-	 * fraction measures our own QP rather than the content" - and it is what
-	 * happens off the clip it was fitted to.
-	 *
-	 * 0.75 is the FPV clip's own operating point: at QP 29 it codes 73% of
-	 * its blocks, so the term evaluates to 0.97 and does nothing, which is
-	 * why the defect was invisible there. On soccer_4cif at 600 kbps the
-	 * loop settled at a coded fraction of 0.192 and a target of 0.30 of
-	 * budget, delivering 178 kbps with QP pinned at 50; a quarter of the
-	 * pictures sat on the target floor and 41% at QP 51. Setting coded_pow
-	 * to 0 put it on 599.9 kbps at QP 40.56, against the encoder's own rate
-	 * control at 599.5 and 40.24.
-	 *
-	 * Normalising the *complexity estimate* by coded area is a different
-	 * matter and may still be worth having; scaling the target by it is not.
-	 * coded_ref is kept so the term can be re-enabled and re-fitted. */
-	rc->coded_ref = env_double("EXT_RC_CODED_REF", 0.75);
-	rc->coded_pow = env_double("EXT_RC_CODED_POW", 0.0);
 	rc->alpha = env_double("EXT_RC_ALPHA", 0.3);
-	rc->deadband_first = env_int("EXT_RC_DEAD_FIRST", 0);
-	rc->bucket_clamp = env_int("EXT_RC_BUCKET_CLAMP", 0);
-	rc->unspent_capped = env_int("EXT_RC_UNSPENT_CAP", 0);
 	/* QP per doubling of rate. Measured on a VC8000E by coding 250 pictures
 	 * at every QP from 20 to 42: rate follows Qstep^-1.62, i.e. 3.71 QP per
 	 * doubling, not the 6.00 that a plain R ~ 1/Qstep proportion assumes.
@@ -206,7 +148,6 @@ int ext_rate_control_init(ExtRateControl *rc, ExtRateControlParams const *params
 	if (rc->slope < 1.0) rc->slope = 1.0;
 
 	rc->prev_qp = -1;
-	rc->min_headroom = 1.0;
 
 	return 0;
 }
@@ -232,16 +173,12 @@ void ext_rate_control_set_bitrate(ExtRateControl *rc, unsigned int bitrate_bps)
 
 int ext_rate_control_pre(ExtRateControl *rc, int is_intra)
 {
-	double fill, headroom, scale, target, qp;
+	double fill, scale, target, qp;
 
 	if (rc == NULL)
 		return -1;
 
 	fill = (rc->bucket_cap > 0.0) ? (rc->bucket / rc->bucket_cap) : 0.0;
-	headroom = 1.0 - fill;
-	if (headroom < 0.0) headroom = 0.0;
-	if (headroom > 1.0) headroom = 1.0;
-	if (headroom < rc->min_headroom) rc->min_headroom = headroom;
 	rc->sum_fill += fill;
 	if (fill > rc->max_fill) rc->max_fill = fill;
 
@@ -260,27 +197,8 @@ int ext_rate_control_pre(ExtRateControl *rc, int is_intra)
 		scale *= r;
 	}
 
-	if ((rc->coded_pow > 0.0) && (rc->coded_prev > 0.0) && (rc->total_blocks > 0))
-	{
-		double coded_fraction = rc->coded_prev / (double)(rc->total_blocks) / rc->coded_ref;
-		if (coded_fraction > 1.0) coded_fraction = 1.0;
-		scale *= pow(coded_fraction, rc->coded_pow);
-	}
-
-	/* The deadband decides that a trim this shallow is not worth making. In
-	 * deadband_first mode it is applied before the target, so such a picture
-	 * simply gets the full budget; otherwise the target keeps the trim and
-	 * only the bucket charge is waived, which hands the bits back over the
-	 * following pictures instead - and loses them outright whenever the
-	 * bucket bottoms out in between. */
-	if (rc->deadband_first && (scale > rc->deadband))
-		scale = 1.0;
-
 	/* The bucket biases the target: full pushes it down, empty lets it up. */
 	target = rc->bit_per_pic * scale * (1.0 - rc->gain * (fill - rc->setpoint));
-
-	if (scale > rc->deadband) scale = 1.0;
-	rc->unspent = (scale < 1.0) ? (rc->unspent_share * rc->bit_per_pic * (1.0 - scale)) : 0.0;
 
 	if (target < rc->bit_per_pic * rc->target_min) target = rc->bit_per_pic * rc->target_min;
 	if (target > rc->bit_per_pic * rc->target_max) target = rc->bit_per_pic * rc->target_max;
@@ -416,7 +334,6 @@ void ext_rate_control_post(ExtRateControl *rc, size_t bits, int is_intra, ExtRat
 		rc->cplx_per_block = (rc->cplx_per_block > 0.0)
 		                   ? (rc->cplx_per_block + rc->alpha * (per_block - rc->cplx_per_block))
 		                   : per_block;
-		rc->coded_prev = coded;
 		rc->cplx_prev = rc->cplx_per_block * coded;
 		rc->cplx_ema = (rc->cplx_ema > 0.0)
 		             ? (rc->cplx_ema + rc->alpha * (rc->cplx_prev - rc->cplx_ema))
@@ -434,48 +351,12 @@ void ext_rate_control_post(ExtRateControl *rc, size_t bits, int is_intra, ExtRat
 			rc->complexity_x += rc->alpha * (x - rc->complexity_x);
 	}
 
-	/* Forfeiting the bits the content terms did not ask for is the point of
-	 * the charge, but it can only forfeit bits that were actually saved.
-	 * Charging bit_per_pic * (1 - scale) ignores what the picture cost, and
-	 * with unspent_share at 1.0 that charge cancels the bit_per_pic drain
-	 * term outright: the bucket stops being a leaky bucket and becomes a
-	 * pure integrator of (coded bits - scale * bit_per_pic). The feedback
-	 * that would settle it works by lowering the target, and that stops at
-	 * the target floor - on content whose scale sits below the floor the
-	 * level then climbs without limit. Bounding the charge at what the link
-	 * did not have to carry keeps the credit forfeited and the bucket
-	 * monotonic in the right direction. */
-	if (rc->unspent_capped)
-	{
-		double const saved = rc->bit_per_pic - b;
-		if (rc->unspent > saved) rc->unspent = saved;
-		if (rc->unspent < 0.0) rc->unspent = 0.0;
-	}
-
-	if (rc->unspent > 0.0)
-	{
-		rc->num_trimmed++;
-		rc->sum_unspent += rc->unspent;
-	}
-
-	rc->bucket += b + rc->unspent - rc->bit_per_pic;
+	rc->bucket += b - rc->bit_per_pic;
 	if (rc->bucket < 0.0)
 	{
 		rc->bucket = 0.0;
 		rc->num_bucket_empty++;
 	}
-	/* Anti-windup. Charging unspent bits can push the bucket past what the
-	 * link could ever be holding, and on content that is trimmed picture
-	 * after picture it runs away - the charge exceeds the drain, so the
-	 * level integrates without bound, the bucket term saturates the target
-	 * at its floor, and the debt then has to be worked off before the
-	 * target can recover from it. Bound it at the real buffer size. */
-	if (rc->bucket_clamp && (rc->bucket > rc->bucket_cap))
-	{
-		rc->bucket = rc->bucket_cap;
-		rc->num_bucket_full++;
-	}
-
 	rc->prev_qp = rc->current_qp;
 	rc->num_pictures++;
 	rc->sum_bits += b;

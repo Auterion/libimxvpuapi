@@ -114,28 +114,19 @@ typedef struct
 
 	/* --- tuning; see ext_rate_control_init() for what each one does --- */
 	double gain, setpoint, target_min, target_max;
-	double deadband, unspent_share;
 	/* Ceiling on the bootstrap intra picture, as a share of the buffer. See
 	 * ext_rate_control_init(). */
 	double first_intra_share;
-	double cplx_min, cplx_max, coded_ref, coded_pow;
+	double cplx_min, cplx_max;
 	double alpha;
 	double slope;
-	int deadband_first;
-	int bucket_clamp;
-	int unspent_capped;
 
 	/* --- state --- */
 	/* Bits handed to the link that it has not drained yet. */
 	double bucket;
 	/* Cost of one coded block at Qstep 1, smoothed, and the previous
-	 * picture's cost and coded-block count derived from it. */
-	double cplx_per_block, cplx_prev, cplx_ema, coded_prev;
-	/* Bits deliberately not requested for the current picture, charged to the
-	 * bucket so a calm stretch cannot bank credit for the first hard picture
-	 * to spend all at once. Zero unless EXT_RC_UNSPENT is set: the charge is
-	 * off by default, see ext_rate_control_init(). */
-	double unspent;
+	 * picture's cost derived from it. */
+	double cplx_per_block, cplx_prev, cplx_ema;
 	/* log2(bits) + qp/slope: what the picture would have cost at QP 0, and
 	 * therefore independent of the QP it was coded at. */
 	double complexity_x;
@@ -149,21 +140,12 @@ typedef struct
 	/* --- counters, for logging only --- */
 	unsigned long num_pictures;
 	unsigned long num_reencodes;
-	/* Pictures whose deliberately-unspent bits were charged to the bucket,
-	 * and how many bits that was in total. In steady state the stream's rate
-	 * is the configured rate minus this, so it is the first thing to look at
-	 * when the output lands under the bitrate that was asked for - though
-	 * with the charge off by default these now read zero. */
-	unsigned long num_trimmed;
-	double sum_unspent;
 	/* Pictures where the bucket hit its floor, i.e. where the link had
 	 * drained everything and the accounting identity above stops holding. */
 	unsigned long num_bucket_empty;
-	unsigned long num_bucket_full;
 	double sum_bits;
 	double sum_fill;
 	double max_fill;
-	double min_headroom;
 }
 ExtRateControl;
 

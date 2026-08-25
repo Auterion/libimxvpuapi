@@ -1598,11 +1598,10 @@ void imx_vpu_api_enc_close(ImxVpuApiEncoder *encoder)
 	IMX_VPU_API_DEBUG("closing encoder");
 
 	/* The rate control's own account of the stream it just produced. The
-	 * bucket is charged the coded bits plus whatever the content terms
-	 * decided not to ask for, so in steady state the stream's rate is the
-	 * configured rate minus the unspent share - which makes "trimmed" the
-	 * first number to look at when the output lands under the bitrate that
-	 * was requested. */
+	 * bucket is charged the coded bits and drained one picture's budget, so
+	 * fill mean is where the loop settled - and that standing level is the
+	 * queueing delay, which makes it the first number to look at when the
+	 * latency is wrong. */
 	if (encoder->new_cbr_active && (encoder->new_cbr.num_pictures > 0))
 	{
 		ExtRateControl const *rc = &encoder->new_cbr;
@@ -1610,13 +1609,11 @@ void imx_vpu_api_enc_close(ImxVpuApiEncoder *encoder)
 
 		IMX_VPU_API_INFO(
 			"new CBR summary: %lu pictures, %.0f kbps of %.0f kbps configured, "
-			"trimmed %lu pictures by %.0f kbps on average, %lu re-encodes, "
+			"%lu re-encodes, "
 			"bucket empty on %lu pictures, fill mean %.2f max %.2f",
 			rc->num_pictures,
 			rc->sum_bits / pictures * rc->frame_rate / 1000.0,
 			rc->bit_per_pic * rc->frame_rate / 1000.0,
-			rc->num_trimmed,
-			rc->sum_unspent / pictures * rc->frame_rate / 1000.0,
 			rc->num_reencodes,
 			rc->num_bucket_empty,
 			rc->sum_fill / pictures,
