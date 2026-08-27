@@ -136,6 +136,13 @@ typedef struct
 	int current_qp;
 	int current_target;
 	int cap_attempts;
+	/* Set while the next intra picture is one with no model behind it, which
+	 * is the case at the start of a stream and again after a resolution
+	 * change: nothing coded so far says what a picture of the new size
+	 * costs. first_intra_share bounds that one picture; see
+	 * ext_rate_control_check(). Cleared as soon as an intra picture has been
+	 * coded. */
+	int intra_bootstrap_pending;
 
 	/* --- counters, for logging only --- */
 	unsigned long num_pictures;

@@ -2454,6 +2454,46 @@ typedef struct
 }
 ImxVpuApiEncStreamInfo;
 
+/* How many bytes of encoder state ImxVpuApiEncSessionState carries. Sized with
+ * room to grow; the encoder rejects a state whose size field does not match
+ * what it wrote. */
+#define IMX_VPU_API_ENC_SESSION_STATE_SIZE 256
+
+/* Opaque state of a stream that continues across encoder instances.
+ *
+ * An encoder instance is per resolution: the hardware is initialized with the
+ * frame size, so a resolution change means closing the encoder and opening a
+ * new one. Everything the encoder learned about the stream so far dies with
+ * the old instance, and two of those things are not restarted safely:
+ *
+ * - The rate control's leaky bucket. It holds the coded bits the link has not
+ *   drained yet, which is a property of the link and not of the picture size,
+ *   and a new instance starts it at empty. The first pictures at the new
+ *   resolution are then budgeted as if the buffer were free, on top of what is
+ *   still in flight - which is exactly how a CPB/HRD buffer overflows.
+ * - The parameter set ids. A new instance numbers its SPS and PPS from zero
+ *   again, so the parameter sets of the new resolution have the same ids as
+ *   the ones of the old. A decoder that loses them at the switch point keeps
+ *   using the ids it already has and decodes the new stream with the old
+ *   frame size, which it cannot detect.
+ *
+ * The caller carries both across the gap: read the state out of the old
+ * encoder with imx_vpu_api_enc_get_session_state() before closing it, and hand
+ * it to the new encoder with imx_vpu_api_enc_set_session_state() after opening
+ * it. Do not construct or interpret the contents; they are written and read by
+ * the encoder only, and the version field is checked on restore.
+ *
+ * Only implemented for the VC8000E, and only meaningful there with
+ * rate_control_mode 1. */
+typedef struct
+{
+	/* Set by imx_vpu_api_enc_get_session_state(). */
+	uint32_t version;
+	uint32_t size;
+	uint8_t data[IMX_VPU_API_ENC_SESSION_STATE_SIZE];
+}
+ImxVpuApiEncSessionState;
+
 typedef enum
 {
 	/* If set, the underlying codec can encode. Some hardware codecs can
@@ -2722,6 +2762,55 @@ void imx_vpu_api_enc_flush(ImxVpuApiEncoder *encoder);
 ImxVpuApiEncReturnCodes imx_vpu_api_enc_set_bitrate(ImxVpuApiEncoder *encoder, unsigned int bitrate);
 
 void imx_vpu_api_enc_set_intra_refresh_region(ImxVpuApiEncoder *encoder, unsigned int first_ctb_row, unsigned int num_ctb_rows);
+
+/* Reads out the state of the stream this encoder is producing, so that a
+ * successor instance can continue it. See ImxVpuApiEncSessionState.
+ *
+ * Call this before imx_vpu_api_enc_close() on the encoder that is being
+ * replaced. It only reads; the encoder is left encoding as it was, so a caller
+ * that ends up not replacing the encoder can simply drop the state.
+ *
+ * @param encoder Encoder instance. Must not be NULL.
+ * @param state Where to write the state. Must not be NULL.
+ * @return Return code indicating the outcome. Valid values:
+ *
+ * IMX_VPU_API_ENC_RETURN_CODE_OK: Success.
+ *
+ * IMX_VPU_API_ENC_RETURN_CODE_INVALID_CALL: This encoder has no state worth
+ * carrying - it is not the VC8000E, or rate_control_mode is not 1. The stream
+ * can be restarted without it, so this is not an error; the state is simply
+ * not filled in.
+ */
+ImxVpuApiEncReturnCodes imx_vpu_api_enc_get_session_state(ImxVpuApiEncoder *encoder, ImxVpuApiEncSessionState *state);
+
+/* Continues the stream described by state in this encoder.
+ *
+ * Call this on a freshly opened encoder, after imx_vpu_api_enc_open() and
+ * before the first imx_vpu_api_enc_encode(), with a state that
+ * imx_vpu_api_enc_get_session_state() produced. The rate control resumes with
+ * the bucket level and the content model of the old instance, rescaled to the
+ * new frame size where the quantity depends on it, and the parameter sets of
+ * this instance get an id that is not the one any other resolution in the
+ * session is using.
+ *
+ * A state from a stream with a different bitrate or buffer size is still
+ * usable: the bucket is a number of bits either way, and it is clamped to the
+ * new buffer if the new buffer is smaller.
+ *
+ * @param encoder Encoder instance. Must not be NULL.
+ * @param state State to continue from. Must not be NULL.
+ * @return Return code indicating the outcome. Valid values:
+ *
+ * IMX_VPU_API_ENC_RETURN_CODE_OK: Success.
+ *
+ * IMX_VPU_API_ENC_RETURN_CODE_INVALID_CALL: Called after encoding started, or
+ * this encoder cannot use the state (see the return codes of
+ * imx_vpu_api_enc_get_session_state()).
+ *
+ * IMX_VPU_API_ENC_RETURN_CODE_ERROR: The state was not written by a matching
+ * version of this library. Consult log output.
+ */
+ImxVpuApiEncReturnCodes imx_vpu_api_enc_set_session_state(ImxVpuApiEncoder *encoder, ImxVpuApiEncSessionState const *state);
 
 /* Sets the current encoding frame rate to this new value, in kbps.
  *

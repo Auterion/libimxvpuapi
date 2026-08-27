@@ -95,6 +95,25 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_set_bitrate(ImxVpuApiEncoder *encoder, u
 }
 
 
+/* Stream continuity across encoder instances is a VC8000E facility - see
+ * imxvpuapi2_imx8m_hantro_vc8000_encoder.c. There is nothing here that a
+ * successor instance would have to be told about. */
+ImxVpuApiEncReturnCodes imx_vpu_api_enc_get_session_state(ImxVpuApiEncoder *encoder, ImxVpuApiEncSessionState *state)
+{
+	IMX_VPU_API_UNUSED_PARAM(encoder);
+	IMX_VPU_API_UNUSED_PARAM(state);
+	return IMX_VPU_API_ENC_RETURN_CODE_INVALID_CALL;
+}
+
+
+ImxVpuApiEncReturnCodes imx_vpu_api_enc_set_session_state(ImxVpuApiEncoder *encoder, ImxVpuApiEncSessionState const *state)
+{
+	IMX_VPU_API_UNUSED_PARAM(encoder);
+	IMX_VPU_API_UNUSED_PARAM(state);
+	return IMX_VPU_API_ENC_RETURN_CODE_INVALID_CALL;
+}
+
+
 void imx_vpu_api_enc_set_intra_refresh_region(ImxVpuApiEncoder *encoder, unsigned int first_ctb_row, unsigned int num_ctb_rows)
 {
 	IMX_VPU_API_UNUSED_PARAM(encoder);

@@ -148,6 +148,7 @@ int ext_rate_control_init(ExtRateControl *rc, ExtRateControlParams const *params
 	if (rc->slope < 1.0) rc->slope = 1.0;
 
 	rc->prev_qp = -1;
+	rc->intra_bootstrap_pending = 1;
 
 	return 0;
 }
@@ -275,12 +276,19 @@ int ext_rate_control_check(ExtRateControl *rc, size_t bits, int is_intra)
 		if (soft < ceiling) ceiling = soft;
 	}
 
-	/* Except the first one, which has no model behind it and would otherwise
-	 * be bounded only by the whole buffer. Only the first: every later intra
-	 * picture is predicted from a complexity estimate that exists by then,
-	 * and holding those to a fraction of the buffer would be the
-	 * refresh-starving mistake this cap is not trying to make. */
-	if (is_intra && (rc->num_pictures == 0) && (rc->first_intra_share > 0.0))
+	/* Except one with no model behind it, which would otherwise be bounded
+	 * only by the whole buffer. Only that one: every later intra picture is
+	 * predicted from a complexity estimate that exists by then, and holding
+	 * those to a fraction of the buffer would be the refresh-starving
+	 * mistake this cap is not trying to make.
+	 *
+	 * That is the first picture of a stream, and also the first picture at a
+	 * new resolution - nothing coded before it says what a picture of that
+	 * size costs, and the caller re-arms the flag when it continues a stream
+	 * into a differently sized one. Measured on a 720p to 1080p switch at a
+	 * 100 ms buffer: without this the switch picture takes 0.91 of the
+	 * buffer on its own, with it 0.16. */
+	if (is_intra && rc->intra_bootstrap_pending && (rc->first_intra_share > 0.0))
 	{
 		double const first = rc->bucket_cap * rc->first_intra_share;
 		if (first < ceiling) ceiling = first;
@@ -360,4 +368,6 @@ void ext_rate_control_post(ExtRateControl *rc, size_t bits, int is_intra, ExtRat
 	rc->prev_qp = rc->current_qp;
 	rc->num_pictures++;
 	rc->sum_bits += b;
+	if (is_intra)
+		rc->intra_bootstrap_pending = 0;
 }

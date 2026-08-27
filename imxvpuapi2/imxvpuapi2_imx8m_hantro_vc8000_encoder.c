@@ -151,6 +151,52 @@ static VCEncPictureType convert_to_vc8000e_pixel_format(ImxVpuApiColorFormat col
 
 #define FORCED_INTRA_QUEUE_SIZE 32
 
+/* Bumped whenever the layout of EncSessionState below changes. A state written
+ * by another version is refused rather than misread. */
+#define ENC_SESSION_STATE_VERSION 1
+
+/* How many distinct resolutions get an id of their own before ids start being
+ * reused. h.265 allows 16 SPS ids and 64 PPS ids, h.264 32 and 256, so eight
+ * fits both with room to spare; a session that visits more than eight
+ * resolutions gets the id of the one it saw eight switches ago, by which point
+ * no decoder is still holding that one's parameter sets. */
+#define ENC_MAX_PARAM_SET_IDS 8
+
+/* What one encoder instance hands to its successor when a stream continues
+ * across a resolution change. Carried by the caller as the opaque payload of
+ * ImxVpuApiEncSessionState - see the documentation there for why these two
+ * things in particular cannot be restarted from scratch. */
+typedef struct
+{
+	/* Which parameter set id each resolution seen so far owns, oldest entry
+	 * first, and the id the next unseen resolution gets. The first resolution
+	 * of a session takes id 0, so a stream that never changes resolution
+	 * carries the ids the encoder itself wrote and needs no rewriting at
+	 * all. */
+	uint16_t ps_width[ENC_MAX_PARAM_SET_IDS];
+	uint16_t ps_height[ENC_MAX_PARAM_SET_IDS];
+	uint8_t ps_id[ENC_MAX_PARAM_SET_IDS];
+	uint8_t ps_num;
+	uint8_t ps_next_id;
+
+	/* The new CBR controller's state. Set only once a picture has been
+	 * encoded; before that there is nothing to carry. */
+	uint8_t rc_valid;
+	/* Frame size the quantities below were learned at, in 8x8 blocks. The
+	 * ones that scale with it are rescaled on restore. */
+	uint32_t rc_total_blocks;
+	double rc_bucket;
+	double rc_cplx_per_block, rc_cplx_prev, rc_cplx_ema;
+	double rc_complexity_x;
+	int32_t rc_have_complexity_x;
+	int32_t rc_prev_qp, rc_current_qp;
+	uint32_t rc_num_pictures, rc_num_reencodes, rc_num_bucket_empty;
+	double rc_sum_bits, rc_sum_fill, rc_max_fill;
+}
+EncSessionState;
+
+/* The state has to fit in the caller's buffer, and that buffer is public ABI. */
+typedef char enc_session_state_fits[(sizeof(EncSessionState) <= IMX_VPU_API_ENC_SESSION_STATE_SIZE) ? 1 : -1];
 struct _ImxVpuApiEncoder
 {
 	/* Hantro VC8000E encoder that is in use. */
@@ -300,6 +346,25 @@ struct _ImxVpuApiEncoder
 	BOOL new_cbr_active;
 	ExtRateControl new_cbr;
 	VCEncRateCtrl cached_rate_ctrl;
+
+	/* Stream continuity across encoder instances - see
+	 * ImxVpuApiEncSessionState. Only filled in at rate_control_mode 1, where
+	 * a resolution change must not restart either the rate control or the
+	 * parameter set numbering. */
+	EncSessionState session;
+	/* Parameter set id this instance stamps into its SPS and PPS. 0 means the
+	 * ids the encoder itself wrote are left alone, which is the case for the
+	 * first resolution of a session and therefore for every stream that never
+	 * changes resolution. */
+	int param_set_id;
+	/* The vendor PPS carrying param_set_id is created and activated so that
+	 * slice headers reference it too; without that the parameter sets would
+	 * carry the new id and the slices would still point at the previous
+	 * resolution's PPS. Creating it makes the vendor library insert a copy of
+	 * it into the next picture, ahead of the slice, and that copy says the
+	 * picture uses the SPS the old resolution used - contradicting the
+	 * header - so it is taken back out again. */
+	BOOL drop_inserted_pps;
 };
 
 
@@ -577,6 +642,246 @@ static void vc8000_h264_force_no_reorder(uint8_t *data,size_t *size)
 		}
 		p=nal_end;
 	}
+}
+
+
+/* Parameter set ids.
+ *
+ * A resolution change means a new encoder instance, and the vendor library
+ * numbers the parameter sets of every instance from zero - VCEncStrmStart()
+ * writes SPS 0 and PPS 0 and resets the active PPS id to 0. The stream that
+ * comes out therefore describes its new frame size with the same ids as the
+ * old one, and a decoder that loses the parameter sets sent at the switch
+ * point goes on using the ones it already has: it decodes the new resolution
+ * as the old one, with nothing in the bitstream to tell it otherwise.
+ *
+ * So the ids are restamped, per resolution. Two of the three places they
+ * appear are in the cached SPS/PPS header, which is ours to rewrite; the third
+ * is slice_pic_parameter_set_id in every slice header, written by the hardware
+ * from the active PPS id, and that one is moved by creating a PPS with the id
+ * this resolution owns and activating it (see activate_param_set_pps()).
+ *
+ * Both halves are needed. With only the SPS id moved, a decoder that receives
+ * the PPS but not the SPS is left with a PPS pointing at an SPS it does not
+ * have and drops cleanly - but one that receives the SPS and not the PPS still
+ * has the previous PPS, which now points at the wrong SPS, and that is worse
+ * than before the change. With the PPS id moved too, both cases end in a
+ * reference the decoder cannot resolve, which is what it can act on. */
+
+/* Position of the rbsp_stop_one_bit, i.e. of the end of the syntax. 0 if the
+ * data does not end in one. */
+static size_t vc_rbsp_stop_bit(const uint8_t *in, size_t in_len)
+{
+	long L = (long)in_len - 1;
+	int r = 0;
+
+	while ((L >= 0) && (in[L] == 0)) L--;
+	if (L < 0) return 0;
+	while (((in[L] >> r) & 1u) == 0) r++;
+
+	return (size_t)L * 8 + (size_t)(7 - r);
+}
+
+/* Copies what is left of the syntax across verbatim and terminates the RBSP.
+ * Returns the byte length written, or 0 if the reader has already overrun. */
+static size_t vc_restamp_tail(VcBR *br, VcBW *bw, size_t stop_bit)
+{
+	if (br->bit > stop_bit) return 0;
+	while (br->bit < stop_bit) vc_bw_u1(bw, vc_br_u1(br));
+	vc_bw_u1(bw, 1);
+	while (bw->bit & 7) vc_bw_u1(bw, 0);
+	/* vc_bw_u1() drops what does not fit rather than failing, so the length
+	 * is the only thing that says whether all of it was written. */
+	if ((bw->bit >> 3) > bw->cap) return 0;
+	return bw->bit >> 3;
+}
+
+static size_t vc_h265_sps_restamp(const uint8_t *in, size_t in_len, uint8_t *out, size_t out_cap, unsigned id)
+{
+	size_t const stop_bit = vc_rbsp_stop_bit(in, in_len);
+	VcBR br = { in, in_len, 0 };
+	VcBW bw = { out, out_cap, 0 };
+	unsigned max_sub;
+
+	if (stop_bit == 0) return 0;
+	memset(out, 0, out_cap);
+
+	vc_cp_un(&br, &bw, 4);                     /* sps_video_parameter_set_id */
+	max_sub = vc_cp_un(&br, &bw, 3);           /* sps_max_sub_layers_minus1 */
+	vc_cp_un(&br, &bw, 1);                     /* sps_temporal_id_nesting_flag */
+	/* profile_tier_level() is 96 bits only with a single sub layer, which is
+	 * all this encoder produces. */
+	if (max_sub != 0) return 0;
+	vc_cp_bits(&br, &bw, 96);
+	(void)vc_br_ue(&br); vc_bw_ue(&bw, id);    /* sps_seq_parameter_set_id */
+
+	return vc_restamp_tail(&br, &bw, stop_bit);
+}
+
+static size_t vc_h264_sps_restamp(const uint8_t *in, size_t in_len, uint8_t *out, size_t out_cap, unsigned id)
+{
+	size_t const stop_bit = vc_rbsp_stop_bit(in, in_len);
+	VcBR br = { in, in_len, 0 };
+	VcBW bw = { out, out_cap, 0 };
+
+	if (stop_bit == 0) return 0;
+	memset(out, 0, out_cap);
+
+	vc_cp_un(&br, &bw, 8);                     /* profile_idc */
+	vc_cp_un(&br, &bw, 8);                     /* constraint flags + reserved */
+	vc_cp_un(&br, &bw, 8);                     /* level_idc */
+	(void)vc_br_ue(&br); vc_bw_ue(&bw, id);    /* seq_parameter_set_id */
+
+	return vc_restamp_tail(&br, &bw, stop_bit);
+}
+
+/* The first two fields of a PPS are the same in both codecs: its own id, then
+ * the id of the SPS it activates. Both move together, so that the PPS this
+ * resolution owns points at the SPS this resolution owns. */
+static size_t vc_pps_restamp(const uint8_t *in, size_t in_len, uint8_t *out, size_t out_cap, unsigned id)
+{
+	size_t const stop_bit = vc_rbsp_stop_bit(in, in_len);
+	VcBR br = { in, in_len, 0 };
+	VcBW bw = { out, out_cap, 0 };
+
+	if (stop_bit == 0) return 0;
+	memset(out, 0, out_cap);
+
+	(void)vc_br_ue(&br); vc_bw_ue(&bw, id);    /* pps_pic_parameter_set_id */
+	(void)vc_br_ue(&br); vc_bw_ue(&bw, id);    /* pps_seq_parameter_set_id */
+
+	return vc_restamp_tail(&br, &bw, stop_bit);
+}
+
+/* Restamps the SPS and PPS of a cached annex B header with id. Everything else
+ * in the header - the start codes, whatever their length, the nal unit headers,
+ * the VPS - is copied through byte for byte.
+ *
+ * An id costs more bits than the 0 it replaces, so this cannot be done in
+ * place; on success *header_data points at a new buffer and the old one has
+ * been freed. Returns 0 and leaves the header untouched if anything about it
+ * does not parse, which is the safe outcome: the stream then carries the ids
+ * the encoder wrote, as it did before this existed. */
+static int vc8000_restamp_param_set_ids(uint8_t **header_data, size_t *header_size, BOOL is_h264, unsigned id)
+{
+	uint8_t *in = *header_data;
+	size_t const in_size = *header_size;
+	size_t const out_cap = in_size + 16;
+	uint8_t *out;
+	size_t out_len = 0;
+	size_t p = 0;
+	int num_sps = 0, num_pps = 0;
+
+	if ((in == NULL) || (in_size < 4)) return 0;
+
+	out = malloc(out_cap);
+	if (out == NULL) return 0;
+
+	/* Anything ahead of the first start code (there is none in practice). */
+	while ((p + 3 <= in_size) && !((in[p] == 0) && (in[p+1] == 0) && (in[p+2] == 1))) p++;
+	if (p + 3 > in_size) goto fail;
+	memcpy(out, in, p);
+	out_len = p;
+
+	while (p + 3 <= in_size)
+	{
+		size_t nal, q, nal_end, pad, payload_len, hdr_len;
+		int type;
+		size_t rewritten = 0;
+
+		nal = p + 3;                     /* first byte of the nal unit header */
+		q = nal;
+		while ((q + 3 <= in_size) && !((in[q] == 0) && (in[q+1] == 0) && (in[q+2] == 1))) q++;
+		nal_end = (q + 3 <= in_size) ? q : in_size;
+
+		/* Trailing zero bytes belong to the next start code, not to this nal
+		 * unit: an RBSP always ends in its stop bit, so its last byte is
+		 * never zero. Held back and re-emitted so that a four byte start
+		 * code stays a four byte start code. */
+		hdr_len = is_h264 ? 1 : 2;
+		pad = 0;
+		while ((nal_end - pad > nal + hdr_len) && (in[nal_end - pad - 1] == 0)) pad++;
+
+		type = is_h264 ? (in[nal] & 0x1f) : ((in[nal] >> 1) & 0x3f);
+		payload_len = (nal_end - pad > nal + hdr_len) ? (nal_end - pad - nal - hdr_len) : 0;
+
+		if ((payload_len > 0) &&
+		    ((is_h264 && ((type == 7) || (type == 8))) || (!is_h264 && ((type == 33) || (type == 34)))))
+		{
+			uint8_t rbsp[512], stamped[544], em[640];
+			size_t rl;
+			size_t sl = 0;
+
+			/* Nothing this encoder emits comes close, and a parameter set
+			 * that did would be truncated by the de-emulation rather than
+			 * rejected by it. */
+			if (payload_len > sizeof(rbsp))
+				goto fail;
+
+			rl = vc_deemulate(in + nal + hdr_len, payload_len, rbsp, sizeof(rbsp));
+
+			if (rl > 0)
+			{
+				if (is_h264)
+					sl = (type == 7) ? vc_h264_sps_restamp(rbsp, rl, stamped, sizeof(stamped), id)
+					                 : vc_pps_restamp(rbsp, rl, stamped, sizeof(stamped), id);
+				else
+					sl = (type == 33) ? vc_h265_sps_restamp(rbsp, rl, stamped, sizeof(stamped), id)
+					                  : vc_pps_restamp(rbsp, rl, stamped, sizeof(stamped), id);
+			}
+
+			if (sl == 0)
+				goto fail;
+
+			{
+				size_t el = vc_emulate(stamped, sl, em, sizeof(em));
+				size_t const chunk = (nal - p) + hdr_len + el + pad;
+
+				if ((el < sl) || (out_len + chunk > out_cap))
+					goto fail;
+
+				memcpy(out + out_len, in + p, (nal - p) + hdr_len);
+				out_len += (nal - p) + hdr_len;
+				memcpy(out + out_len, em, el);
+				out_len += el;
+				memset(out + out_len, 0, pad);
+				out_len += pad;
+				rewritten = 1;
+			}
+
+			if ((is_h264 && (type == 7)) || (!is_h264 && (type == 33)))
+				num_sps++;
+			else
+				num_pps++;
+		}
+
+		if (!rewritten)
+		{
+			if (out_len + (nal_end - p) > out_cap)
+				goto fail;
+			memcpy(out + out_len, in + p, nal_end - p);
+			out_len += nal_end - p;
+		}
+
+		p = nal_end;
+	}
+
+	if ((num_sps != 1) || (num_pps != 1))
+	{
+		IMX_VPU_API_WARNING("header carries %d SPS and %d PPS; expected one of each", num_sps, num_pps);
+		if ((num_sps == 0) || (num_pps == 0))
+			goto fail;
+	}
+
+	free(in);
+	*header_data = out;
+	*header_size = out_len;
+
+	return 1;
+
+fail:
+	free(out);
+	return 0;
 }
 
 static void bitbuf_put(uint8_t *buf, unsigned *pos, uint32_t value, int num_bits)
@@ -1825,6 +2130,161 @@ void imx_vpu_api_enc_set_intra_refresh_region(ImxVpuApiEncoder *encoder, unsigne
 }
 
 
+ImxVpuApiEncReturnCodes imx_vpu_api_enc_get_session_state(ImxVpuApiEncoder *encoder, ImxVpuApiEncSessionState *state)
+{
+	EncSessionState *session;
+
+	assert(encoder != NULL);
+	assert(state != NULL);
+
+	if (encoder->open_params.rate_control_mode != 1)
+	{
+		/* Nothing to carry: mode 0 is the unmodified encoder, and its stream
+		 * restarts exactly as it always did. */
+		IMX_VPU_API_DEBUG("no session state at rate control mode %d", (int)(encoder->open_params.rate_control_mode));
+		return IMX_VPU_API_ENC_RETURN_CODE_INVALID_CALL;
+	}
+
+	/* Debug lever: with nothing carried, a resolution change behaves the way
+	 * it did before any of this - the rate control restarts from an empty
+	 * buffer and the parameter sets keep the ids of the resolution before
+	 * them. It is here so that the difference can be measured on the target
+	 * rather than argued about. */
+	if (getenv("VC8000E_NO_SESSION_CARRY") != NULL)
+	{
+		IMX_VPU_API_INFO("VC8000E_NO_SESSION_CARRY is set; the stream will restart at the next resolution change");
+		return IMX_VPU_API_ENC_RETURN_CODE_INVALID_CALL;
+	}
+
+	memset(state, 0, sizeof(*state));
+	state->version = ENC_SESSION_STATE_VERSION;
+	state->size = (uint32_t)sizeof(EncSessionState);
+
+	session = &(encoder->session);
+
+	if (encoder->new_cbr_active && (encoder->new_cbr.num_pictures > 0))
+	{
+		ExtRateControl const *rc = &(encoder->new_cbr);
+
+		session->rc_valid = 1;
+		session->rc_total_blocks = rc->total_blocks;
+		session->rc_bucket = rc->bucket;
+		session->rc_cplx_per_block = rc->cplx_per_block;
+		session->rc_cplx_prev = rc->cplx_prev;
+		session->rc_cplx_ema = rc->cplx_ema;
+		session->rc_complexity_x = rc->complexity_x;
+		session->rc_have_complexity_x = rc->have_complexity_x;
+		session->rc_prev_qp = rc->prev_qp;
+		session->rc_current_qp = rc->current_qp;
+		session->rc_num_pictures = (uint32_t)(rc->num_pictures);
+		session->rc_num_reencodes = (uint32_t)(rc->num_reencodes);
+		session->rc_num_bucket_empty = (uint32_t)(rc->num_bucket_empty);
+		session->rc_sum_bits = rc->sum_bits;
+		session->rc_sum_fill = rc->sum_fill;
+		session->rc_max_fill = rc->max_fill;
+	}
+
+	memcpy(state->data, session, sizeof(EncSessionState));
+
+	IMX_VPU_API_DEBUG("session state read out: %d resolution(s), rate control %s",
+	                  (int)(session->ps_num), session->rc_valid ? "carried" : "not started yet");
+
+	return IMX_VPU_API_ENC_RETURN_CODE_OK;
+}
+
+
+ImxVpuApiEncReturnCodes imx_vpu_api_enc_set_session_state(ImxVpuApiEncoder *encoder, ImxVpuApiEncSessionState const *state)
+{
+	EncSessionState const *session;
+
+	assert(encoder != NULL);
+	assert(state != NULL);
+
+	if (encoder->open_params.rate_control_mode != 1)
+	{
+		IMX_VPU_API_DEBUG("session state ignored at rate control mode %d", (int)(encoder->open_params.rate_control_mode));
+		return IMX_VPU_API_ENC_RETURN_CODE_INVALID_CALL;
+	}
+
+	if ((encoder->num_encoded_pictures != 0) || encoder->has_header)
+	{
+		IMX_VPU_API_ERROR("tried to continue a stream in an encoder that has already encoded");
+		return IMX_VPU_API_ENC_RETURN_CODE_INVALID_CALL;
+	}
+
+	if ((state->version != ENC_SESSION_STATE_VERSION) || (state->size != (uint32_t)sizeof(EncSessionState)))
+	{
+		IMX_VPU_API_ERROR("session state is version %u size %u; this library writes version %u size %zu",
+		                  state->version, state->size,
+		                  (unsigned)ENC_SESSION_STATE_VERSION, sizeof(EncSessionState));
+		return IMX_VPU_API_ENC_RETURN_CODE_ERROR;
+	}
+
+	memcpy(&(encoder->session), state->data, sizeof(EncSessionState));
+	session = &(encoder->session);
+
+	if (encoder->new_cbr_active && session->rc_valid)
+	{
+		ExtRateControl *rc = &(encoder->new_cbr);
+		/* Everything the controller holds is either a property of the link,
+		 * which the frame size does not enter into, or a cost per coded
+		 * block, which it does. The second kind is rescaled by the change in
+		 * block count so that the first picture at the new resolution is
+		 * budgeted from a model in the new picture's units.
+		 *
+		 * cplx_prev and cplx_ema are only ever used as a ratio of each other,
+		 * so scaling both leaves the controller's reading of "is this stretch
+		 * harder than the recent average" untouched while putting both in the
+		 * new scale. complexity_x is log2(bits) at QP 0, and bits scale with
+		 * the block count, so the correction there is additive. */
+		double const ratio = ((session->rc_total_blocks > 0) && (rc->total_blocks > 0))
+		                   ? ((double)(rc->total_blocks) / (double)(session->rc_total_blocks))
+		                   : 1.0;
+
+		rc->bucket = session->rc_bucket;
+		if (rc->bucket > rc->bucket_cap)
+		{
+			IMX_VPU_API_WARNING("carried bucket level %.0f exceeds the new %.0f bit buffer; clamped",
+			                    rc->bucket, rc->bucket_cap);
+			rc->bucket = rc->bucket_cap;
+		}
+
+		rc->cplx_per_block = session->rc_cplx_per_block;
+		rc->cplx_prev = session->rc_cplx_prev * ratio;
+		rc->cplx_ema = session->rc_cplx_ema * ratio;
+		rc->complexity_x = session->rc_complexity_x + ((ratio > 0.0) ? log2(ratio) : 0.0);
+		rc->have_complexity_x = session->rc_have_complexity_x;
+		rc->prev_qp = session->rc_prev_qp;
+		rc->current_qp = session->rc_current_qp;
+		rc->num_pictures = session->rc_num_pictures;
+		/* The picture that opens the new resolution has no model behind it -
+		 * nothing coded at the old size says what one of the new size costs -
+		 * so it gets the same bootstrap allowance as the first picture of a
+		 * stream. Without this it is bounded only by what is left in the
+		 * buffer, and on a 720p to 1080p switch at a 100 ms buffer it takes
+		 * 0.91 of the buffer on its own instead of 0.16. */
+		rc->intra_bootstrap_pending = 1;
+		rc->num_reencodes = session->rc_num_reencodes;
+		rc->num_bucket_empty = session->rc_num_bucket_empty;
+		rc->sum_bits = session->rc_sum_bits;
+		rc->sum_fill = session->rc_sum_fill;
+		rc->max_fill = session->rc_max_fill;
+
+		IMX_VPU_API_INFO(
+			"new CBR resumed after %lu pictures: bucket %.0f of %.0f bits (%.2f fill), QP %d, "
+			"content model rescaled by %.3f, first picture held to %.0f bits",
+			rc->num_pictures, rc->bucket, rc->bucket_cap,
+			(rc->bucket_cap > 0.0) ? (rc->bucket / rc->bucket_cap) : 0.0,
+			rc->current_qp, ratio, rc->bucket_cap * rc->first_intra_share
+		);
+	}
+	else if (session->rc_valid)
+		IMX_VPU_API_WARNING("session state carries rate control state, but this encoder has no new CBR to resume it in");
+
+	return IMX_VPU_API_ENC_RETURN_CODE_OK;
+}
+
+
 ImxVpuApiEncReturnCodes imx_vpu_api_enc_set_frame_rate(ImxVpuApiEncoder *encoder, unsigned int frame_rate_numerator, unsigned int frame_rate_denominator)
 {
 	// TODO
@@ -1857,6 +2317,171 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_push_raw_frame(ImxVpuApiEncoder *encoder
 }
 
 
+/* Which parameter set id this resolution owns. Same resolution as an earlier
+ * one in the session means the same id, so returning to a resolution the
+ * decoder still has parameter sets for costs nothing. The first resolution
+ * takes id 0, which is what the encoder writes anyway: a stream that never
+ * changes resolution is therefore not rewritten at all. */
+static void resolve_param_set_id(ImxVpuApiEncoder *encoder)
+{
+	EncSessionState *session = &(encoder->session);
+	uint16_t const width = (uint16_t)(encoder->open_params.frame_width);
+	uint16_t const height = (uint16_t)(encoder->open_params.frame_height);
+	int i;
+
+	encoder->param_set_id = 0;
+
+	/* Mode 0 is the unmodified encoder, down to the bytes. */
+	if (encoder->open_params.rate_control_mode != 1)
+		return;
+
+	for (i = 0; i < (int)(session->ps_num); ++i)
+	{
+		if ((session->ps_width[i] == width) && (session->ps_height[i] == height))
+		{
+			encoder->param_set_id = session->ps_id[i];
+			IMX_VPU_API_DEBUG("parameter set id %d: %ux%u again", encoder->param_set_id, width, height);
+			return;
+		}
+	}
+
+	if (session->ps_num < ENC_MAX_PARAM_SET_IDS)
+		i = session->ps_num++;
+	else
+	{
+		/* Oldest entry out, and its id comes back around. */
+		memmove(&(session->ps_width[0]), &(session->ps_width[1]), (ENC_MAX_PARAM_SET_IDS - 1) * sizeof(session->ps_width[0]));
+		memmove(&(session->ps_height[0]), &(session->ps_height[1]), (ENC_MAX_PARAM_SET_IDS - 1) * sizeof(session->ps_height[0]));
+		memmove(&(session->ps_id[0]), &(session->ps_id[1]), (ENC_MAX_PARAM_SET_IDS - 1) * sizeof(session->ps_id[0]));
+		i = ENC_MAX_PARAM_SET_IDS - 1;
+	}
+
+	session->ps_width[i] = width;
+	session->ps_height[i] = height;
+	session->ps_id[i] = session->ps_next_id;
+	session->ps_next_id = (uint8_t)((session->ps_next_id + 1) % ENC_MAX_PARAM_SET_IDS);
+	encoder->param_set_id = session->ps_id[i];
+
+	if (encoder->param_set_id != 0)
+		IMX_VPU_API_INFO("parameter set id %d for %ux%u; %d resolution(s) in this stream so far",
+		                 encoder->param_set_id, width, height, (int)(session->ps_num));
+}
+
+
+/* Moves slice_pic_parameter_set_id onto the id this resolution owns, by
+ * creating the PPS with that id and making it the active one. The hardware
+ * writes the active id into every slice header, so this is the only way to
+ * move it without rewriting picture data.
+ *
+ * Clears param_set_id if it cannot be done, which leaves the ids exactly as
+ * the encoder wrote them - a working stream without the improvement, rather
+ * than a header and a picture that disagree. */
+static void activate_param_set_pps(ImxVpuApiEncoder *encoder)
+{
+	VCEncPPSCfg pps_cfg;
+	i32 created_id = 0;
+	int guard;
+
+	memset(&pps_cfg, 0, sizeof(pps_cfg));
+
+	/* Cloned from PPS 0, so the PPS the pictures are coded against carries
+	 * the same chroma and deblocking offsets as the one in the header.
+	 * VCEncGetPPSData() reports them in the units VCEncCreateNewPPS()
+	 * expects. */
+	if (VCEncGetPPSData(encoder->encoder, &pps_cfg, 0) != VCENC_OK)
+	{
+		IMX_VPU_API_WARNING("could not read PPS 0; keeping the parameter set ids the encoder wrote");
+		encoder->param_set_id = 0;
+		return;
+	}
+
+	/* The ids handed out are the lowest free ones, from 1 up, so this walks
+	 * up to the one this resolution owns. The ones passed on the way are
+	 * never written to the stream: after VCEncStrmStart() the vendor library
+	 * emits a PPS only for a newly created one - taken back out again by
+	 * drop_inserted_pps_nal() - and for the resend flags, which this encoder
+	 * does not use. */
+	for (guard = 0; (created_id < encoder->param_set_id) && (guard < ENC_MAX_PARAM_SET_IDS); ++guard)
+	{
+		i32 const previous_id = created_id;
+
+		if (VCEncCreateNewPPS(encoder->encoder, &pps_cfg, &created_id) != VCENC_OK)
+			break;
+		if (created_id <= previous_id)
+			break;
+	}
+
+	if ((created_id != encoder->param_set_id) ||
+	    (VCEncActiveAnotherPPS(encoder->encoder, encoder->param_set_id) != VCENC_OK))
+	{
+		IMX_VPU_API_WARNING("could not activate PPS %d; keeping the parameter set ids the encoder wrote",
+		                    encoder->param_set_id);
+		encoder->param_set_id = 0;
+		return;
+	}
+
+	/* Creating it queued a copy of it for the next picture. */
+	encoder->drop_inserted_pps = TRUE;
+}
+
+
+/* Takes the PPS the vendor library inserted ahead of the slice back out of the
+ * picture. It is a copy of PPS 0 under the new id, so it says the picture uses
+ * the SPS of the previous resolution - the one thing the restamped header
+ * exists to stop the decoder believing. Dropping it also keeps the parameter
+ * sets on the wire coming from one place, the cached header. */
+static void drop_inserted_pps_nal(ImxVpuApiEncoder *encoder, VCEncOut *encoder_output)
+{
+	uint8_t *data = encoder->stream_buffer_virtual_address;
+	size_t size = (size_t)(encoder_output->streamSize);
+	BOOL const is_h264 = (encoder->open_params.compression_format == IMX_VPU_API_COMPRESSION_FORMAT_H264);
+	int const pps_nal_type = is_h264 ? 8 : 34;
+	size_t p = 0;
+	int nals_examined = 0;
+
+	imx_dma_buffer_start_sync_session(encoder->stream_buffer);
+
+	while ((p + 3 <= size) && !((data[p] == 0) && (data[p+1] == 0) && (data[p+2] == 1))) p++;
+
+	/* It goes in ahead of the slice, behind at most an access unit delimiter,
+	 * so there is no reason to walk into the picture data looking for it. */
+	while ((p + 3 <= size) && (nals_examined < 4))
+	{
+		size_t nal = p + 3, q = p + 3, nal_end;
+		int type;
+
+		while ((q + 3 <= size) && !((data[q] == 0) && (data[q+1] == 0) && (data[q+2] == 1))) q++;
+		nal_end = (q + 3 <= size) ? q : size;
+		type = is_h264 ? (data[nal] & 0x1f) : ((data[nal] >> 1) & 0x3f);
+
+		if (type == pps_nal_type)
+		{
+			size_t const dropped = nal_end - p;
+
+			memmove(data + p, data + nal_end, size - nal_end);
+			size -= dropped;
+			encoder_output->streamSize = (u32)size;
+			encoder->drop_inserted_pps = FALSE;
+			IMX_VPU_API_DEBUG("dropped the %zu byte PPS the encoder inserted with parameter set id %d",
+			                  dropped, encoder->param_set_id);
+			break;
+		}
+
+		nals_examined++;
+		p = nal_end;
+	}
+
+	imx_dma_buffer_stop_sync_session(encoder->stream_buffer);
+
+	if (encoder->drop_inserted_pps)
+	{
+		IMX_VPU_API_WARNING("no inserted PPS found at the start of the picture; the stream carries two PPS %d",
+		                    encoder->param_set_id);
+		encoder->drop_inserted_pps = FALSE;
+	}
+}
+
+
 static ImxVpuApiEncReturnCodes restart_encoder(ImxVpuApiEncoder *encoder)
 {
 	ImxVpuApiEncReturnCodes ret;
@@ -1882,6 +2507,12 @@ static ImxVpuApiEncReturnCodes restart_encoder(ImxVpuApiEncoder *encoder)
 	encoder->num_encoded_pictures = 0;
 	encoder->next_coding_type = VCENC_NOTCODED_FRAME;
 	encoder->force_IDR_frame = FALSE;
+
+	/* The new instance numbers its parameter sets from zero again, so the
+	 * PPS this resolution owns has to be created and activated again. The
+	 * resolution has not changed, so resolve_param_set_id() hands back the
+	 * same id. */
+	encoder->drop_inserted_pps = FALSE;
 
 	resolve_refresh_config(encoder);
 
@@ -2061,6 +2692,8 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 		/* Start the stream if we are encoding the very first picture.
 		 * This is where the SPS/PPS/VPS header data is generated. */
 
+		resolve_param_set_id(encoder);
+
 		memset(&encoder_output, 0, sizeof(encoder_output));
 		enc_ret = VCEncStrmStart(encoder->encoder, encoder_input, &encoder_output);
 		if (enc_ret != VCENC_OK)
@@ -2090,6 +2723,34 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 			vc8000_h264_force_no_reorder(encoder->header_data, &encoder->header_data_size);
 			IMX_VPU_API_LOG("H264 SPS no-reorder rewrite: header %zu -> %zu bytes",
 			                before, encoder->header_data_size);
+		}
+
+		/* Give this resolution's parameter sets an id of their own, so that a
+		 * decoder which loses them at a resolution change cannot go on
+		 * decoding with the previous resolution's. Both halves have to
+		 * succeed together: the slice headers point at the new PPS, so the
+		 * header must define it. */
+		if (encoder->param_set_id != 0)
+		{
+			BOOL const is_h264 = (encoder->open_params.compression_format == IMX_VPU_API_COMPRESSION_FORMAT_H264);
+			size_t const before = encoder->header_data_size;
+
+			activate_param_set_pps(encoder);
+
+			if ((encoder->param_set_id != 0)
+			 && !vc8000_restamp_param_set_ids(&(encoder->header_data), &(encoder->header_data_size),
+			                                  is_h264, (unsigned)(encoder->param_set_id)))
+			{
+				IMX_VPU_API_WARNING("could not restamp the header parameter set ids; reverting to PPS 0");
+				if (VCEncActiveAnotherPPS(encoder->encoder, 0) != VCENC_OK)
+					IMX_VPU_API_ERROR("could not revert to PPS 0; the picture and the header disagree");
+				encoder->param_set_id = 0;
+			}
+			else if (encoder->param_set_id != 0)
+			{
+				IMX_VPU_API_INFO("parameter set id %d stamped into the SPS and the PPS: header %zu -> %zu bytes",
+				                 encoder->param_set_id, before, encoder->header_data_size);
+			}
 		}
 
 		encoder->has_header = TRUE;
@@ -2273,6 +2934,20 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 	/* Perform the actual frame encoding. */
 	memset(&encoder_output, 0, sizeof(encoder_output));
 	enc_ret = encode_one_picture(encoder, encoder_input, &encoder_output);
+
+	if (encoder->drop_inserted_pps)
+	{
+		if (enc_ret == VCENC_FRAME_READY)
+			drop_inserted_pps_nal(encoder, &encoder_output);
+		else
+		{
+			/* The picture it was written into is being thrown away, and the
+			 * vendor library only inserts it once. The header carries the
+			 * same PPS, so nothing is lost. */
+			IMX_VPU_API_DEBUG("the picture carrying the inserted PPS was discarded");
+			encoder->drop_inserted_pps = FALSE;
+		}
+	}
 
 	/* New CBR: a picture past the ceiling is re-encoded coarser. Only the
 	 * attempt that is kept is reported to the rate control, so its model
