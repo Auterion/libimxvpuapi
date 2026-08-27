@@ -2324,6 +2324,19 @@ typedef struct
 	 *     hrd_buffer_size - the same buffer the HRD describes, enforced by
 	 *     the rate control rather than by the encoder - and re-encodes any
 	 *     picture large enough to threaten it.
+	 *
+	 * This also selects which mechanism produces the intra refresh, because
+	 * the two cannot both drive it - the encoder's own GDR overwrites the
+	 * intra area on every picture. Mode 0 leaves the refresh to the encoder,
+	 * exactly as it was before either of these existed, so a stream produced
+	 * at mode 0 is byte for byte the stream the unmodified library produced
+	 * from the same settings. Mode 1 runs the sweep from the library instead
+	 * (intra_refresh.c), which is what intra_refresh_duration,
+	 * intra_refresh_rows and imx_vpu_api_enc_set_intra_refresh_region() act
+	 * on, and which emits the two refresh SEIs. The deprecated
+	 * num_rolling_slices and num_rolling_tiles were always driven from the
+	 * library and still are, in both modes.
+	 *
 	 * Only implemented for the VC8000E. */
 	uint8_t rate_control_mode;
 
@@ -2345,6 +2358,11 @@ typedef struct
 	 * shape the sweep has. They replace num_rolling_slices,
 	 * num_rolling_tiles, roll_size and gdr_refresh_period, which are now
 	 * mapped onto them.
+	 *
+	 * Only the period applies at rate_control_mode 0, where the encoder's own
+	 * GDR runs the sweep and has no other dial; the duration and the band
+	 * height need rate_control_mode 1. Setting one of those at mode 0 is
+	 * warned about rather than silently dropped.
 	 *
 	 * How often a sweep starts, in frames. 0 = gdr_refresh_period, or
 	 * gop_size when that is 0 too. */

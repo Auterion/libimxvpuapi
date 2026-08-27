@@ -259,13 +259,20 @@ struct _ImxVpuApiEncoder
 	int forced_intra_q_head;
 	int forced_intra_q_count;
 
-	/* Intra refresh. The sweep is driven from here rather than by the
-	 * encoder's own gdrDuration, because the vendor's sweep cannot be
-	 * configured to do what this mode needs - see intra_refresh.c. It is
-	 * one scheduler for what used to be three separate modes; the
-	 * deprecated open_params fields are mapped onto refresh_cfg by
-	 * resolve_refresh_config(). */
+	/* Intra refresh. Two mechanisms can produce it, and
+	 * resolve_refresh_config() picks one of them - never both.
+	 *
+	 * refresh_active: the sweep is driven from here, because the vendor's own
+	 * cannot be configured to do what the new rate control needs - see
+	 * intra_refresh.c. One scheduler for what used to be three separate
+	 * modes; the deprecated open_params fields are mapped onto refresh_cfg by
+	 * resolve_refresh_config().
+	 *
+	 * vendor_gdr_active: the vendor library places the band itself from
+	 * gdrDuration. That is what this encoder did before any of the above, and
+	 * what rate_control_mode 0 still gets, down to the bytes. */
 	BOOL refresh_active;
+	BOOL vendor_gdr_active;
 	ImxVpuApiIntraRefreshCfg refresh_cfg;
 	ImxVpuApiIntraRefreshState refresh_state;
 	/* Slice height in CTB rows that was programmed, 0 = one slice. Kept
@@ -708,17 +715,73 @@ static void resolve_refresh_config(ImxVpuApiEncoder *encoder)
 
 	imx_vpu_api_intra_refresh_plan(&req, &(encoder->refresh_cfg), &plan);
 
-	encoder->refresh_active = plan.active;
+	/* Which of the two mechanisms runs the sweep.
+	 *
+	 * rate_control_mode 0 is this encoder as it shipped, and that includes
+	 * its own GDR: the vendor library places the intra band from gdrDuration,
+	 * and neither the scheduler here nor the two SEIs that come with it
+	 * appear in the stream. Only rate_control_mode 1 gets the caller-driven
+	 * sweep - it exists because the vendor's cannot be paced independently of
+	 * the IDR interval, and because it takes intraArea away from everything
+	 * else that wants it.
+	 *
+	 * The deprecated rolling slices and tiles aliases are the exception. They
+	 * were always caller driven, the vendor sweep can place neither a band
+	 * per slice nor a half width region, and reproducing what they did before
+	 * is the whole point of keeping them - so they stay on the scheduler in
+	 * either mode.
+	 *
+	 * This keys off the requested rate control mode and not off whether the
+	 * new CBR actually came up, so that a zero bitrate or a failed
+	 * ext_rate_control_init() cannot quietly change which refresh mechanism
+	 * the stream uses on top of losing the rate control. */
+	encoder->vendor_gdr_active = plan.active
+	                          && (open_params->rate_control_mode != 1)
+	                          && (req.num_rolling_slices == 0)
+	                          && (req.num_rolling_tiles == 0);
+	encoder->refresh_active = plan.active && !encoder->vendor_gdr_active;
 	encoder->slice_size = plan.slice_size;
 	memset(&(encoder->refresh_state), 0, sizeof(encoder->refresh_state));
 
 	if (!plan.active)
 		return;
 
+	/* Slices are programmed the same way whoever runs the sweep, and asking
+	 * for a count the hardware cannot derive silently changed it before. */
+	if ((open_params->slice_count > 1) && (plan.slice_count != (int)(open_params->slice_count)))
+		IMX_VPU_API_INFO("slice-count %u is not achievable at %d CTB rows; "
+		                 "using %d slices of %d rows",
+		                 open_params->slice_count, encoder->refresh_cfg.ctb_rows,
+		                 plan.slice_count, plan.slice_size);
+
+	if (encoder->vendor_gdr_active)
+	{
+		/* The vendor sweep has one dial - the period - and derives the
+		 * band height from it and the picture size. There is nowhere to
+		 * put the rest, so say they are being dropped rather than report
+		 * a schedule that is not the one running. */
+		if ((open_params->intra_refresh_duration > 0)
+		 && ((int)(open_params->intra_refresh_duration) != encoder->refresh_cfg.period))
+			IMX_VPU_API_WARNING("intra-refresh-duration %u is ignored with the encoder's "
+			                    "own GDR (rate-control=0): the sweep is spread over the "
+			                    "whole %d picture period",
+			                    open_params->intra_refresh_duration,
+			                    encoder->refresh_cfg.period);
+		if (open_params->intra_refresh_rows > 0)
+			IMX_VPU_API_WARNING("intra-refresh-rows %u is ignored with the encoder's own "
+			                    "GDR (rate-control=0): it derives the band height from "
+			                    "the period", open_params->intra_refresh_rows);
+
+		IMX_VPU_API_DEBUG("intra refresh: the encoder's own GDR, period %d, "
+		                  "%d slice(s) of %d row(s)",
+		                  encoder->refresh_cfg.period, plan.slice_count, plan.slice_size);
+		return;
+	}
+
 	imx_vpu_api_intra_refresh_init(&(encoder->refresh_state), &(encoder->refresh_cfg));
 
-	/* Both of these silently changed the caller's configuration before, and
-	 * both change what the result means, so say so. */
+	/* This silently changed the caller's configuration before, and it changes
+	 * what the result means, so say so. */
 	if (plan.wanted_steps > plan.num_steps)
 		IMX_VPU_API_INFO("intra refresh: a %d picture sweep cannot hold %d regions; "
 		                 "using %d row(s) of %d, so bands are %d CTB rows not %d",
@@ -726,11 +789,6 @@ static void resolve_refresh_config(ImxVpuApiEncoder *encoder)
 		                 plan.row_steps, plan.col_steps,
 		                 encoder->refresh_cfg.ctb_rows / plan.row_steps,
 		                 encoder->refresh_cfg.rows);
-	if ((open_params->slice_count > 1) && (plan.slice_count != (int)(open_params->slice_count)))
-		IMX_VPU_API_INFO("slice-count %u is not achievable at %d CTB rows; "
-		                 "using %d slices of %d rows",
-		                 open_params->slice_count, encoder->refresh_cfg.ctb_rows,
-		                 plan.slice_count, plan.slice_size);
 
 	IMX_VPU_API_DEBUG("intra refresh: period %d, duration %d, %d region(s) of "
 	                  "%d row(s) x %d col(s) of %d px, %d slice(s) of %d row(s)",
@@ -753,15 +811,26 @@ static void init_encoder_input(ImxVpuApiEncoder *encoder)
 	encoder_input->gopConfig.size = 1;
 	encoder_input->gopConfig.special_size = 0;
 	encoder_input->gopConfig.pGopPicSpecialCfg = &encoder->gop_pic_special_config[0];
-	/* Intra refresh is driven from this file (see intra_refresh.c), so it
-	 * wants no periodic IDR, and gdrDuration left at zero so
-	 * VCEncFindNextPic() never asks for an intra picture. Leaving the
-	 * encoder's own GDR on would take the intra area away - it overwrites
-	 * intraArea and roi1Area on every picture (hevcencapi.c:6340-6394) and
-	 * rejects any intraArea set from here. */
-	encoder_input->gopConfig.idr_interval = encoder->refresh_active
-	                                      ? INT32_MAX : open_params->gop_size;
-	encoder_input->gopConfig.gdrDuration = 0;
+	/* Whose GDR. The vendor's is one setting, and it is tied to the IDR
+	 * interval: VCEncFindNextPic() starts a sweep after each IDR and asks for
+	 * the intra picture that begins it, so the period has to be both.
+	 *
+	 * A sweep driven from this file wants the opposite - no periodic IDR, and
+	 * gdrDuration left at zero so VCEncFindNextPic() never asks for an intra
+	 * picture. Leaving the encoder's own GDR on as well would take the intra
+	 * area away: it overwrites intraArea and roi1Area on every picture
+	 * (hevcencapi.c:6340-6394) and rejects any intraArea set from here. */
+	if (encoder->vendor_gdr_active)
+	{
+		encoder_input->gopConfig.gdrDuration = encoder->refresh_cfg.period;
+		encoder_input->gopConfig.idr_interval = encoder->refresh_cfg.period;
+	}
+	else
+	{
+		encoder_input->gopConfig.idr_interval = encoder->refresh_active
+		                                      ? INT32_MAX : open_params->gop_size;
+		encoder_input->gopConfig.gdrDuration = 0;
+	}
 	encoder_input->gopConfig.firstPic = 0;
 	encoder_input->gopConfig.lastPic = INT32_MAX;
 	encoder_input->gopConfig.outputRateNumer = open_params->frame_rate_numerator;
@@ -837,11 +906,13 @@ static ImxVpuApiEncReturnCodes init_vcenc_instance(ImxVpuApiEncoder *encoder,
 		                         || (open_params->format_specific_open_params.h264_open_params.profile != IMX_VPU_API_H264_PROFILE_BASELINE);
 		coding_config.cirStart = 0;
 		coding_config.cirInterval = open_params->min_intra_refresh_mb_count;
-		/* Always zero: the sweep is run from this file. A nonzero value here
-		 * also silently forces cu_qp_delta_enabled_flag on in the PPS
-		 * (hevcencapi.c:2324) and stamps roi1DeltaQp onto the refresh band,
-		 * neither of which this mode wants. */
-		coding_config.gdrDuration = 0;
+		/* Nonzero only for the encoder's own GDR. It also forces
+		 * cu_qp_delta_enabled_flag on in the PPS (hevcencapi.c:2324) and
+		 * stamps roi1DeltaQp onto the refresh band - part of what that
+		 * mechanism is, and neither of which a sweep driven from this file
+		 * wants. */
+		coding_config.gdrDuration = encoder->vendor_gdr_active
+		                          ? encoder->refresh_cfg.period : 0;
 
 		/* These are set to the defaults specified in hevcencapi.h */
 		coding_config.noiseLow = 10;
@@ -1716,6 +1787,17 @@ void imx_vpu_api_enc_set_intra_refresh_region(ImxVpuApiEncoder *encoder, unsigne
 		return;
 	}
 
+	/* The encoder's own GDR sweeps on its own schedule and overwrites
+	 * intraArea on every picture, so there is nothing here that can serve a
+	 * request. Say so once instead of filling a queue nobody drains. */
+	if (encoder->vendor_gdr_active)
+	{
+		IMX_VPU_API_DEBUG("ignoring the intra refresh request for rows %u..%u: the "
+		                  "encoder's own GDR drives the sweep (rate-control=0)",
+		                  first_ctb_row, first_ctb_row + num_ctb_rows - 1);
+		return;
+	}
+
 	for (int i = 0; i < encoder->forced_intra_q_count; i++)
 	{
 		int idx = (encoder->forced_intra_q_head + i) % FORCED_INTRA_QUEUE_SIZE;
@@ -1954,7 +2036,7 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 	}
 
 	if (!encoder->has_header && (encoder->num_encoded_pictures > 0) &&
-	    encoder->refresh_active &&
+	    (encoder->refresh_active || encoder->vendor_gdr_active) &&
 	    (encoder->open_params.gop_size > 0) &&
 	    (((int)(encoder->num_encoded_pictures) % (int)(encoder->open_params.gop_size)) == 0))
 	{
