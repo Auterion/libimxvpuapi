@@ -2482,57 +2482,6 @@ static void drop_inserted_pps_nal(ImxVpuApiEncoder *encoder, VCEncOut *encoder_o
 }
 
 
-static ImxVpuApiEncReturnCodes restart_encoder(ImxVpuApiEncoder *encoder)
-{
-	ImxVpuApiEncReturnCodes ret;
-
-	IMX_VPU_API_INFO(
-		"VC8000E auto-recovery: releasing and re-initializing the encoder "
-		"after %d encoded frames",
-		(int)encoder->num_encoded_pictures
-	);
-
-	if (encoder->encoder != NULL)
-	{
-		VCEncRelease(encoder->encoder);
-		encoder->encoder = NULL;
-		usleep(50 * 1000);
-	}
-
-	free(encoder->header_data);
-	encoder->header_data = NULL;
-	encoder->header_data_size = 0;
-	encoder->has_header = FALSE;
-
-	encoder->num_encoded_pictures = 0;
-	encoder->next_coding_type = VCENC_NOTCODED_FRAME;
-	encoder->force_IDR_frame = FALSE;
-
-	/* The new instance numbers its parameter sets from zero again, so the
-	 * PPS this resolution owns has to be created and activated again. The
-	 * resolution has not changed, so resolve_param_set_id() hands back the
-	 * same id. */
-	encoder->drop_inserted_pps = FALSE;
-
-	resolve_refresh_config(encoder);
-
-	init_encoder_input(encoder);
-
-	ret = init_vcenc_instance(
-		encoder,
-		convert_to_vc8000e_pixel_format(encoder->open_params.color_format),
-		&encoder->stream_info.frame_encoding_framebuffer_metrics
-	);
-	if (ret != IMX_VPU_API_ENC_RETURN_CODE_OK)
-	{
-		IMX_VPU_API_ERROR("encoder restart failed; subsequent encode calls will fail");
-		return ret;
-	}
-
-	return IMX_VPU_API_ENC_RETURN_CODE_OK;
-}
-
-
 /* The Hantro VC8000E blob prints unconditional stdout debug while assembling the
  * bitstream ("RecoveryPoint sei size=%d", "PicTiming sei size=%d", "BufferingSei
  * sei size=%d", "UserDataUnreg sei size=%d", ...). With a per-picture recovery SEI
@@ -3002,27 +2951,31 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 		ret = IMX_VPU_API_ENC_RETURN_CODE_OK;
 		goto finish;
 	}
+	/* PR #19's lost-IRQ auto-recovery used to sit here, releasing and
+	 * re-initialising the encoder on any non-FRAME_READY return. It is gone for
+	 * good.
+	 *
+	 * It was aimed at the wrong thing. The stall it worked around is the
+	 * VC8000E wedging on picture start, which happens only when slice-ready
+	 * interrupts are armed - and those are now permanently off, so the failure
+	 * it caught should not occur at all. The restart also worked for a reason
+	 * its own log message got wrong: not "lost IRQ", but that VCEncRelease()
+	 * closes /dev/mxc_hantro_vc8000e and the reopen power-cycles the block.
+	 * It cost a dropped frame and a forced IDR every time it fired, and it
+	 * fired on genuine hardware errors too, turning them into silent quality
+	 * dips instead of reports.
+	 *
+	 * The full diagnosis is in the comment above vcenc_reject_slice_ready_cb()
+	 * in the VC8000E encoder's hevcencapi.c.
+	 * https://github.com/Auterion/vpu-imx-recipe/pull/19 */
 	if (enc_ret != VCENC_FRAME_READY)
 	{
-		IMX_VPU_API_WARNING(
-			"VCEncStrmEncode returned %s (%d); attempting auto-recovery via encoder restart",
-			vcenc_retval_to_string(enc_ret), (int)enc_ret
+		IMX_VPU_API_ERROR(
+			"VCEncStrmEncode returned %s (%d) after %d encoded pictures",
+			vcenc_retval_to_string(enc_ret), (int)enc_ret,
+			(int)encoder->num_encoded_pictures
 		);
-
-		encoder->skipped_frame_context = encoder->staged_raw_frame.context;
-		encoder->skipped_frame_pts = encoder->staged_raw_frame.pts;
-		encoder->skipped_frame_dts = encoder->staged_raw_frame.dts;
-		encoder->skipped_frame_available = TRUE;
-
-		if (restart_encoder(encoder) != IMX_VPU_API_ENC_RETURN_CODE_OK)
-		{
-			IMX_VPU_API_ERROR("encoder auto-recovery failed; declaring fatal");
-			goto error;
-		}
-
-		*output_code = IMX_VPU_API_ENC_OUTPUT_CODE_FRAME_SKIPPED;
-		ret = IMX_VPU_API_ENC_RETURN_CODE_OK;
-		goto finish;
+		goto error;
 	}
 
 	if (encoder_output.streamSize == 0)
@@ -3117,7 +3070,7 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 finish:
 	if (encoder->staged_raw_frame_set)
 	{
-		//imx_dma_buffer_unmap(encoder->staged_raw_frame.fb_dma_buffer);
+		imx_dma_buffer_unmap(encoder->staged_raw_frame.fb_dma_buffer);
 		encoder->staged_raw_frame_set = FALSE;
 	}
 
