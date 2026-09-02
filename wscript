@@ -115,7 +115,10 @@ class PlatformIMX8M:
 		if self.soc_type == 'MX8MM':
 			# i.MX8m mini has the Hantro H1 encoder
 			conf.define('IMXVPUAPI2_VPU_HAS_H1_ENCODER', 1)
-			conf.check_cc(uselib_store = 'HANTRO', uselib = 'HANTRO', define_name = '', mandatory = 1, lib = 'hantro_h1')
+			# libm is for ext_rate_control.c, which is shared with the imx8mp
+			# and uses log2/pow/lround. The imx8mp picks it up alongside the
+			# VC8000E library below.
+			conf.check_cc(uselib_store = 'HANTRO', uselib = 'HANTRO', define_name = '', mandatory = 1, lib = ['hantro_h1', 'm'])
 			conf.check_cc(uselib_store = 'HANTRO', uselib = 'HANTRO', define_name = '', mandatory = 1, lib = 'codec_enc')
 			conf.env['DEFINES_HANTRO_ENC'] += ['ENCH1', 'OMX_ENCODER_VIDEO_DOMAIN', 'ENABLE_HANTRO_ENC']
 			conf.check_cc(uselib_store = 'HANTRO_ENC', uselib = 'HANTRO', define_name = '', mandatory = 1, includes = [os.path.join(sysroot_path, 'usr/include/hantro_enc'), os.path.join(sysroot_path, 'usr/include/hantro_enc/headers')], header_name = 'encoder/codec.h')
@@ -156,7 +159,13 @@ class PlatformIMX8M:
 				features = ['c'],
 				includes = ['.'],
 				uselib = ['IMXDMABUFFER', 'C99', 'HANTRO', 'HANTRO_ENC'],
-				source = ['imxvpuapi2/imxvpuapi2_imx8m_hantro_h1_encoder.c'],
+				# intra_refresh.c is the shared option planner and
+				# ext_rate_control.c the shared leaky-bucket rate control:
+				# no vendor headers, no hardware, just a mapping from the
+				# unified properties onto a geometry and a QP. Both encoder
+				# backends go through them, so that a property means the same
+				# thing on an imx8mm as on an imx8mp.
+				source = ['imxvpuapi2/imxvpuapi2_imx8m_hantro_h1_encoder.c', 'imxvpuapi2/ext_rate_control.c', 'imxvpuapi2/intra_refresh.c', 'imxvpuapi2/enc_session_state.c'],
 				name = 'imx8_encoder'
 			)
 		elif self.soc_type == 'MX8MP':
@@ -164,7 +173,7 @@ class PlatformIMX8M:
 				features = ['c'],
 				includes = ['.'],
 				uselib = ['IMXDMABUFFER', 'C99', 'HANTRO', 'HANTRO_ENC'],
-				source = ['imxvpuapi2/imxvpuapi2_imx8m_hantro_vc8000_encoder.c', 'imxvpuapi2/ext_rate_control.c', 'imxvpuapi2/intra_refresh.c'],
+				source = ['imxvpuapi2/imxvpuapi2_imx8m_hantro_vc8000_encoder.c', 'imxvpuapi2/ext_rate_control.c', 'imxvpuapi2/intra_refresh.c', 'imxvpuapi2/enc_session_state.c'],
 				name = 'imx8_encoder'
 			)
 		else:
@@ -226,6 +235,25 @@ def configure(conf):
 
 	conf.env['CFLAGS'] = basic_cflags
 	conf.env['LINKFLAGS'] = basic_ldflags
+
+	# A shared library links happily with symbols nothing on the link line
+	# defines - the loader is left to find them, and when it cannot, the
+	# failure lands on whoever dlopens the plugin rather than on the build.
+	# That is how a source file left out of a platform's build reached a
+	# packaged .deb once already: imx8mm built and linked clean while
+	# libimxvpuapi2.so carried four undefined ext_rate_control_* symbols.
+	# Make it a link error instead.
+	#
+	# Probed rather than assumed: --no-undefined is GNU ld and lld, and a
+	# toolchain without it should build the library rather than refuse to
+	# configure.
+	conf.env['LINKFLAGS_NOUNDEFINED'] = []
+	if check_combined_build_flags(conf, conf.env['CFLAGS_C99'] or [], ['-Wl,--no-undefined']):
+		conf.env['LINKFLAGS_NOUNDEFINED'] = ['-Wl,--no-undefined']
+	else:
+		Logs.pprint('YELLOW', 'This linker has no --no-undefined; an unresolved symbol will '
+		                      'surface at load time rather than at build time')
+
 	conf.env['BUILD_STATIC'] = conf.options.enable_static
 	conf.env['DISABLE_EXAMPLES'] = conf.options.disable_examples
 
@@ -284,7 +312,9 @@ def build(bld):
 	bld(
 		features = ['c', 'cstlib' if bld.env['BUILD_STATIC'] else 'cshlib'],
 		includes = ['.'],
-		uselib = ['IMXDMABUFFER', 'C99'] + use_lists['uselib'],
+		# NOUNDEFINED is empty for a static build, which has no link step to
+		# apply it to, and on a linker that does not have the flag.
+		uselib = ['IMXDMABUFFER', 'C99'] + ([] if bld.env['BUILD_STATIC'] else ['NOUNDEFINED']) + use_lists['uselib'],
 		use = use_lists['use'],
 		source = ['imxvpuapi2/imxvpuapi2.c', 'imxvpuapi2/imxvpuapi2_priv.c', 'imxvpuapi2/imxvpuapi2_jpeg.c'],
 		name = 'imxvpuapi2',

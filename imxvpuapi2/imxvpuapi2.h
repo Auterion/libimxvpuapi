@@ -2267,13 +2267,13 @@ typedef struct
 	/* DEPRECATED, use the intra_refresh_* fields. Number of horizontal
 	 * slices for rolling intra refresh. 0 = disabled, 1 = automatic
 	 * (4 slices), 2..16 = actual slice count. Mapped onto
-	 * intra_refresh_rows plus slice_count. */
+	 * intra_refresh_height plus slice_count. */
 	uint8_t num_rolling_slices;
 
 	/* DEPRECATED, use the intra_refresh_* fields. Number of 2D tiles
 	 * (arranged in 2 columns) for rolling intra tile refresh. 0 = disabled,
 	 * 1 = automatic (4 tiles = 2x2 grid), 2/4/6/.../16 = tile count (even).
-	 * Mapped onto intra_refresh_rows plus intra_refresh_columns. Mutually
+	 * Mapped onto intra_refresh_height plus intra_refresh_columns. Mutually
 	 * exclusive with num_rolling_slices. */
 	uint8_t num_rolling_tiles;
 
@@ -2332,7 +2332,7 @@ typedef struct
 	 * at mode 0 is byte for byte the stream the unmodified library produced
 	 * from the same settings. Mode 1 runs the sweep from the library instead
 	 * (intra_refresh.c), which is what intra_refresh_duration,
-	 * intra_refresh_rows and imx_vpu_api_enc_set_intra_refresh_region() act
+	 * intra_refresh_height and imx_vpu_api_enc_set_intra_refresh_region() act
 	 * on, and which emits the two refresh SEIs. The deprecated
 	 * num_rolling_slices and num_rolling_tiles were always driven from the
 	 * library and still are, in both modes.
@@ -2376,11 +2376,14 @@ typedef struct
 	 * into fewer pictures. Longer than the period is clamped down to it. */
 	uint8_t intra_refresh_duration;
 
-	/* Target band height in CTB rows, 0 = 2. It is a target: the sweep is
+	/* Target band height in CTB rows. 0 selects the default, which is 2 rows
+	 * on h.265 and 8 rows on h.264 - a row being 64 pixels on the one and 16
+	 * on the other, so the two cover the same share of the picture. It is a
+	 * target: the sweep is
 	 * split into ceil(ctb_rows / this) bands of as equal a height as they
 	 * divide into, so that they cover the picture exactly. A one row band
 	 * measures worse than every coarser height tried. */
-	uint8_t intra_refresh_rows;
+	uint8_t intra_refresh_height;
 
 	/* Region width in CTB columns, 0 = full width. Only the deprecated
 	 * rolling tiles mapping sets this; no property exposes it, because a

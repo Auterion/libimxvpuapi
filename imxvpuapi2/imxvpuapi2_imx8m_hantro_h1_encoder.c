@@ -6,6 +6,9 @@
 #include <config.h>
 #include "imxvpuapi2.h"
 #include "imxvpuapi2_priv.h"
+#include "intra_refresh.h"
+#include "ext_rate_control.h"
+#include "enc_session_state.h"
 
 #include "vp8encapi.h"
 #include "h264encapi.h"
@@ -43,6 +46,10 @@ typedef struct
 	void (*get_encoded_data)(void *h1_encoder, ImxVpuApiEncodedFrame *encoded_frame);
 
 	void (*flush)(void *h1_encoder);
+
+	/* Renumber the parameter sets and hand back the new header. NULL where
+	 * the codec has no parameter sets to renumber, which is VP8. */
+	ImxVpuApiEncReturnCodes (*set_param_set_id)(void *h1_encoder, unsigned int id, size_t *header_size);
 }
 HantroH1EncoderFunctions;
 
@@ -80,6 +87,12 @@ static char const * imx_vpu_api_h1_encoder_3state_mode_to_string(uint32_t mode)
 
 struct _ImxVpuApiEncoder
 {
+	/* Carried across a resolution change; see ImxVpuApiEncSession. Only filled
+	 * in at rate_control_mode 1, mode 0 being the encoder as it shipped. */
+	ImxVpuApiEncSession session;
+	/* The id this instance's resolution owns, 0 until one is assigned. */
+	int param_set_id;
+
 	/* Specific H1 encoder to use (VP8 or h.264). */
 	void *h1_encoder;
 	HantroH1EncoderFunctions const *h1_encoder_functions;
@@ -621,22 +634,6 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_set_bitrate(ImxVpuApiEncoder *encoder, u
 /* Stream continuity across encoder instances is a VC8000E facility - see
  * imxvpuapi2_imx8m_hantro_vc8000_encoder.c. There is nothing here that a
  * successor instance would have to be told about. */
-ImxVpuApiEncReturnCodes imx_vpu_api_enc_get_session_state(ImxVpuApiEncoder *encoder, ImxVpuApiEncSessionState *state)
-{
-	IMX_VPU_API_UNUSED_PARAM(encoder);
-	IMX_VPU_API_UNUSED_PARAM(state);
-	return IMX_VPU_API_ENC_RETURN_CODE_INVALID_CALL;
-}
-
-
-ImxVpuApiEncReturnCodes imx_vpu_api_enc_set_session_state(ImxVpuApiEncoder *encoder, ImxVpuApiEncSessionState const *state)
-{
-	IMX_VPU_API_UNUSED_PARAM(encoder);
-	IMX_VPU_API_UNUSED_PARAM(state);
-	return IMX_VPU_API_ENC_RETURN_CODE_INVALID_CALL;
-}
-
-
 void imx_vpu_api_enc_set_intra_refresh_region(ImxVpuApiEncoder *encoder, unsigned int first_ctb_row, unsigned int num_ctb_rows)
 {
 	IMX_VPU_API_UNUSED_PARAM(encoder);
@@ -1595,6 +1592,7 @@ static ImxVpuApiEncReturnCodes h1_h264_encode_frame(void *h1_encoder, ImxVpuApiF
 static void h1_h264_get_encoded_data(void *h1_encoder, ImxVpuApiEncodedFrame *encoded_frame);
 
 static void h1_h264_flush(void *h1_encoder);
+static ImxVpuApiEncReturnCodes h1_h264_set_param_set_id(void *h1_encoder, unsigned int id, size_t *header_size);
 
 static char const * h1_h264_encoder_ret_to_string(H264EncRet enc_ret);
 static char const * h1_h264_encoder_deblocking_filter_mode_to_string(uint32_t mode);
@@ -1611,7 +1609,12 @@ static HantroH1EncoderFunctions const h1_h264_encoder_functions = {
 	.get_encoded_data = h1_h264_get_encoded_data,
 
 	.flush = h1_h264_flush,
+
+	.set_param_set_id = h1_h264_set_param_set_id,
 };
+
+
+
 
 typedef struct
 {
@@ -1621,8 +1624,295 @@ typedef struct
 	BOOL is_first_frame;
 	unsigned int gop_frame_counter;
 	unsigned int interval_between_idr_frames;
+
+	/* rate-control=1. The leaky bucket in ext_rate_control.c chooses every
+	 * picture's QP and the sweep is driven from here, instead of the
+	 * encoder's built-in picture rate control and its own GDR. The two
+	 * cannot be mixed: the vendor GDR overwrites intraArea every picture
+	 * and H264EncSetCodingCtrl refuses an intraArea while gdrDuration is
+	 * nonzero (H264EncApi.c:362-370). */
+	BOOL new_cbr_active;
+	ExtRateControl new_cbr;
+
+	BOOL refresh_active;
+	ImxVpuApiIntraRefreshCfg refresh_cfg;
+	ImxVpuApiIntraRefreshState refresh_state;
+
+	/* The vendor API is configured by whole structs, so the last one set has
+	 * to be kept to change one field of it per picture. */
+	H264EncConfig cached_config;
+	H264EncCodingCtrl cached_coding_ctrl;
+	H264EncRateCtrl cached_rate_ctrl;
+	H264EncPreProcessingCfg cached_preproc;
+
+	/* H264EncSetSeiUserData() keeps the caller's pointer rather than copying
+	 * the payload (H264EncApi.c:1420), so the band SEI has to outlive the
+	 * call that sets it - it is read when the picture is encoded. */
+	uint8_t band_sei[IMX_VPU_API_REFRESH_BAND_SEI_SIZE];
+	/* A recovery point SEI is a whole NAL that no vendor API will emit for a
+	 * caller driven sweep, so it is built here and prepended to the picture
+	 * that starts the sweep. */
+	uint8_t recovery_sei[IMX_VPU_API_RECOVERY_POINT_SEI_MAX];
+	size_t recovery_sei_size;
+
+	uint32_t num_encoded_pictures;
 }
 H1H264Encoder;
+
+
+/* Take the parameter sets the last restart wrote and make them the ones that
+ * get prepended to the stream. They are not the ones captured when the
+ * encoder first came up: the PPS carries pic_init_qp_minus26, so an instance
+ * restarted at a different QP writes a different PPS, and every slice codes
+ * its own QP as a delta against it. Prepending the older sets makes a decoder
+ * dequantise against the wrong initial QP - a stream that parses cleanly and
+ * decodes to nothing like the input. */
+static void h1_h264_recapture_header(H1H264Encoder *encoder, size_t header_size)
+{
+	ImxVpuApiEncoder *base = encoder->base;
+	uint8_t *fresh;
+
+	if (header_size == 0)
+		return;
+
+	fresh = malloc(header_size);
+	if (fresh == NULL)
+		return;
+
+	imx_dma_buffer_start_sync_session(base->stream_buffer);
+	memcpy(fresh, base->stream_buffer_virtual_address, header_size);
+	imx_dma_buffer_stop_sync_session(base->stream_buffer);
+
+	free(base->header_data);
+	base->header_data = fresh;
+	base->header_data_size = header_size;
+}
+
+
+
+/* Which parameter set id this instance's resolution owns, from the shared
+ * allocator. Only at rate_control_mode 1: mode 0 is the encoder as it shipped,
+ * down to the bytes, and renumbering its parameter sets would change that. */
+static void resolve_param_set_id(ImxVpuApiEncoder *encoder)
+{
+	if (encoder->open_params.rate_control_mode != 1)
+	{
+		encoder->param_set_id = 0;
+		return;
+	}
+
+	encoder->param_set_id = imx_vpu_api_enc_session_param_set_id(
+		&(encoder->session),
+		encoder->open_params.frame_width,
+		encoder->open_params.frame_height);
+}
+
+
+ImxVpuApiEncReturnCodes imx_vpu_api_enc_get_session_state(ImxVpuApiEncoder *encoder, ImxVpuApiEncSessionState *state)
+{
+	ImxVpuApiEncSession *session;
+
+	assert(encoder != NULL);
+	assert(state != NULL);
+
+	if (encoder->open_params.rate_control_mode != 1)
+	{
+		/* Nothing to carry: mode 0 is the unmodified encoder, and its stream
+		 * restarts exactly as it always did. */
+		IMX_VPU_API_DEBUG("no session state at rate control mode %d",
+		                  (int)(encoder->open_params.rate_control_mode));
+		return IMX_VPU_API_ENC_RETURN_CODE_INVALID_CALL;
+	}
+
+	/* Register this instance's resolution before handing the table on, in
+	 * case nothing has yet. The first encoder of a stream is never given a
+	 * session state - there is none to give - so it never resolves an id of
+	 * its own, and without this its resolution would be missing from the
+	 * table its successor inherits: the second resolution would then take
+	 * id 0 as though it were the first, and the third would be handed the
+	 * id the first one is still using. Later instances resolved theirs when
+	 * the state arrived and find it already present here. */
+	resolve_param_set_id(encoder);
+
+	session = &(encoder->session);
+
+	if (encoder->open_params.compression_format == IMX_VPU_API_COMPRESSION_FORMAT_H264)
+	{
+		H1H264Encoder const *h264 = (H1H264Encoder const *)(encoder->h1_encoder);
+
+		if ((h264 != NULL) && h264->new_cbr_active && (h264->new_cbr.num_pictures > 0))
+			imx_vpu_api_enc_session_save_rc(session, &(h264->new_cbr));
+	}
+
+	imx_vpu_api_enc_session_pack(session, state);
+
+	IMX_VPU_API_DEBUG("session state read out: %d resolution(s), rate control %s",
+	                  (int)(session->ps_num), session->rc_valid ? "carried" : "not started yet");
+
+	return IMX_VPU_API_ENC_RETURN_CODE_OK;
+}
+
+
+ImxVpuApiEncReturnCodes imx_vpu_api_enc_set_session_state(ImxVpuApiEncoder *encoder, ImxVpuApiEncSessionState const *state)
+{
+	ImxVpuApiEncSession restored;
+	H1H264Encoder *h264;
+
+	assert(encoder != NULL);
+	assert(state != NULL);
+
+	if (encoder->open_params.rate_control_mode != 1)
+		return IMX_VPU_API_ENC_RETURN_CODE_INVALID_CALL;
+
+	if (!imx_vpu_api_enc_session_unpack(&restored, state))
+		return IMX_VPU_API_ENC_RETURN_CODE_INVALID_PARAMS;
+
+	encoder->session = restored;
+
+	if (encoder->open_params.compression_format != IMX_VPU_API_COMPRESSION_FORMAT_H264)
+		return IMX_VPU_API_ENC_RETURN_CODE_OK;
+
+	h264 = (H1H264Encoder *)(encoder->h1_encoder);
+	if (h264 == NULL)
+		return IMX_VPU_API_ENC_RETURN_CODE_OK;
+
+	/* Carry the rate control's leaky bucket over. Its level is a debt the
+	 * link has not drained yet, which belongs to the link and not to the
+	 * picture size; the quantities that do scale with the picture are
+	 * rescaled onto the new one. */
+	if (h264->new_cbr_active)
+		imx_vpu_api_enc_session_restore_rc(&restored, &(h264->new_cbr));
+
+	/* Now that the table is restored, this resolution can be given its id -
+	 * and the encoder was brought up before that was known, numbering its
+	 * parameter sets 0. Renumber by restarting it, which is the only way:
+	 * the ids are baked into the parameter sets H264EncStrmStart() emits and
+	 * into a register the hardware writes into every slice header. */
+	resolve_param_set_id(encoder);
+
+	if ((encoder->param_set_id != 0) && (h264->base->h1_encoder_functions->set_param_set_id != NULL))
+	{
+		size_t header_size = 0;
+
+		if (h264->base->h1_encoder_functions->set_param_set_id(h264, (unsigned int)(encoder->param_set_id),
+		                                                       &header_size) != IMX_VPU_API_ENC_RETURN_CODE_OK)
+		{
+			IMX_VPU_API_WARNING("could not renumber the parameter sets to id %d; the stream keeps id 0",
+			                    encoder->param_set_id);
+			encoder->param_set_id = 0;
+			return IMX_VPU_API_ENC_RETURN_CODE_ERROR;
+		}
+
+		/* The header captured when the encoder came up carries the old ids. */
+		if (header_size > 0)
+		{
+			uint8_t *fresh = malloc(header_size);
+
+			if (fresh != NULL)
+			{
+				imx_dma_buffer_start_sync_session(encoder->stream_buffer);
+				memcpy(fresh, encoder->stream_buffer_virtual_address, header_size);
+				imx_dma_buffer_stop_sync_session(encoder->stream_buffer);
+
+				free(encoder->header_data);
+				encoder->header_data = fresh;
+				encoder->header_data_size = header_size;
+				encoder->must_prepend_header_data = TRUE;
+			}
+		}
+	}
+
+	return IMX_VPU_API_ENC_RETURN_CODE_OK;
+}
+
+
+/* The unified option set is one vocabulary across both i.MX8M encoders, so
+ * every property reaches this backend whether or not the H1 has anywhere to
+ * put it. Say which ones do not rather than let them look applied: a stream
+ * asked for with a two row refresh band and produced with whatever band the
+ * vendor GDR picked is a different stream, and the caller cannot tell from
+ * the outside. The VC8000E reports the same way at rate-control=0, where its
+ * own GDR has the same single dial.
+ *
+ * These are warnings and not errors on purpose. A caller configured for an
+ * imx8mp should keep working on an imx8mm rather than refuse to open. */
+static void h1_h264_report_unsupported_options(ImxVpuApiEncOpenParams const *open_params,
+                                               ImxVpuApiIntraRefreshCfg const *refresh_cfg,
+                                               ImxVpuApiIntraRefreshPlan const *refresh_plan,
+                                               BOOL vendor_gdr_active)
+{
+	if (open_params->rate_control_mode > 1)
+		IMX_VPU_API_WARNING("rate-control=%u is not a mode this encoder has; using the "
+		                    "encoder's built-in rate control",
+		                    open_params->rate_control_mode);
+
+	/* request-intra-region is the one part of rate-control=1 that is not
+	 * here. The sweep it re-anchors is, but there is nothing on this encoder
+	 * to receive the request, so a caller that relies on it for loss
+	 * recovery should know it is getting the sweep alone. */
+	if (open_params->rate_control_mode == 1)
+		IMX_VPU_API_DEBUG("rate-control=1: HRD buffer rate control and a caller driven "
+		                  "refresh sweep, both driven from the library. "
+		                  "imx_vpu_api_enc_set_intra_refresh_region() is not implemented on "
+		                  "this encoder and does nothing");
+
+	/* The hardware bounds every picture with one QP pair. At rate-control=1
+	 * that does not matter: the QP is chosen outside the encoder and the
+	 * bucket applies the intra and inter bounds itself. */
+	if (open_params->rate_control_mode != 1)
+	{
+		if (open_params->qp_min_intra > 0)
+			IMX_VPU_API_WARNING("qp-min-intra %u is ignored with this encoder's built-in rate "
+			                    "control: it bounds every picture with one QP pair and has no "
+			                    "separate intra bounds. Use qp-min, or "
+			                    "fixed-intra-quantization / intra-qp-bias to move the intra QP "
+			                    "relative to it, or rate-control=1",
+			                    open_params->qp_min_intra);
+		if (open_params->qp_max_intra > 0)
+			IMX_VPU_API_WARNING("qp-max-intra %u is ignored with this encoder's built-in rate "
+			                    "control: it bounds every picture with one QP pair and has no "
+			                    "separate intra bounds. Use qp-max, or rate-control=1",
+			                    open_params->qp_max_intra);
+
+		if (open_params->static_scene_ibit_percent > 0)
+			IMX_VPU_API_WARNING("static-scene-ibit-percent %u is ignored on the H1 encoder: its "
+			                    "rate control has no static scene detection",
+			                    open_params->static_scene_ibit_percent);
+	}
+
+	if (!refresh_plan->active || !vendor_gdr_active)
+		return;
+
+	/* Everything below describes the encoder's own GDR, which is what runs
+	 * at rate-control=0. It has one dial - the period - and derives the band
+	 * height from it and the picture size. Worded as the VC8000E words it
+	 * for its own GDR, because it is the same situation. */
+	if ((open_params->intra_refresh_duration > 0)
+	 && ((int)(open_params->intra_refresh_duration) != refresh_cfg->period))
+		IMX_VPU_API_WARNING("intra-refresh-duration %u is ignored with the encoder's own GDR: "
+		                    "the sweep is spread over the whole %d picture period",
+		                    open_params->intra_refresh_duration, refresh_cfg->period);
+	if (open_params->intra_refresh_height > 0)
+		IMX_VPU_API_WARNING("intra-refresh-height %u is ignored with the encoder's own GDR "
+		                    "(rate-control=0): it derives the band height from the period",
+		                    open_params->intra_refresh_height);
+
+	/* The rolling modes were caller driven sweeps with a band placement of
+	 * their own - oldest slice first, or half width tiles. Their slice count
+	 * and period survive the mapping; the placement needs the caller driven
+	 * sweep, which is what rate-control=1 selects. */
+	if (open_params->num_rolling_slices > 0)
+		IMX_VPU_API_WARNING("use-rolling-slices=%u at rate-control=0 gives the slice count and "
+		                    "the period, but not the oldest-slice-first band order: the "
+		                    "encoder's own GDR sweeps top to bottom. rate-control=1 reproduces "
+		                    "the order", open_params->num_rolling_slices);
+	if (open_params->num_rolling_tiles > 0)
+		IMX_VPU_API_WARNING("use-rolling-tiles=%u at rate-control=0 gives the slice count and "
+		                    "the period, but not the half width tiles: the encoder's own GDR "
+		                    "refreshes full width bands. rate-control=1 reproduces the tiles",
+		                    open_params->num_rolling_tiles);
+}
+
 
 static ImxVpuApiEncReturnCodes h1_h264_open_encoder(ImxVpuApiEncoder *base, void **h1_encoder)
 {
@@ -1638,6 +1928,9 @@ static ImxVpuApiEncReturnCodes h1_h264_open_encoder(ImxVpuApiEncoder *base, void
 	H264EncRateCtrl rate_control;
 	H264EncPreProcessingCfg preprocessor_config;
 	H264EncRet enc_ret;
+	ImxVpuApiIntraRefreshCfg refresh_cfg;
+	ImxVpuApiIntraRefreshPlan refresh_plan;
+	BOOL vendor_gdr_active;
 
 	assert(base != NULL);
 	assert(h1_encoder != NULL);
@@ -1647,6 +1940,10 @@ static ImxVpuApiEncReturnCodes h1_h264_open_encoder(ImxVpuApiEncoder *base, void
 
 	encoder = malloc(sizeof(H1H264Encoder));
 	assert(encoder != NULL);
+	/* Every field is read before it is written somewhere below - the refresh
+	 * and rate control state in particular is consulted on the first picture
+	 * whether or not rate-control=1 set it up. */
+	memset(encoder, 0, sizeof(H1H264Encoder));
 
 	open_params = &(base->open_params);
 	fb_metrics = &(base->stream_info.frame_encoding_framebuffer_metrics);
@@ -1730,6 +2027,8 @@ static ImxVpuApiEncReturnCodes h1_h264_open_encoder(ImxVpuApiEncoder *base, void
 			goto error;
 	}
 
+	encoder->cached_config = config;
+
 	enc_ret = H264EncInit(&config, &(encoder->handle));
 	if (enc_ret != H264ENC_OK)
 	{
@@ -1751,8 +2050,63 @@ static ImxVpuApiEncReturnCodes h1_h264_open_encoder(ImxVpuApiEncoder *base, void
 		goto error;
 	}
 
-	/* Encode the entire picture in one slice */
-	coding_control.sliceSize = 0;
+	/* Slices and the intra refresh sweep are resolved by the same planner
+	 * the VC8000E uses, so that a property means the same thing on an
+	 * imx8mm as it does on an imx8mp: the same period precedence, the same
+	 * rounding of an unachievable slice count, the same mapping of the
+	 * deprecated rolling spellings. The H1 counts both sliceSize and its
+	 * GDR in macroblock rows, which is exactly the planner's unit at
+	 * unit_pixels 16. */
+	{
+		ImxVpuApiIntraRefreshRequest req;
+
+		memset(&req, 0, sizeof(req));
+		req.unit_pixels = 16;
+		req.ctb_rows = (int)(base->num_macroblocks_per_column);
+		req.ctb_cols = (int)(base->num_macroblocks_per_row);
+		req.gop_size = (int)(open_params->gop_size);
+		req.enable = base->use_intra_refresh;
+		req.period = open_params->intra_refresh_period;
+		req.duration = open_params->intra_refresh_duration;
+		req.rows = open_params->intra_refresh_height;
+		req.slice_height = open_params->slice_height;
+		req.slice_count = open_params->slice_count;
+		req.gdr_refresh_period = open_params->gdr_refresh_period;
+		req.num_rolling_slices = open_params->num_rolling_slices;
+		req.num_rolling_tiles = open_params->num_rolling_tiles;
+		req.roll_size = open_params->roll_size;
+
+		imx_vpu_api_intra_refresh_plan(&req, &refresh_cfg, &refresh_plan);
+	}
+
+	/* Which of the two mechanisms produces the refresh, decided exactly as
+	 * the VC8000E decides it. The encoder's own GDR and a sweep driven from
+	 * here cannot both run: the vendor code overwrites intraArea on every
+	 * picture while gdrDuration is nonzero, and H264EncSetCodingCtrl refuses
+	 * an intraArea set from outside in that state.
+	 *
+	 * This keys off the requested rate control mode and not off whether the
+	 * new CBR actually came up, so that a zero bitrate or a failed
+	 * ext_rate_control_init() cannot quietly change which mechanism the
+	 * stream uses on top of losing the rate control. */
+	encoder->refresh_cfg = refresh_cfg;
+	encoder->refresh_active = refresh_plan.active && (open_params->rate_control_mode == 1);
+	vendor_gdr_active = refresh_plan.active && !encoder->refresh_active;
+	if (encoder->refresh_active)
+		imx_vpu_api_intra_refresh_init(&(encoder->refresh_state), &(encoder->refresh_cfg));
+
+	h1_h264_report_unsupported_options(open_params, &refresh_cfg, &refresh_plan,
+	                                   vendor_gdr_active);
+
+	/* sliceSize is a height in macroblock rows; 0 is how the vendor API
+	 * spells one slice per picture. */
+	coding_control.sliceSize = refresh_plan.slice_size;
+	if ((open_params->slice_count > 1) && (refresh_plan.slice_count != (int)(open_params->slice_count)))
+		IMX_VPU_API_INFO("slice-count %u is not achievable at %d macroblock rows; "
+		                 "using %d slices of %d rows",
+		                 open_params->slice_count, refresh_cfg.ctb_rows,
+		                 refresh_plan.slice_count, refresh_plan.slice_size);
+
 	coding_control.seiMessages = 0;
 	/* Make sure SPS and PPS NALUs are prepended to IDR frames to
 	 * facilitate seeking as well as allowing the use of the
@@ -1775,7 +2129,14 @@ static ImxVpuApiEncReturnCodes h1_h264_open_encoder(ImxVpuApiEncoder *base, void
 	 * refresh that way, since the underlying Hantro code then fills in
 	 * h.264 SPS/PPS NALUs, SEI messages etc. with appropriate extra info.
 	 * This is something that otherwise would have to be done manually. */
-	coding_control.gdrDuration = base->use_intra_refresh ? open_params->gop_size : 0;
+	/* The H1's GDR is the encoder's own sweep, the same arrangement as the
+	 * VC8000E at rate-control=0: the vendor code places the intra band and
+	 * fills in the recovery point SEI, and its one dial is how many pictures
+	 * a full refresh takes. Until now that was hardwired to the GOP size,
+	 * which coupled the refresh to the rate control window; the period is
+	 * now the caller's to set, and falls back to the GOP size when it is
+	 * not. */
+	coding_control.gdrDuration = vendor_gdr_active ? (uint32_t)(refresh_cfg.period) : 0;
 	/* Don't force any slices to be intra-coded */
 	coding_control.intraSliceMap1 = 0;
 	coding_control.intraSliceMap2 = 0;
@@ -1789,7 +2150,14 @@ static ImxVpuApiEncReturnCodes h1_h264_open_encoder(ImxVpuApiEncoder *base, void
 	coding_control.roi1Area.enable = 0;
 	coding_control.roi2Area.enable = 0;
 
-	IMX_VPU_API_DEBUG("using GOP size %u as Gradual Decoder Refresh (GDR) interval for intra refresh", open_params->gop_size);
+	if (vendor_gdr_active)
+		IMX_VPU_API_DEBUG("intra refresh: the encoder's own GDR, period %d picture(s)",
+		                  refresh_cfg.period);
+	else if (encoder->refresh_active)
+		IMX_VPU_API_DEBUG("intra refresh: driven from the library, period %d, duration %d, "
+		                  "band %d macroblock row(s), %d slice(s) of %d row(s)",
+		                  refresh_cfg.period, refresh_cfg.duration, refresh_cfg.rows,
+		                  refresh_plan.slice_count, refresh_plan.slice_size);
 
 	switch (open_params->format_specific_open_params.h264_open_params.profile)
 	{
@@ -1870,6 +2238,12 @@ static ImxVpuApiEncReturnCodes h1_h264_open_encoder(ImxVpuApiEncoder *base, void
 	IMX_VPU_API_DEBUG("    noise low: %" PRIu32, (int32_t)(coding_control.noiseLow));
 	IMX_VPU_API_DEBUG("    noise level: %" PRIu32, (int32_t)(coding_control.noiseLevel));
 
+	/* Kept so that a per-picture intraArea can be set without rebuilding the
+	 * whole struct. Only slice size, CIR, ROI and the intra area are applied
+	 * once encoding has started (H264EncApi.c:423, "set_slice_size"), so
+	 * everything else in it stays what it is here. */
+	encoder->cached_coding_ctrl = coding_control;
+
 	enc_ret = H264EncSetCodingCtrl(encoder->handle, &coding_control);
 	if (enc_ret != H264ENC_OK)
 	{
@@ -1891,10 +2265,21 @@ static ImxVpuApiEncReturnCodes h1_h264_open_encoder(ImxVpuApiEncoder *base, void
 		goto error;
 	}
 
-	rate_control.qpMin = 0;
-	rate_control.qpMax = 51;
+	/* The H1 bounds every picture with one QP pair - it has no separate
+	 * intra bounds - so qp-min/qp-max map straight onto it, and 0 keeps the
+	 * vendor defaults of no floor and a ceiling of 51. */
+	rate_control.qpMin = open_params->qp_min_inter;
+	rate_control.qpMax = (open_params->qp_max_inter > 0) ? open_params->qp_max_inter : 51;
 	rate_control.bitPerSecond = open_params->bitrate * 1000;
 	rate_control.gopLen = open_params->gop_size;
+	/* Written unconditionally, so that 0 means a zero delta rather than
+	 * "leave whatever the hardware came up with". The two encoders disagree
+	 * about that starting point - this one defaults to -3, the VC8000E to -5
+	 * - and a property whose documented default is 0 should not mean two
+	 * different biases on two platforms. The cost is that a stream at
+	 * rate-control=0 and default settings is no longer bit identical to the
+	 * one the unmodified encoder produced; see the README. */
+	rate_control.intraQpDelta = open_params->intra_qp_delta;
 
 	if (open_params->bitrate != 0)
 	{
@@ -1904,8 +2289,96 @@ static ImxVpuApiEncReturnCodes h1_h264_open_encoder(ImxVpuApiEncoder *base, void
 		rate_control.mbRc = 1;
 		rate_control.pictureSkip = (open_params->flags & IMX_VPU_API_ENC_OPEN_PARAMS_FLAG_ALLOW_FRAMESKIPPING) ? 1 : 0;
 		rate_control.qpHdr = -1; /* -1 = Let rate control calculate initial QP */
-		rate_control.hrd = 1; /* enable the Hypothetical Reference Decoder model */
+		/* Hypothetical Reference Decoder model. Always on with a bitrate,
+		 * which is what this encoder has always done and what a stream
+		 * produced at rate-control=0 has to keep doing: that mode is the
+		 * encoder as it shipped, down to the bytes.
+		 *
+		 * So use-hrd cannot mean here what it means on the VC8000E, where it
+		 * switches the model on. It selects whether the caller sizes the CPB
+		 * instead - the model is on either way, and without the flag the
+		 * vendor default applies, derived from the level (16.8 Mbit at the
+		 * level a 720p30 2 Mbps stream lands on). Sizing it unconditionally
+		 * from hrd_buffer_size would move every default stream, because that
+		 * property defaults to 1000 kbits rather than to "leave it alone". */
+		rate_control.hrd = 1;
+		if (open_params->flags & IMX_VPU_API_ENC_H26x_OPEN_PARAMS_FLAG_USE_HRD)
+		{
+			/* Coded Picture Buffer size in bits, with 0 meaning one second of
+			 * bitrate and the hardware model's five frame budget floor
+			 * applied - see imx_vpu_api_enc_hrd_buffer_bits(). */
+			rate_control.hrdCpbSize = imx_vpu_api_enc_hrd_buffer_bits(open_params, 5);
+		}
 		rate_control.fixedIntraQp = (fixed_intra_qp > 0) ? fixed_intra_qp : 0; /* 0 = rate control calculates intra QP */
+
+		if (open_params->rate_control_mode == 1)
+		{
+			ExtRateControlParams rc_params;
+
+			imx_vpu_api_enc_session_rc_params(&rc_params, open_params);
+
+			if (ext_rate_control_init(&(encoder->new_cbr), &rc_params) != 0)
+			{
+				IMX_VPU_API_WARNING("rate-control=1 asked for, but the rate control could not "
+				                    "be set up from bitrate %u kbps, %u/%u fps, %ux%u; using "
+				                    "the encoder's built-in one",
+				                    open_params->bitrate,
+				                    open_params->frame_rate_numerator,
+				                    open_params->frame_rate_denominator,
+				                    open_params->frame_width, open_params->frame_height);
+			}
+			else
+			{
+				encoder->new_cbr_active = TRUE;
+
+				/* Everything that would otherwise decide a QP is switched off,
+				 * because the QP comes from ext_rate_control_pre() instead and
+				 * any second opinion silently overrides it. mbRc in particular
+				 * would vary the QP within the picture, which would make the
+				 * bits the model learns from no longer describe the QP it
+				 * recorded them against. */
+				rate_control.pictureRc = 0;
+				rate_control.mbRc = 0;
+				rate_control.pictureSkip = 0;
+				/* Our own bucket does this job, and it does it without dropping
+				 * pictures - the hardware HRD's only enforcement mechanism is
+				 * skipping one, which leaves the decoder hunting for a
+				 * reference that was never coded. Keeping it off is also what
+				 * lets H264EncSetRateCtrl be called between pictures at all
+				 * (H264EncApi.c refuses it once encoding has started while hrd
+				 * is on). */
+				rate_control.hrd = 0;
+				rate_control.hrdCpbSize = 0;
+				/* These would move the intra QP away from the one the rate
+				 * control chose, which is exactly what it is trying to
+				 * control. */
+				rate_control.intraQpDelta = 0;
+				rate_control.fixedIntraQp = 0;
+				/* The hardware has one QP pair for all picture types and the
+				 * rate control has two, so widen the hardware's to the union:
+				 * it must not clip a QP that the rate control already clamped
+				 * to the right range for the picture at hand. */
+				rate_control.qpMin = (encoder->new_cbr.qp_min_intra < encoder->new_cbr.qp_min_inter)
+				                   ? encoder->new_cbr.qp_min_intra : encoder->new_cbr.qp_min_inter;
+				rate_control.qpMax = (encoder->new_cbr.qp_max_intra > encoder->new_cbr.qp_max_inter)
+				                   ? encoder->new_cbr.qp_max_intra : encoder->new_cbr.qp_max_inter;
+				rate_control.qpHdr = ext_rate_control_pre(&(encoder->new_cbr), 1);
+
+				IMX_VPU_API_INFO("new CBR: %u kbps, %.2f fps, %.0f kbit HRD buffer (%.0f ms at this rate), QP %d..%d",
+				                 open_params->bitrate,
+				                 encoder->new_cbr.frame_rate,
+				                 encoder->new_cbr.bucket_cap / 1000.0,
+				                 encoder->new_cbr.bucket_cap * 1000.0 / (double)(open_params->bitrate * 1000),
+				                 encoder->new_cbr.qp_min_inter,
+				                 encoder->new_cbr.qp_max_inter);
+			}
+		}
+	}
+	else if (open_params->rate_control_mode == 1)
+	{
+		IMX_VPU_API_WARNING("rate-control=1 needs a bitrate; with bitrate=0 the encoder is in "
+		                    "constant quantization mode and there is nothing for a rate "
+		                    "control to aim at");
 	}
 	else
 	{
@@ -1936,6 +2409,8 @@ static ImxVpuApiEncReturnCodes h1_h264_open_encoder(ImxVpuApiEncoder *base, void
 	IMX_VPU_API_DEBUG("  macroblock QP adjustments: %" PRId32, (int32_t)(rate_control.mbQpAdjustment));
 	IMX_VPU_API_DEBUG("  period between long term pic refreshes: %" PRId32, (int32_t)(rate_control.longTermPicRate));
 	IMX_VPU_API_DEBUG("  QP auto boost: %" PRId32, (int32_t)(rate_control.mbQpAutoBoost));
+
+	encoder->cached_rate_ctrl = rate_control;
 
 	enc_ret = H264EncSetRateCtrl(encoder->handle, &rate_control);
 	if (enc_ret != H264ENC_OK)
@@ -2011,6 +2486,8 @@ static ImxVpuApiEncReturnCodes h1_h264_open_encoder(ImxVpuApiEncoder *base, void
 			 * taken care of by the code in imx_vpu_api_enc_open(). */
 			assert(FALSE);
 	}
+
+	encoder->cached_preproc = preprocessor_config;
 
 	enc_ret = H264EncSetPreProcessing(encoder->handle, &preprocessor_config);
 	if (enc_ret != H264ENC_OK)
@@ -2097,6 +2574,81 @@ static ImxVpuApiEncReturnCodes h1_h264_start_stream(void *h1_encoder, size_t *ou
 }
 
 
+/* Bring a fresh vendor instance up in exactly the state the current one is in,
+ * except for the QP, so that the picture just encoded can be encoded again.
+ *
+ * This is how an intra picture is re-encoded on this hardware.
+ * H264EncStrmEncode() commits: it rotates the reference list, advances
+ * frame_num and picks a new reconstruction buffer before returning, so a
+ * second call is the next picture rather than another attempt at this one.
+ * A predicted picture can dodge that with ipf = H264ENC_REFERENCE, which
+ * leaves the reference buffer unrefreshed - but the vendor skips the ipf
+ * handling entirely for an intra picture (H264EncApi.c:2073), so that lever
+ * does nothing here and the instance itself has to be restarted. Measured on
+ * an imx8mm: released and re-initialised, the same input produces a
+ * byte-identical picture, which is what makes this sound.
+ *
+ * Only intra pictures. Restarting loses every reference frame, so a predicted
+ * picture re-encoded this way would be predicting from nothing; an intra
+ * picture has no such dependency, which is exactly why it is the one that can
+ * be redone. */
+static ImxVpuApiEncReturnCodes h1_h264_restart(H1H264Encoder *encoder, int qp,
+                                               unsigned int param_set_id, size_t *header_size)
+{
+	H264EncOut new_header;
+	H264EncRet enc_ret;
+
+	H264EncRelease(encoder->handle);
+	encoder->handle = NULL;
+
+	enc_ret = H264EncInit(&(encoder->cached_config), &(encoder->handle));
+	if (enc_ret != H264ENC_OK)
+	{
+		IMX_VPU_API_ERROR("could not re-initialise the encoder to re-encode a picture: %s",
+		                  h1_h264_encoder_ret_to_string(enc_ret));
+		return IMX_VPU_API_ENC_RETURN_CODE_ERROR;
+	}
+
+	/* A fresh instance is at H264ENCSTAT_INIT, so this applies the whole
+	 * coding control and not just the handful of fields that may change once
+	 * encoding has started. */
+	if ((enc_ret = H264EncSetCodingCtrl(encoder->handle, &(encoder->cached_coding_ctrl))) != H264ENC_OK)
+		goto failed;
+
+	encoder->cached_rate_ctrl.qpHdr = qp;
+	if ((enc_ret = H264EncSetRateCtrl(encoder->handle, &(encoder->cached_rate_ctrl))) != H264ENC_OK)
+		goto failed;
+
+	if ((enc_ret = H264EncSetPreProcessing(encoder->handle, &(encoder->cached_preproc))) != H264ENC_OK)
+		goto failed;
+
+	/* Has to be set before the parameter sets are written, which is what
+	 * H264EncStrmStart() below does. */
+	if ((enc_ret = H264EncSetParameterSetId(encoder->handle, param_set_id)) != H264ENC_OK)
+		goto failed;
+
+	/* Required to get the instance out of INIT and into START_FRAME. It
+	 * writes the parameter sets into the stream buffer. A re-encode
+	 * overwrites them and does not care, nothing that feeds them having
+	 * changed; a renumbering caller wants them, and asks by passing
+	 * header_size. */
+	memset(&new_header, 0, sizeof(new_header));
+	enc_ret = H264EncStrmStart(encoder->handle, &(encoder->input), &new_header);
+	if (enc_ret != H264ENC_OK)
+		goto failed;
+
+	if (header_size != NULL)
+		*header_size = new_header.streamSize;
+
+	return IMX_VPU_API_ENC_RETURN_CODE_OK;
+
+failed:
+	IMX_VPU_API_ERROR("could not reconfigure the re-initialised encoder: %s",
+	                  h1_h264_encoder_ret_to_string(enc_ret));
+	return IMX_VPU_API_ENC_RETURN_CODE_ERROR;
+}
+
+
 static ImxVpuApiEncReturnCodes h1_h264_encode_frame(void *h1_encoder, ImxVpuApiFrameType frame_type, size_t *encoded_frame_size, ImxVpuApiFrameType *encoded_frame_type, ImxVpuApiEncOutputCodes *output_code)
 {
 	H264EncRet enc_ret;
@@ -2118,8 +2670,22 @@ static ImxVpuApiEncReturnCodes h1_h264_encode_frame(void *h1_encoder, ImxVpuApiF
 	encoder->input.ltrf = H264ENC_REFERENCE;
 
 	/* Enforce an I/IDR frame at the start of GOPs, and
-	 * reset the counter, since this is a new GOP. */
-	if ((encoder->gop_frame_counter % base->open_params.gop_size) == 0)
+	 * reset the counter, since this is a new GOP.
+	 *
+	 * Not when the sweep is driven from here: the whole point of an intra
+	 * refresh is that there is no periodic IDR, and one every GOP would put
+	 * back the spike the sweep exists to remove. Only the very first picture
+	 * still has to be one, because a stream has to start somewhere. The
+	 * encoder's own GDR does not need this - it intercepts the request and
+	 * codes a predicted picture instead (H264EncApi.c:1855-1862) - but a
+	 * caller driven sweep has nothing in that path. */
+	if (encoder->refresh_active && !encoder->is_first_frame)
+	{
+		encoder->base->encoded_frame_is_sync_point = FALSE;
+		if (frame_type == IMX_VPU_API_FRAME_TYPE_UNKNOWN)
+			frame_type = IMX_VPU_API_FRAME_TYPE_P;
+	}
+	else if ((encoder->gop_frame_counter % base->open_params.gop_size) == 0)
 	{
 		if (encoder->interval_between_idr_frames > 0)
 		{
@@ -2176,6 +2742,105 @@ static ImxVpuApiEncReturnCodes h1_h264_encode_frame(void *h1_encoder, ImxVpuApiF
 			assert(FALSE);
 	}
 
+	{
+		BOOL const is_intra = (encoder->input.codingType == H264ENC_INTRA_FRAME)
+		                   || (encoder->input.codingType == H264ENC_NONIDR_INTRA_FRAME);
+		int sei_refresh = 0, sei_top = 0, sei_bottom = 0;
+
+		encoder->recovery_sei_size = 0;
+
+		/* The refresh sweep. An intra picture refreshes everything by
+		 * itself, so the sweep sits that one out without losing its place -
+		 * which is why the step is skipped rather than the state reset. */
+		if (encoder->refresh_active && !is_intra)
+		{
+			ImxVpuApiIntraRefreshBand band;
+
+			/* No forced region: imx_vpu_api_enc_set_intra_refresh_region()
+			 * is not implemented on this encoder, so the only source of
+			 * bands is the sweep itself. */
+			imx_vpu_api_intra_refresh_step(&(encoder->refresh_state), &(encoder->refresh_cfg),
+			                               0, 0, &band);
+
+			if (band.recovery_count > 0)
+				encoder->recovery_sei_size = imx_vpu_api_build_recovery_point_sei(
+					encoder->recovery_sei, band.recovery_count, 1);
+
+			if (band.apply)
+			{
+				encoder->cached_coding_ctrl.intraArea.enable = 1;
+				encoder->cached_coding_ctrl.intraArea.top    = (u32)(band.top);
+				encoder->cached_coding_ctrl.intraArea.bottom = (u32)(band.bottom);
+				encoder->cached_coding_ctrl.intraArea.left   = (u32)(band.left);
+				encoder->cached_coding_ctrl.intraArea.right  = (u32)(band.right);
+
+				enc_ret = H264EncSetCodingCtrl(encoder->handle, &(encoder->cached_coding_ctrl));
+				if (enc_ret != H264ENC_OK)
+				{
+					IMX_VPU_API_ERROR("could not set intra refresh region, macroblock rows "
+					                  "%d..%d cols %d..%d: %s",
+					                  band.top, band.bottom, band.left, band.right,
+					                  h1_h264_encoder_ret_to_string(enc_ret));
+					return IMX_VPU_API_ENC_RETURN_CODE_ERROR;
+				}
+
+				/* The refresh SEI describes a full width band, so a region
+				 * narrowed to a column range - the deprecated tiles mapping,
+				 * and nothing else - deliberately does not get one. */
+				if ((band.left == 0) && (band.right == (encoder->refresh_cfg.ctb_cols - 1)))
+				{
+					sei_refresh = 1;
+					sei_top = band.top;
+					sei_bottom = band.bottom;
+				}
+			}
+			else if (encoder->cached_coding_ctrl.intraArea.enable)
+			{
+				encoder->cached_coding_ctrl.intraArea.enable = 0;
+				H264EncSetCodingCtrl(encoder->handle, &(encoder->cached_coding_ctrl));
+			}
+		}
+		else if (encoder->refresh_active && encoder->cached_coding_ctrl.intraArea.enable)
+		{
+			/* An intra picture must not also carry a forced area left over
+			 * from the previous one. */
+			encoder->cached_coding_ctrl.intraArea.enable = 0;
+			H264EncSetCodingCtrl(encoder->handle, &(encoder->cached_coding_ctrl));
+		}
+
+		/* The band SEI, which the vendor API wraps in a user-data-unregistered
+		 * message for us. It keeps the pointer rather than copying, so the
+		 * payload lives in the encoder and not on this stack frame. */
+		if (encoder->refresh_active)
+		{
+			if (sei_refresh)
+			{
+				size_t const sei_size = imx_vpu_api_build_refresh_band_sei(
+					encoder->band_sei, sei_top, sei_bottom - sei_top + 1,
+					(int)(encoder->num_encoded_pictures));
+				H264EncSetSeiUserData(encoder->handle, encoder->band_sei, (u32)sei_size);
+			}
+			else
+				H264EncSetSeiUserData(encoder->handle, NULL, 0);
+		}
+
+		/* New CBR: pick this picture's QP before handing it to the encoder. */
+		if (encoder->new_cbr_active)
+		{
+			int const qp = ext_rate_control_pre(&(encoder->new_cbr), is_intra);
+
+			encoder->cached_rate_ctrl.qpHdr = qp;
+			enc_ret = H264EncSetRateCtrl(encoder->handle, &(encoder->cached_rate_ctrl));
+			if (enc_ret != H264ENC_OK)
+			{
+				IMX_VPU_API_ERROR("could not set QP %d for picture %" PRIu32 ": %s",
+				                  qp, encoder->num_encoded_pictures,
+				                  h1_h264_encoder_ret_to_string(enc_ret));
+				return IMX_VPU_API_ENC_RETURN_CODE_ERROR;
+			}
+		}
+	}
+
 	enc_ret = H264EncStrmEncode(encoder->handle, &(encoder->input), &encoder_output, NULL, NULL, NULL);
 
 	if (enc_ret != H264ENC_FRAME_READY)
@@ -2203,9 +2868,102 @@ static ImxVpuApiEncReturnCodes h1_h264_encode_frame(void *h1_encoder, ImxVpuApiF
 			assert(FALSE);
 	}
 
-	base->num_bytes_in_stream_buffer = encoder_output.streamSize;
-	*encoded_frame_size = (base->must_prepend_header_data ? base->header_data_size : 0) + base->num_bytes_in_stream_buffer;
+	/* New CBR: an intra picture past the buffer ceiling is re-encoded
+	 * coarser. Only intra, because the only way to redo a picture on this
+	 * hardware is to restart the encoder, and that loses the reference
+	 * frames a predicted picture would need - see
+	 * h1_h264_restart(). The bootstrap picture is the one this
+	 * matters for: it is the largest in the stream and nothing else bounds
+	 * it. Only the attempt that is kept is reported to the rate control
+	 * below, so its model never learns from a discarded one. */
+	if (encoder->new_cbr_active)
+	{
+		BOOL const coded_intra = (encoder_output.codingType == H264ENC_INTRA_FRAME)
+		                      || (encoder_output.codingType == H264ENC_NONIDR_INTRA_FRAME);
 
+		if (coded_intra)
+		{
+			int kept_qp = encoder->cached_rate_ctrl.qpHdr;
+			size_t bits = (size_t)(encoder_output.streamSize) * 8;
+			int qp;
+
+			while ((qp = ext_rate_control_check(&(encoder->new_cbr), bits, 1)) > 0)
+			{
+				H264EncOut retry_output;
+
+				size_t header_size = 0;
+
+				if (h1_h264_restart(encoder, qp, (unsigned int)(encoder->base->param_set_id),
+				                    &header_size) != IMX_VPU_API_ENC_RETURN_CODE_OK)
+					return IMX_VPU_API_ENC_RETURN_CODE_ERROR;
+
+				/* Before the encode below overwrites the stream buffer, and
+				 * unconditionally: this picture is coded against the QP in
+				 * the parameter sets the restart just wrote. */
+				h1_h264_recapture_header(encoder, header_size);
+
+				memset(&retry_output, 0, sizeof(retry_output));
+				if (H264EncStrmEncode(encoder->handle, &(encoder->input), &retry_output,
+				                      NULL, NULL, NULL) != H264ENC_FRAME_READY)
+				{
+					IMX_VPU_API_WARNING("re-encode at QP %d did not produce a picture; "
+					                    "keeping the previous attempt", qp);
+					break;
+				}
+
+				IMX_VPU_API_DEBUG("new CBR: intra picture %" PRIu32 " re-encoded at QP %d, "
+				                  "%u -> %u bits", encoder->num_encoded_pictures, qp,
+				                  (unsigned int)bits,
+				                  (unsigned int)(retry_output.streamSize * 8));
+
+				encoder_output = retry_output;
+				bits = (size_t)(retry_output.streamSize) * 8;
+				kept_qp = qp;
+			}
+
+			/* An attempt that was proposed but never produced output must not
+			 * be what the model learns from - the QP the kept bits were coded
+			 * at is the only one that describes them. */
+			encoder->new_cbr.current_qp = kept_qp;
+		}
+	}
+
+	base->num_bytes_in_stream_buffer = encoder_output.streamSize;
+	*encoded_frame_size = (base->must_prepend_header_data ? base->header_data_size : 0)
+	                    + encoder->recovery_sei_size
+	                    + base->num_bytes_in_stream_buffer;
+
+	/* New CBR: report what the picture actually cost.
+	 *
+	 * The ceiling is enforced for intra pictures only, above. A predicted
+	 * picture that breaches it goes out as it is and the bucket repays it
+	 * over the following ones, which is what the bucket is for:
+	 * ext_rate_control_check() is deliberately not called for those, because
+	 * it would move current_qp to a QP nothing was coded at and the model
+	 * would learn from it.
+	 *
+	 * cu_stats is NULL because this encoder reports no per-block coding
+	 * statistics - H264EncOut carries motion vectors and an MSE, but no
+	 * intra or skip counts. The rate control then budgets against the whole
+	 * picture instead of against the blocks it actually had to code, which
+	 * is the documented fallback. */
+	if (encoder->new_cbr_active)
+	{
+		size_t const bits = (size_t)(encoder_output.streamSize) * 8;
+		int const coded_intra = (encoder_output.codingType == H264ENC_INTRA_FRAME)
+		                     || (encoder_output.codingType == H264ENC_NONIDR_INTRA_FRAME);
+
+		ext_rate_control_post(&(encoder->new_cbr), bits, coded_intra, NULL);
+
+		IMX_VPU_API_LOG("new CBR: picture %" PRIu32 " qp %d target %d bits %u HRD buffer %.0f/%.0f kbit",
+		                encoder->num_encoded_pictures,
+		                encoder->new_cbr.current_qp,
+		                ext_rate_control_target(&(encoder->new_cbr)),
+		                (unsigned int)bits,
+		                encoder->new_cbr.bucket / 1000.0, encoder->new_cbr.bucket_cap / 1000.0);
+	}
+
+	encoder->num_encoded_pictures++;
 	encoder->is_first_frame = FALSE;
 	encoder->gop_frame_counter++;
 
@@ -2224,8 +2982,25 @@ static void h1_h264_get_encoded_data(void *h1_encoder, ImxVpuApiEncodedFrame *en
 	if (base->must_prepend_header_data)
 	{
 		memcpy(encoded_data, base->header_data, base->header_data_size);
+		/* How many leading bytes of this frame are the SPS/PPS. Callers that
+		 * re-insert the parameter sets periodically - config-interval in the
+		 * GStreamer element - cache them from here, and has_header alone does
+		 * not say where they end. Left at 0 on every later frame, which is
+		 * right: the vendor puts SPS/PPS inside each IDR itself (idrHeader),
+		 * and their extent there is not ours to report. */
+		encoded_frame->header_size = base->header_data_size;
 		encoded_data += base->header_data_size;
 		base->must_prepend_header_data = FALSE;
+	}
+
+	/* The recovery point SEI belongs immediately ahead of the picture that
+	 * begins a sweep, and after the parameter sets if this picture carries
+	 * them. It is a whole NAL of its own, built by the library because
+	 * neither vendor API emits one for a caller driven sweep. */
+	if (encoder->recovery_sei_size > 0)
+	{
+		memcpy(encoded_data, encoder->recovery_sei, encoder->recovery_sei_size);
+		encoded_data += encoder->recovery_sei_size;
 	}
 
 	/* Begin synced access since we have to copy the encoded
@@ -2236,11 +3011,27 @@ static void h1_h264_get_encoded_data(void *h1_encoder, ImxVpuApiEncodedFrame *en
 }
 
 
+/* Renumber this instance's parameter sets, and hand back the size of the
+ * header the restart produced so the caller can re-capture it. The QP stays
+ * whatever the rate control last chose. */
+static ImxVpuApiEncReturnCodes h1_h264_set_param_set_id(void *h1_encoder, unsigned int id, size_t *header_size)
+{
+	H1H264Encoder *encoder = (H1H264Encoder *)h1_encoder;
+
+	return h1_h264_restart(encoder, encoder->cached_rate_ctrl.qpHdr, id, header_size);
+}
+
+
 static void h1_h264_flush(void *h1_encoder)
 {
 	H1H264Encoder *encoder = (H1H264Encoder *)h1_encoder;
 	encoder->is_first_frame = TRUE;
 	encoder->gop_frame_counter = 0;
+	/* The next picture is an IDR, so the sweep starts over with it rather
+	 * than resuming half way down a picture that no longer exists. */
+	if (encoder->refresh_active)
+		imx_vpu_api_intra_refresh_init(&(encoder->refresh_state), &(encoder->refresh_cfg));
+	encoder->recovery_sei_size = 0;
 }
 
 static char const * h1_h264_encoder_ret_to_string(H264EncRet enc_ret)

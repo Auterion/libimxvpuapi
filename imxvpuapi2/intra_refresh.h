@@ -18,6 +18,9 @@
 #ifndef IMXVPUAPI2_INTRA_REFRESH_H
 #define IMXVPUAPI2_INTRA_REFRESH_H
 
+#include <stddef.h>
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -60,7 +63,13 @@ typedef struct
 	/* Target band height in rows of unit_pixels. It is a target, not an
 	 * exact height:
 	 * the sweep is split into ceil(ctb_rows / rows) bands of as equal a
-	 * height as they divide into, so that coverage stays exact. 0 = 2 rows.
+	 * height as they divide into, so that coverage stays exact.
+	 *
+	 * 0 selects a band of 128 picture lines, which is a row count that
+	 * depends on unit_pixels: 2 rows on h.265, 8 on h.264. The default is a
+	 * pixel height rather than a row count so that it covers the same slice
+	 * of the picture on either codec; the field itself is always a row
+	 * count.
 	 *
 	 * A one row band measures worse than every coarser height tried, on
 	 * both test clips and with either rate control - least intra prediction
@@ -190,7 +199,10 @@ ImxVpuApiIntraRefreshRequest;
 /* What a request resolved to, for the caller to program and to report. */
 typedef struct
 {
-	int active;         /* 0 = no intra refresh; nothing else is meaningful */
+	/* 0 = no intra refresh. The step geometry below then means nothing, but
+	 * slice_size and slice_count still do: slicing is independent of the
+	 * sweep and is asked for on its own. */
+	int active;
 	int num_steps;
 	int row_steps;
 	int col_steps;
@@ -219,6 +231,35 @@ void imx_vpu_api_intra_refresh_plan(ImxVpuApiIntraRefreshRequest const *req,
  * and the answer is 4. */
 int imx_vpu_api_slice_height_for_count(int ctb_rows, int slice_count,
                                        int *achieved_count);
+
+
+/* --- SEI payloads that go with the sweep ---------------------------------
+ *
+ * Both encoder backends emit these, and both are wire formats a receiver
+ * parses, so they are built here rather than once per backend.
+ */
+
+/* Bytes imx_vpu_api_build_refresh_band_sei() writes, and the smallest buffer
+ * it may be handed. */
+#define IMX_VPU_API_REFRESH_BAND_SEI_SIZE 20
+
+/* Bytes imx_vpu_api_build_recovery_point_sei() may write, worst case. */
+#define IMX_VPU_API_RECOVERY_POINT_SEI_MAX 24
+
+/* A recovery_point SEI in its own prefix NAL unit, to be sent immediately
+ * ahead of the picture that begins a sweep. recovery_count is how many further
+ * pictures the decoder has to take before the picture is fully refreshed:
+ * recovery_frame_cnt for h.264, recovery_poc_cnt for h.265. Written as a
+ * complete NAL, start code included, because neither vendor API will emit one
+ * for a caller driven sweep. Returns the number of bytes written. */
+size_t imx_vpu_api_build_recovery_point_sei(uint8_t *out, int recovery_count, int is_h264);
+
+/* The 20 byte user-data-unregistered payload naming the rows this picture
+ * refreshed - uuid, version, top row, height in rows, picture number. Only the
+ * payload: both vendor APIs wrap it in the SEI NAL themselves. Returns the
+ * number of bytes written. */
+size_t imx_vpu_api_build_refresh_band_sei(uint8_t *out, int top, int height,
+                                          int picture_number);
 
 
 #ifdef __cplusplus

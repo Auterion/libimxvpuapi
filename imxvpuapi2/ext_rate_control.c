@@ -60,9 +60,16 @@ int ext_rate_control_init(ExtRateControl *rc, ExtRateControlParams const *params
 	memset(rc, 0, sizeof(*rc));
 
 	fps = (double)(params->frame_rate_numerator) / (double)(params->frame_rate_denominator);
+	/* 0 means one second of bitrate. A second is a lot of latency to allow
+	 * and more than the smoothing gains justify - 250 to 500 ms is the range
+	 * worth tuning in - but it is the one default that cannot surprise
+	 * anyone: the buffer holds exactly what the link carries in a second, so
+	 * a caller who has not thought about the buffer gets a bucket that
+	 * scales with the rate rather than a fixed bit count that means half a
+	 * second at one bitrate and two at another. */
 	buffer_bits = (params->buffer_bits > 0)
 	            ? params->buffer_bits
-	            : (unsigned int)((double)(params->bitrate_bps) * 0.100);
+	            : params->bitrate_bps;
 	rc->frame_rate = fps;
 	rc->bit_per_pic = (double)(params->bitrate_bps) / fps;
 	rc->bucket_cap = (double)buffer_bits;

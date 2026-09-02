@@ -2,6 +2,7 @@
  *
  * Author: Andrii Voznytsia <andrew@auterion.com>
  */
+#include <stdint.h>
 #include <string.h>
 
 #include "intra_refresh.h"
@@ -239,60 +240,69 @@ void imx_vpu_api_intra_refresh_plan(ImxVpuApiIntraRefreshRequest const *req,
 	if (num_rolling_tiles == 1)
 		num_rolling_tiles = 4;
 
-	plan->active = req->enable || (num_rolling_slices > 0) || (num_rolling_tiles > 0);
-	plan->slice_count = 1;
-	if (!plan->active)
-		return;
-
-	period = req->period;
-	if (period == 0)
-		period = req->gdr_refresh_period;
-	/* The rolling modes took their period from roll_size, and clamped it to
-	 * gop_size because the wave was front loaded into each GOP. */
-	if ((period == 0) && ((num_rolling_slices > 0) || (num_rolling_tiles > 0)))
-	{
-		period = req->roll_size;
-		if ((period == 0) || (period > req->gop_size))
-			period = req->gop_size;
-	}
-	if (period == 0)
-		period = req->gop_size;
-
-	rows = req->rows;
-	columns = 0;
 	slice_height = req->slice_height;
 	slice_count = req->slice_count;
 
-	if (num_rolling_slices > 0)
+	plan->active = req->enable || (num_rolling_slices > 0) || (num_rolling_tiles > 0);
+	plan->slice_count = 1;
+
+	if (plan->active)
 	{
-		/* One band per slice, and the band was the slice. */
-		if (rows == 0)
-			rows = (req->ctb_rows + num_rolling_slices - 1) / num_rolling_slices;
-		if ((slice_height == 0) && (slice_count == 0))
-			slice_count = num_rolling_slices;
+		period = req->period;
+		if (period == 0)
+			period = req->gdr_refresh_period;
+		/* The rolling modes took their period from roll_size, and clamped it to
+		 * gop_size because the wave was front loaded into each GOP. */
+		if ((period == 0) && ((num_rolling_slices > 0) || (num_rolling_tiles > 0)))
+		{
+			period = req->roll_size;
+			if ((period == 0) || (period > req->gop_size))
+				period = req->gop_size;
+		}
+		if (period == 0)
+			period = req->gop_size;
+
+		rows = req->rows;
+		columns = 0;
+
+		if (num_rolling_slices > 0)
+		{
+			/* One band per slice, and the band was the slice. */
+			if (rows == 0)
+				rows = (req->ctb_rows + num_rolling_slices - 1) / num_rolling_slices;
+			if ((slice_height == 0) && (slice_count == 0))
+				slice_count = num_rolling_slices;
+		}
+		else if (num_rolling_tiles > 0)
+		{
+			/* Two fixed columns, ceil(N/2) rows, one slice per tile row. */
+			int const tile_rows = (num_rolling_tiles + 1) / 2;
+
+			if (rows == 0)
+				rows = (req->ctb_rows + tile_rows - 1) / tile_rows;
+			if (columns == 0)
+				columns = req->ctb_cols / 2;
+			if ((slice_height == 0) && (slice_count == 0))
+				slice_count = tile_rows;
+		}
+
+		cfg->period = period;
+		cfg->duration = req->duration;
+		cfg->rows = rows;
+		cfg->columns = columns;
+
+		imx_vpu_api_intra_refresh_resolve(cfg, &(plan->num_steps), &(plan->row_steps),
+		                                  &(plan->col_steps));
+		plan->wanted_steps = ((cfg->ctb_rows + cfg->rows - 1) / cfg->rows) * plan->col_steps;
 	}
-	else if (num_rolling_tiles > 0)
-	{
-		/* Two fixed columns, ceil(N/2) rows, one slice per tile row. */
-		int const tile_rows = (num_rolling_tiles + 1) / 2;
 
-		if (rows == 0)
-			rows = (req->ctb_rows + tile_rows - 1) / tile_rows;
-		if (columns == 0)
-			columns = req->ctb_cols / 2;
-		if ((slice_height == 0) && (slice_count == 0))
-			slice_count = tile_rows;
-	}
-
-	cfg->period = period;
-	cfg->duration = req->duration;
-	cfg->rows = rows;
-	cfg->columns = columns;
-
-	imx_vpu_api_intra_refresh_resolve(cfg, &(plan->num_steps), &(plan->row_steps),
-	                                  &(plan->col_steps));
-	plan->wanted_steps = ((cfg->ctb_rows + cfg->rows - 1) / cfg->rows) * plan->col_steps;
-
+	/* Slicing is not part of the sweep and is resolved whether or not one is
+	 * running: it is programmed once at open time from the same picture
+	 * geometry, and a caller that asks for slices without intra refresh -
+	 * for loss confinement or finer RTP fragmentation, which is what they
+	 * are for - means it. The rolling modes are the only reason this sits
+	 * after the block above: they derive a slice count of their own, and
+	 * only when they are what is running. */
 	if (slice_height > 0)
 	{
 		plan->slice_size = slice_height;
@@ -326,4 +336,134 @@ int imx_vpu_api_slice_height_for_count(int ctb_rows, int slice_count,
 
 	/* sliceSize 0 is how the vendor API spells "one slice per picture". */
 	return (count <= 1) ? 0 : height;
+}
+
+
+/* --- SEI payloads that go with the sweep -------------------------------
+ *
+ * Both encoder backends emit the same two SEIs, and both are wire formats a
+ * receiver parses, so they are built once here rather than per backend.
+ */
+
+static void bitbuf_put(uint8_t *buf, unsigned *pos, uint32_t value, int num_bits)
+{
+	int i;
+
+	for (i = num_bits - 1; i >= 0; --i)
+	{
+		unsigned const bit = (value >> i) & 1u;
+
+		buf[*pos >> 3] |= (uint8_t)(bit << (7 - (*pos & 7)));
+		(*pos)++;
+	}
+}
+
+
+static void bitbuf_put_ue(uint8_t *buf, unsigned *pos, uint32_t value)
+{
+	uint32_t const shifted = value + 1;
+	int num_bits = 0;
+
+	while ((shifted >> num_bits) != 0)
+		num_bits++;
+
+	bitbuf_put(buf, pos, 0, num_bits - 1);
+	bitbuf_put(buf, pos, shifted, num_bits);
+}
+
+
+static void bitbuf_put_se(uint8_t *buf, unsigned *pos, int32_t value)
+{
+	bitbuf_put_ue(buf, pos, (value > 0) ? (uint32_t)(2 * value - 1) : (uint32_t)(-2 * value));
+}
+
+
+/* A recovery_point SEI in its own prefix NAL unit, to be sent immediately
+ * ahead of the picture that begins an intra refresh sweep. recovery_count is
+ * how many further pictures the decoder has to take before the picture is
+ * fully refreshed: recovery_frame_cnt for h.264, recovery_poc_cnt for h.265.
+ * Returns the number of bytes written.
+ *
+ * No emulation prevention is applied. The payload is two bytes, the first of
+ * which always has its top bit set (the leading one of the ue/se prefix), so
+ * the three byte sequences it would have to escape cannot occur. */
+size_t imx_vpu_api_build_recovery_point_sei(uint8_t *out, int recovery_count, int is_h264)
+{
+	uint8_t payload[8];
+	unsigned pos = 0;
+	size_t payload_size;
+	size_t n = 0;
+
+	memset(payload, 0, sizeof(payload));
+
+	if (is_h264)
+	{
+		bitbuf_put_ue(payload, &pos, (uint32_t)recovery_count);   /* recovery_frame_cnt */
+		bitbuf_put(payload, &pos, 1, 1);                          /* exact_match_flag */
+		bitbuf_put(payload, &pos, 0, 1);                          /* broken_link_flag */
+		bitbuf_put(payload, &pos, 0, 2);                          /* changing_slice_group_idc */
+	}
+	else
+	{
+		bitbuf_put_se(payload, &pos, recovery_count);             /* recovery_poc_cnt */
+		bitbuf_put(payload, &pos, 1, 1);                          /* exact_match_flag */
+		bitbuf_put(payload, &pos, 0, 1);                          /* broken_link_flag */
+	}
+
+	bitbuf_put(payload, &pos, 1, 1);                              /* payload alignment */
+	while ((pos & 7) != 0)
+		bitbuf_put(payload, &pos, 0, 1);
+	payload_size = pos / 8;
+
+	out[n++] = 0x00; out[n++] = 0x00; out[n++] = 0x00; out[n++] = 0x01;
+	if (is_h264)
+	{
+		out[n++] = 0x06;             /* nal_ref_idc 0, nal_unit_type 6 (SEI) */
+	}
+	else
+	{
+		out[n++] = 0x4E;             /* nal_unit_type 39 (PREFIX_SEI), layer 0 */
+		out[n++] = 0x01;             /* temporal_id_plus1 */
+	}
+	out[n++] = 6;                    /* payloadType: recovery point */
+	out[n++] = (uint8_t)payload_size;
+	memcpy(out + n, payload, payload_size);
+	n += payload_size;
+	out[n++] = 0x80;                 /* rbsp_trailing_bits */
+
+	return n;
+}
+
+/* The refresh band SEI: a user-data-unregistered payload naming the rows this
+ * picture refreshed, so a receiver can chain the bands and know when it has a
+ * complete picture without waiting for the next IDR. Twenty bytes - the uuid
+ * both ends agree on, a version, and the band.
+ *
+ * It is built here rather than at each call site because it is a wire format
+ * shared with the video-receiver, and the two encoder backends emitting
+ * slightly different versions of it is exactly the failure this file exists to
+ * prevent. Only the payload is built: both vendor APIs wrap it in the SEI NAL
+ * themselves.
+ *
+ * The band must span the full picture width. A receiver told that rows N..M
+ * are clean when only half their width is would treat stale blocks as
+ * recovered, so a narrowed region - the deprecated rolling tiles mapping, and
+ * nothing else - deliberately gets no SEI at all. That is the caller's check,
+ * not this one's.
+ *
+ * Returns the number of bytes written, which is always
+ * IMX_VPU_API_REFRESH_BAND_SEI_SIZE. */
+size_t imx_vpu_api_build_refresh_band_sei(uint8_t *out, int top, int height,
+                                          int picture_number)
+{
+	static const uint8_t uuid[16] =
+		{ 'V','R','-','S','L','I','-','R','E','C','O','V','R','Y','0','1' };
+
+	memcpy(out, uuid, 16);
+	out[16] = 1;                                  /* version */
+	out[17] = (uint8_t)top;
+	out[18] = (uint8_t)height;
+	out[19] = (uint8_t)(picture_number & 0xFF);
+
+	return IMX_VPU_API_REFRESH_BAND_SEI_SIZE;
 }

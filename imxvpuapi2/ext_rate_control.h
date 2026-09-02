@@ -8,6 +8,13 @@
  * The defaults were measured on a VC8000E and are called out as such where it
  * matters.
  *
+ * One naming note, because two words for one thing has caused confusion: the
+ * "leaky bucket" below is what everything user facing - the hrd-buffer-size
+ * property, the logs, the documentation - calls the HRD buffer. They are the
+ * same buffer. This file keeps the metaphor because the code models a bucket
+ * that fills and drains; anything a user reads says HRD buffer, and says it
+ * in kbits so it can be compared against a bitrate in kbps.
+ *
  * The built-in rate control it replaces aims a quadratic R-Q model at a bit
  * budget every picture. That has two costs on a buffer-constrained radio
  * link: the model misses by ~30% on a single shot, and forcing every picture

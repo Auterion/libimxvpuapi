@@ -56,6 +56,7 @@
 #include "vc8000e-shim.h"
 #include "ext_rate_control.h"
 #include "intra_refresh.h"
+#include "enc_session_state.h"
 
 
 
@@ -151,52 +152,6 @@ static VCEncPictureType convert_to_vc8000e_pixel_format(ImxVpuApiColorFormat col
 
 #define FORCED_INTRA_QUEUE_SIZE 32
 
-/* Bumped whenever the layout of EncSessionState below changes. A state written
- * by another version is refused rather than misread. */
-#define ENC_SESSION_STATE_VERSION 1
-
-/* How many distinct resolutions get an id of their own before ids start being
- * reused. h.265 allows 16 SPS ids and 64 PPS ids, h.264 32 and 256, so eight
- * fits both with room to spare; a session that visits more than eight
- * resolutions gets the id of the one it saw eight switches ago, by which point
- * no decoder is still holding that one's parameter sets. */
-#define ENC_MAX_PARAM_SET_IDS 8
-
-/* What one encoder instance hands to its successor when a stream continues
- * across a resolution change. Carried by the caller as the opaque payload of
- * ImxVpuApiEncSessionState - see the documentation there for why these two
- * things in particular cannot be restarted from scratch. */
-typedef struct
-{
-	/* Which parameter set id each resolution seen so far owns, oldest entry
-	 * first, and the id the next unseen resolution gets. The first resolution
-	 * of a session takes id 0, so a stream that never changes resolution
-	 * carries the ids the encoder itself wrote and needs no rewriting at
-	 * all. */
-	uint16_t ps_width[ENC_MAX_PARAM_SET_IDS];
-	uint16_t ps_height[ENC_MAX_PARAM_SET_IDS];
-	uint8_t ps_id[ENC_MAX_PARAM_SET_IDS];
-	uint8_t ps_num;
-	uint8_t ps_next_id;
-
-	/* The new CBR controller's state. Set only once a picture has been
-	 * encoded; before that there is nothing to carry. */
-	uint8_t rc_valid;
-	/* Frame size the quantities below were learned at, in 8x8 blocks. The
-	 * ones that scale with it are rescaled on restore. */
-	uint32_t rc_total_blocks;
-	double rc_bucket;
-	double rc_cplx_per_block, rc_cplx_prev, rc_cplx_ema;
-	double rc_complexity_x;
-	int32_t rc_have_complexity_x;
-	int32_t rc_prev_qp, rc_current_qp;
-	uint32_t rc_num_pictures, rc_num_reencodes, rc_num_bucket_empty;
-	double rc_sum_bits, rc_sum_fill, rc_max_fill;
-}
-EncSessionState;
-
-/* The state has to fit in the caller's buffer, and that buffer is public ABI. */
-typedef char enc_session_state_fits[(sizeof(EncSessionState) <= IMX_VPU_API_ENC_SESSION_STATE_SIZE) ? 1 : -1];
 struct _ImxVpuApiEncoder
 {
 	/* Hantro VC8000E encoder that is in use. */
@@ -329,7 +284,7 @@ struct _ImxVpuApiEncoder
 	 * The encoder's own GDR used to produce this; driving the sweep from
 	 * here means producing it here too, or a decoder joining mid-stream has
 	 * nothing standard telling it when the picture will be complete. */
-	uint8_t recovery_sei[24];
+	uint8_t recovery_sei[IMX_VPU_API_RECOVERY_POINT_SEI_MAX];
 	size_t recovery_sei_size;
 
 	BOOL skipped_frame_available;
@@ -351,7 +306,7 @@ struct _ImxVpuApiEncoder
 	 * ImxVpuApiEncSessionState. Only filled in at rate_control_mode 1, where
 	 * a resolution change must not restart either the rate control or the
 	 * parameter set numbering. */
-	EncSessionState session;
+	ImxVpuApiEncSession session;
 	/* Parameter set id this instance stamps into its SPS and PPS. 0 means the
 	 * ids the encoder itself wrote are left alone, which is the case for the
 	 * first resolution of a session and therefore for every stream that never
@@ -480,7 +435,7 @@ void imx_vpu_api_enc_set_default_open_params(ImxVpuApiCompressionFormat compress
 	open_params->frame_rate_numerator = 25;
 	open_params->frame_rate_denominator = 1;
 	open_params->flags &= ~IMX_VPU_API_ENC_H26x_OPEN_PARAMS_FLAG_USE_HRD;
-	open_params->hrd_buffer_size = 1000;
+	open_params->hrd_buffer_size = 0;
 	open_params->intra_qp_delta = 0;
 
 	switch (compression_format)
@@ -884,94 +839,6 @@ fail:
 	return 0;
 }
 
-static void bitbuf_put(uint8_t *buf, unsigned *pos, uint32_t value, int num_bits)
-{
-	int i;
-
-	for (i = num_bits - 1; i >= 0; --i)
-	{
-		unsigned const bit = (value >> i) & 1u;
-
-		buf[*pos >> 3] |= (uint8_t)(bit << (7 - (*pos & 7)));
-		(*pos)++;
-	}
-}
-
-
-static void bitbuf_put_ue(uint8_t *buf, unsigned *pos, uint32_t value)
-{
-	uint32_t const shifted = value + 1;
-	int num_bits = 0;
-
-	while ((shifted >> num_bits) != 0)
-		num_bits++;
-
-	bitbuf_put(buf, pos, 0, num_bits - 1);
-	bitbuf_put(buf, pos, shifted, num_bits);
-}
-
-
-static void bitbuf_put_se(uint8_t *buf, unsigned *pos, int32_t value)
-{
-	bitbuf_put_ue(buf, pos, (value > 0) ? (uint32_t)(2 * value - 1) : (uint32_t)(-2 * value));
-}
-
-
-/* A recovery_point SEI in its own prefix NAL unit, to be sent immediately
- * ahead of the picture that begins an intra refresh sweep. recovery_count is
- * how many further pictures the decoder has to take before the picture is
- * fully refreshed: recovery_frame_cnt for h.264, recovery_poc_cnt for h.265.
- * Returns the number of bytes written.
- *
- * No emulation prevention is applied. The payload is two bytes, the first of
- * which always has its top bit set (the leading one of the ue/se prefix), so
- * the three byte sequences it would have to escape cannot occur. */
-static size_t build_recovery_point_sei(uint8_t *out, int recovery_count, BOOL is_h264)
-{
-	uint8_t payload[8];
-	unsigned pos = 0;
-	size_t payload_size;
-	size_t n = 0;
-
-	memset(payload, 0, sizeof(payload));
-
-	if (is_h264)
-	{
-		bitbuf_put_ue(payload, &pos, (uint32_t)recovery_count);   /* recovery_frame_cnt */
-		bitbuf_put(payload, &pos, 1, 1);                          /* exact_match_flag */
-		bitbuf_put(payload, &pos, 0, 1);                          /* broken_link_flag */
-		bitbuf_put(payload, &pos, 0, 2);                          /* changing_slice_group_idc */
-	}
-	else
-	{
-		bitbuf_put_se(payload, &pos, recovery_count);             /* recovery_poc_cnt */
-		bitbuf_put(payload, &pos, 1, 1);                          /* exact_match_flag */
-		bitbuf_put(payload, &pos, 0, 1);                          /* broken_link_flag */
-	}
-
-	bitbuf_put(payload, &pos, 1, 1);                              /* payload alignment */
-	while ((pos & 7) != 0)
-		bitbuf_put(payload, &pos, 0, 1);
-	payload_size = pos / 8;
-
-	out[n++] = 0x00; out[n++] = 0x00; out[n++] = 0x00; out[n++] = 0x01;
-	if (is_h264)
-	{
-		out[n++] = 0x06;             /* nal_ref_idc 0, nal_unit_type 6 (SEI) */
-	}
-	else
-	{
-		out[n++] = 0x4E;             /* nal_unit_type 39 (PREFIX_SEI), layer 0 */
-		out[n++] = 0x01;             /* temporal_id_plus1 */
-	}
-	out[n++] = 6;                    /* payloadType: recovery point */
-	out[n++] = (uint8_t)payload_size;
-	memcpy(out + n, payload, payload_size);
-	n += payload_size;
-	out[n++] = 0x80;                 /* rbsp_trailing_bits */
-
-	return n;
-}
 
 
 /* Work out what shape the refresh sweep has, from the unified open_params
@@ -1010,7 +877,7 @@ static void resolve_refresh_config(ImxVpuApiEncoder *encoder)
 	req.enable = !!(open_params->flags & IMX_VPU_API_ENC_OPEN_PARAMS_FLAG_USE_INTRA_REFRESH);
 	req.period = open_params->intra_refresh_period;
 	req.duration = open_params->intra_refresh_duration;
-	req.rows = open_params->intra_refresh_rows;
+	req.rows = open_params->intra_refresh_height;
 	req.slice_height = open_params->slice_height;
 	req.slice_count = open_params->slice_count;
 	req.gdr_refresh_period = open_params->gdr_refresh_period;
@@ -1072,10 +939,10 @@ static void resolve_refresh_config(ImxVpuApiEncoder *encoder)
 			                    "whole %d picture period",
 			                    open_params->intra_refresh_duration,
 			                    encoder->refresh_cfg.period);
-		if (open_params->intra_refresh_rows > 0)
-			IMX_VPU_API_WARNING("intra-refresh-rows %u is ignored with the encoder's own "
+		if (open_params->intra_refresh_height > 0)
+			IMX_VPU_API_WARNING("intra-refresh-height %u is ignored with the encoder's own "
 			                    "GDR (rate-control=0): it derives the band height from "
-			                    "the period", open_params->intra_refresh_rows);
+			                    "the period", open_params->intra_refresh_height);
 
 		IMX_VPU_API_DEBUG("intra refresh: the encoder's own GDR, period %d, "
 		                  "%d slice(s) of %d row(s)",
@@ -1276,21 +1143,7 @@ static ImxVpuApiEncReturnCodes init_vcenc_instance(ImxVpuApiEncoder *encoder,
 		{
 			ExtRateControlParams rc_params;
 
-			memset(&rc_params, 0, sizeof(rc_params));
-			rc_params.bitrate_bps = open_params->bitrate * 1000;
-			rc_params.frame_rate_numerator = open_params->frame_rate_numerator;
-			rc_params.frame_rate_denominator = open_params->frame_rate_denominator;
-			rc_params.frame_width = open_params->frame_width;
-			rc_params.frame_height = open_params->frame_height;
-			/* Same buffer the HRD describes, in kbits. Both rate controls
-			 * are sizing the coded data allowed in flight; this one just
-			 * enforces it itself instead of leaving it to the encoder, so
-			 * the USE_HRD flag is not needed with it. */
-			rc_params.buffer_bits = (unsigned int)(open_params->hrd_buffer_size) * 1000u;
-			rc_params.qp_min_inter = open_params->qp_min_inter;
-			rc_params.qp_max_inter = open_params->qp_max_inter;
-			rc_params.qp_min_intra = open_params->qp_min_intra;
-			rc_params.qp_max_intra = open_params->qp_max_intra;
+			imx_vpu_api_enc_session_rc_params(&rc_params, open_params);
 
 			if (ext_rate_control_init(&encoder->new_cbr, &rc_params) != 0)
 			{
@@ -1301,12 +1154,12 @@ static ImxVpuApiEncReturnCodes init_vcenc_instance(ImxVpuApiEncoder *encoder,
 			{
 				encoder->new_cbr_active = TRUE;
 				IMX_VPU_API_INFO(
-					"new CBR: %u kbps, %.2f fps, %.0f bit bucket (%.0f ms at this rate), cap %.0f bits/picture, QP %d..%d",
+					"new CBR: %u kbps, %.2f fps, %.0f kbit HRD buffer (%.0f ms at this rate), cap %.0f kbit/picture, QP %d..%d",
 					open_params->bitrate,
 					encoder->new_cbr.frame_rate,
-					encoder->new_cbr.bucket_cap,
+					encoder->new_cbr.bucket_cap / 1000.0,
 					encoder->new_cbr.bucket_cap * 1000.0 / (double)(open_params->bitrate * 1000),
-					encoder->new_cbr.bucket_cap * encoder->new_cbr.cap_share,
+					(encoder->new_cbr.bucket_cap * encoder->new_cbr.cap_share) / 1000.0,
 					encoder->new_cbr.qp_min_inter,
 					encoder->new_cbr.qp_max_inter
 				);
@@ -1368,7 +1221,10 @@ static ImxVpuApiEncReturnCodes init_vcenc_instance(ImxVpuApiEncoder *encoder,
 		 * assigned here; fields that are set to zero by default are
 		 * already zero due to the memset() call above. */
 		rate_control_config.hrd = !!(open_params->flags & IMX_VPU_API_ENC_H26x_OPEN_PARAMS_FLAG_USE_HRD);
-		rate_control_config.hrdCpbSize = open_params->hrd_buffer_size * 1000;
+		/* 0 means one second of bitrate, and the hardware model gets the
+		 * five frame budget floor it needs - see
+		 * imx_vpu_api_enc_hrd_buffer_bits(). */
+		rate_control_config.hrdCpbSize = imx_vpu_api_enc_hrd_buffer_bits(open_params, 5);
 		rate_control_config.bitrateWindow = open_params->gop_size;
 		rate_control_config.intraQpDelta = open_params->intra_qp_delta;
 		rate_control_config.tolMovingBitRate = 2000;
@@ -1409,28 +1265,6 @@ static ImxVpuApiEncReturnCodes init_vcenc_instance(ImxVpuApiEncoder *encoder,
 			 * refresh P-frame cannot balloon; surplus then sags the rate slightly, not spikes. */
 			rate_control_config.u32StaticSceneIbitPercent = open_params->static_scene_ibit_percent; /* config: static-scene-ibit-percent */
 			/* qpMinPB comes from open_params->qp_min_inter (config: qp-min); set above. */
-
-			/* A CPB that cannot admit coded pictures makes the HRD (correctly)
-			 * skip every frame -> the stream freezes by configuration. Device
-			 * sweep: the VC8000E starves below ~4 average-frame budgets
-			 * (2 Mbps/30fps: 250 kbit freezes, 300 streams; 1.2 Mbps: 150
-			 * freezes, 200 streams). Floor the CPB at five frame budgets
-			 * (5 * bitrate/fps) so aggressive hrd-buffer-size settings degrade
-			 * to occasional skips instead of a dead stream. */
-			if ((rate_control_config.hrdCpbSize > 0) && (open_params->frame_rate_numerator > 0))
-			{
-				uint32_t min_cpb = (uint32_t)(((uint64_t)(rate_control_config.bitPerSecond) * 5u * open_params->frame_rate_denominator) / open_params->frame_rate_numerator);
-				if (rate_control_config.hrdCpbSize < min_cpb)
-				{
-					IMX_VPU_API_WARNING(
-						"hrd-buffer-size %u bits is below five frame budgets (%u bits) at %u bps / %u/%u fps; clamping - the VC8000E HRD starves below ~4 frame budgets (frozen stream)",
-						(unsigned int)(rate_control_config.hrdCpbSize), (unsigned int)min_cpb,
-						(unsigned int)(rate_control_config.bitPerSecond),
-						(unsigned int)(open_params->frame_rate_numerator), (unsigned int)(open_params->frame_rate_denominator)
-					);
-					rate_control_config.hrdCpbSize = min_cpb;
-				}
-			}
 
 			/* NOTE: on CPB overflow VCEncStrmEncode returns VCENC_HRD_ERROR;
 			 * that is the HRD's graceful per-picture skip and is handled as a
@@ -1986,7 +1820,7 @@ void imx_vpu_api_enc_close(ImxVpuApiEncoder *encoder)
 		IMX_VPU_API_INFO(
 			"new CBR summary: %lu pictures, %.0f kbps of %.0f kbps configured, "
 			"%lu re-encodes, "
-			"bucket empty on %lu pictures, fill mean %.2f max %.2f",
+			"HRD buffer emptied on %lu pictures, fill mean %.2f max %.2f",
 			rc->num_pictures,
 			rc->sum_bits / pictures * rc->frame_rate / 1000.0,
 			rc->bit_per_pic * rc->frame_rate / 1000.0,
@@ -2132,7 +1966,7 @@ void imx_vpu_api_enc_set_intra_refresh_region(ImxVpuApiEncoder *encoder, unsigne
 
 ImxVpuApiEncReturnCodes imx_vpu_api_enc_get_session_state(ImxVpuApiEncoder *encoder, ImxVpuApiEncSessionState *state)
 {
-	EncSessionState *session;
+	ImxVpuApiEncSession *session;
 
 	assert(encoder != NULL);
 	assert(state != NULL);
@@ -2156,35 +1990,12 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_get_session_state(ImxVpuApiEncoder *enco
 		return IMX_VPU_API_ENC_RETURN_CODE_INVALID_CALL;
 	}
 
-	memset(state, 0, sizeof(*state));
-	state->version = ENC_SESSION_STATE_VERSION;
-	state->size = (uint32_t)sizeof(EncSessionState);
-
 	session = &(encoder->session);
 
 	if (encoder->new_cbr_active && (encoder->new_cbr.num_pictures > 0))
-	{
-		ExtRateControl const *rc = &(encoder->new_cbr);
+		imx_vpu_api_enc_session_save_rc(session, &(encoder->new_cbr));
 
-		session->rc_valid = 1;
-		session->rc_total_blocks = rc->total_blocks;
-		session->rc_bucket = rc->bucket;
-		session->rc_cplx_per_block = rc->cplx_per_block;
-		session->rc_cplx_prev = rc->cplx_prev;
-		session->rc_cplx_ema = rc->cplx_ema;
-		session->rc_complexity_x = rc->complexity_x;
-		session->rc_have_complexity_x = rc->have_complexity_x;
-		session->rc_prev_qp = rc->prev_qp;
-		session->rc_current_qp = rc->current_qp;
-		session->rc_num_pictures = (uint32_t)(rc->num_pictures);
-		session->rc_num_reencodes = (uint32_t)(rc->num_reencodes);
-		session->rc_num_bucket_empty = (uint32_t)(rc->num_bucket_empty);
-		session->rc_sum_bits = rc->sum_bits;
-		session->rc_sum_fill = rc->sum_fill;
-		session->rc_max_fill = rc->max_fill;
-	}
-
-	memcpy(state->data, session, sizeof(EncSessionState));
+	imx_vpu_api_enc_session_pack(session, state);
 
 	IMX_VPU_API_DEBUG("session state read out: %d resolution(s), rate control %s",
 	                  (int)(session->ps_num), session->rc_valid ? "carried" : "not started yet");
@@ -2195,7 +2006,7 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_get_session_state(ImxVpuApiEncoder *enco
 
 ImxVpuApiEncReturnCodes imx_vpu_api_enc_set_session_state(ImxVpuApiEncoder *encoder, ImxVpuApiEncSessionState const *state)
 {
-	EncSessionState const *session;
+	ImxVpuApiEncSession const *session;
 
 	assert(encoder != NULL);
 	assert(state != NULL);
@@ -2212,72 +2023,13 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_set_session_state(ImxVpuApiEncoder *enco
 		return IMX_VPU_API_ENC_RETURN_CODE_INVALID_CALL;
 	}
 
-	if ((state->version != ENC_SESSION_STATE_VERSION) || (state->size != (uint32_t)sizeof(EncSessionState)))
-	{
-		IMX_VPU_API_ERROR("session state is version %u size %u; this library writes version %u size %zu",
-		                  state->version, state->size,
-		                  (unsigned)ENC_SESSION_STATE_VERSION, sizeof(EncSessionState));
+	if (!imx_vpu_api_enc_session_unpack(&(encoder->session), state))
 		return IMX_VPU_API_ENC_RETURN_CODE_ERROR;
-	}
 
-	memcpy(&(encoder->session), state->data, sizeof(EncSessionState));
 	session = &(encoder->session);
 
 	if (encoder->new_cbr_active && session->rc_valid)
-	{
-		ExtRateControl *rc = &(encoder->new_cbr);
-		/* Everything the controller holds is either a property of the link,
-		 * which the frame size does not enter into, or a cost per coded
-		 * block, which it does. The second kind is rescaled by the change in
-		 * block count so that the first picture at the new resolution is
-		 * budgeted from a model in the new picture's units.
-		 *
-		 * cplx_prev and cplx_ema are only ever used as a ratio of each other,
-		 * so scaling both leaves the controller's reading of "is this stretch
-		 * harder than the recent average" untouched while putting both in the
-		 * new scale. complexity_x is log2(bits) at QP 0, and bits scale with
-		 * the block count, so the correction there is additive. */
-		double const ratio = ((session->rc_total_blocks > 0) && (rc->total_blocks > 0))
-		                   ? ((double)(rc->total_blocks) / (double)(session->rc_total_blocks))
-		                   : 1.0;
-
-		rc->bucket = session->rc_bucket;
-		if (rc->bucket > rc->bucket_cap)
-		{
-			IMX_VPU_API_WARNING("carried bucket level %.0f exceeds the new %.0f bit buffer; clamped",
-			                    rc->bucket, rc->bucket_cap);
-			rc->bucket = rc->bucket_cap;
-		}
-
-		rc->cplx_per_block = session->rc_cplx_per_block;
-		rc->cplx_prev = session->rc_cplx_prev * ratio;
-		rc->cplx_ema = session->rc_cplx_ema * ratio;
-		rc->complexity_x = session->rc_complexity_x + ((ratio > 0.0) ? log2(ratio) : 0.0);
-		rc->have_complexity_x = session->rc_have_complexity_x;
-		rc->prev_qp = session->rc_prev_qp;
-		rc->current_qp = session->rc_current_qp;
-		rc->num_pictures = session->rc_num_pictures;
-		/* The picture that opens the new resolution has no model behind it -
-		 * nothing coded at the old size says what one of the new size costs -
-		 * so it gets the same bootstrap allowance as the first picture of a
-		 * stream. Without this it is bounded only by what is left in the
-		 * buffer, and on a 720p to 1080p switch at a 100 ms buffer it takes
-		 * 0.91 of the buffer on its own instead of 0.16. */
-		rc->intra_bootstrap_pending = 1;
-		rc->num_reencodes = session->rc_num_reencodes;
-		rc->num_bucket_empty = session->rc_num_bucket_empty;
-		rc->sum_bits = session->rc_sum_bits;
-		rc->sum_fill = session->rc_sum_fill;
-		rc->max_fill = session->rc_max_fill;
-
-		IMX_VPU_API_INFO(
-			"new CBR resumed after %lu pictures: bucket %.0f of %.0f bits (%.2f fill), QP %d, "
-			"content model rescaled by %.3f, first picture held to %.0f bits",
-			rc->num_pictures, rc->bucket, rc->bucket_cap,
-			(rc->bucket_cap > 0.0) ? (rc->bucket / rc->bucket_cap) : 0.0,
-			rc->current_qp, ratio, rc->bucket_cap * rc->first_intra_share
-		);
-	}
+		imx_vpu_api_enc_session_restore_rc(session, &(encoder->new_cbr));
 	else if (session->rc_valid)
 		IMX_VPU_API_WARNING("session state carries rate control state, but this encoder has no new CBR to resume it in");
 
@@ -2324,47 +2076,17 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_push_raw_frame(ImxVpuApiEncoder *encoder
  * changes resolution is therefore not rewritten at all. */
 static void resolve_param_set_id(ImxVpuApiEncoder *encoder)
 {
-	EncSessionState *session = &(encoder->session);
-	uint16_t const width = (uint16_t)(encoder->open_params.frame_width);
-	uint16_t const height = (uint16_t)(encoder->open_params.frame_height);
-	int i;
-
-	encoder->param_set_id = 0;
-
 	/* Mode 0 is the unmodified encoder, down to the bytes. */
 	if (encoder->open_params.rate_control_mode != 1)
+	{
+		encoder->param_set_id = 0;
 		return;
-
-	for (i = 0; i < (int)(session->ps_num); ++i)
-	{
-		if ((session->ps_width[i] == width) && (session->ps_height[i] == height))
-		{
-			encoder->param_set_id = session->ps_id[i];
-			IMX_VPU_API_DEBUG("parameter set id %d: %ux%u again", encoder->param_set_id, width, height);
-			return;
-		}
 	}
 
-	if (session->ps_num < ENC_MAX_PARAM_SET_IDS)
-		i = session->ps_num++;
-	else
-	{
-		/* Oldest entry out, and its id comes back around. */
-		memmove(&(session->ps_width[0]), &(session->ps_width[1]), (ENC_MAX_PARAM_SET_IDS - 1) * sizeof(session->ps_width[0]));
-		memmove(&(session->ps_height[0]), &(session->ps_height[1]), (ENC_MAX_PARAM_SET_IDS - 1) * sizeof(session->ps_height[0]));
-		memmove(&(session->ps_id[0]), &(session->ps_id[1]), (ENC_MAX_PARAM_SET_IDS - 1) * sizeof(session->ps_id[0]));
-		i = ENC_MAX_PARAM_SET_IDS - 1;
-	}
-
-	session->ps_width[i] = width;
-	session->ps_height[i] = height;
-	session->ps_id[i] = session->ps_next_id;
-	session->ps_next_id = (uint8_t)((session->ps_next_id + 1) % ENC_MAX_PARAM_SET_IDS);
-	encoder->param_set_id = session->ps_id[i];
-
-	if (encoder->param_set_id != 0)
-		IMX_VPU_API_INFO("parameter set id %d for %ux%u; %d resolution(s) in this stream so far",
-		                 encoder->param_set_id, width, height, (int)(session->ps_num));
+	encoder->param_set_id = imx_vpu_api_enc_session_param_set_id(
+		&(encoder->session),
+		encoder->open_params.frame_width,
+		encoder->open_params.frame_height);
 }
 
 
@@ -2401,7 +2123,7 @@ static void activate_param_set_pps(ImxVpuApiEncoder *encoder)
 	 * emits a PPS only for a newly created one - taken back out again by
 	 * drop_inserted_pps_nal() - and for the resend flags, which this encoder
 	 * does not use. */
-	for (guard = 0; (created_id < encoder->param_set_id) && (guard < ENC_MAX_PARAM_SET_IDS); ++guard)
+	for (guard = 0; (created_id < encoder->param_set_id) && (guard < IMX_VPU_API_ENC_MAX_PARAM_SET_IDS); ++guard)
 	{
 		i32 const previous_id = created_id;
 
@@ -2792,7 +2514,7 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 
 		if (band.recovery_count > 0)
 		{
-			encoder->recovery_sei_size = build_recovery_point_sei(
+			encoder->recovery_sei_size = imx_vpu_api_build_recovery_point_sei(
 				encoder->recovery_sei, band.recovery_count,
 				encoder->open_params.compression_format == IMX_VPU_API_COMPRESSION_FORMAT_H264);
 		}
@@ -2848,15 +2570,11 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 	{
 		if (sei_refresh)
 		{
-			static const uint8_t kRecoveryUuid[16] =
-				{ 'V','R','-','S','L','I','-','R','E','C','O','V','R','Y','0','1' };
-			uint8_t sei[20];
-			memcpy(sei, kRecoveryUuid, 16);
-			sei[16] = 1;
-			sei[17] = (uint8_t)sei_top;
-			sei[18] = (uint8_t)(sei_bottom - sei_top + 1);
-			sei[19] = (uint8_t)(encoder->num_encoded_pictures & 0xFF);
-			VCEncSetSeiUserData(encoder->encoder, sei, sizeof(sei));
+			uint8_t sei[IMX_VPU_API_REFRESH_BAND_SEI_SIZE];
+			size_t const sei_size = imx_vpu_api_build_refresh_band_sei(
+				sei, sei_top, sei_bottom - sei_top + 1,
+				(int)(encoder->num_encoded_pictures));
+			VCEncSetSeiUserData(encoder->encoder, sei, (u32)sei_size);
 		}
 		else
 		{
@@ -3023,7 +2741,7 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 		);
 
 		IMX_VPU_API_LOG(
-			"new CBR: picture %" PRId32 " qp %d target %d bits %u (%+d%%) bucket %.0f/%.0f coded %u/%u",
+			"new CBR: picture %" PRId32 " qp %d target %d bits %u (%+d%%) HRD buffer %.0f/%.0f kbit coded %u/%u",
 			encoder->num_encoded_pictures,
 			encoder->new_cbr.current_qp,
 			ext_rate_control_target(&encoder->new_cbr),
@@ -3032,7 +2750,7 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 				? (int)(((double)(encoder_output.streamSize) * 8.0 - ext_rate_control_target(&encoder->new_cbr))
 				        * 100.0 / ext_rate_control_target(&encoder->new_cbr))
 				: 0,
-			encoder->new_cbr.bucket, encoder->new_cbr.bucket_cap,
+			encoder->new_cbr.bucket / 1000.0, encoder->new_cbr.bucket_cap / 1000.0,
 			total_blocks - cu_stats.skip_blocks, total_blocks
 		);
 	}
