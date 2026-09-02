@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "imxvpuapi2_priv.h"
 #include "ext_rate_control.h"
 
 
@@ -153,6 +154,11 @@ int ext_rate_control_init(ExtRateControl *rc, ExtRateControlParams const *params
 	 * Other encoders will want their own value here. */
 	rc->slope = env_double("EXT_RC_SLOPE", 3.71);
 	if (rc->slope < 1.0) rc->slope = 1.0;
+	rc->slope_corrections = 0;
+	rc->obs_n = 0;
+	rc->obs_head = 0;
+	rc->prev_attempt_qp = -1;
+	rc->prev_attempt_bits = 0;
 
 	rc->prev_qp = -1;
 	rc->intra_bootstrap_pending = 1;
@@ -233,6 +239,8 @@ int ext_rate_control_pre(ExtRateControl *rc, int is_intra)
 	}
 
 	rc->cap_attempts = 0;
+	rc->prev_attempt_qp = -1;
+	rc->prev_attempt_bits = 0;
 
 	return rc->current_qp;
 }
@@ -241,6 +249,94 @@ int ext_rate_control_pre(ExtRateControl *rc, int is_intra)
 int ext_rate_control_target(ExtRateControl const *rc)
 {
 	return (rc != NULL) ? rc->current_target : 0;
+}
+
+
+/* How much evidence a correction needs, and how far it may move on it - both
+ * scaled by how wrong the gradient looks. A gradient off by more than a factor
+ * of two is unmistakable and is taken at once and in full: it is the difference
+ * between hitting the target and a third of it. Half that could be the estimate
+ * wandering around a value that is already right, so it waits longer and only
+ * moves part of the way; below a quarter it is ignored. Measured, a clip whose
+ * gradient really is 3.7 threw estimates as low as 2.6, and chasing those cost
+ * 32 corrections and nothing else.
+ *
+ * Ratios rather than differences, because a gradient is multiplicative - being
+ * 1 apart means something different at 1.5 than at 7. The window is not
+ * cleared on a correction: doing that starves the cautious bands of the
+ * evidence they ask for, which turned into a correction every few pictures. */
+static unsigned int slope_band(double slope, double est, double *step)
+{
+	double const r = (est > slope) ? (est / slope) : (slope / est);
+
+	if (r >= 2.5) { *step = 1.00; return 3; }
+	if (r >= 1.6) { *step = 0.50; return 8; }
+	if (r >= 1.3) { *step = 0.25; return 16; }
+	*step = 0.0;
+	return 0;
+}
+
+
+static void slope_apply(ExtRateControl *rc, double est)
+{
+	unsigned int needed;
+	double step, moved;
+
+	if (est < 1.0) est = 1.0;
+	if (est > 8.0) est = 8.0;
+
+	needed = slope_band(rc->slope, est, &step);
+	if ((needed == 0) || (rc->obs_n < needed))
+		return;
+
+	moved = rc->slope + step * (est - rc->slope);
+	if (moved < 1.0) moved = 1.0;
+	if (moved > 8.0) moved = 8.0;
+
+	IMX_VPU_API_LOG("new CBR: QP per doubling %.2f -> %.2f (measured %.2f, %.0f%% of the way, %u observations)",
+	                rc->slope, moved, est, step * 100.0, rc->obs_n);
+	rc->slope = moved;
+	rc->slope_corrections++;
+}
+
+
+/* One attempt and the next at the same picture: same content, two quantisers,
+ * two sizes, so the gradient between them is measured rather than assumed. */
+static void slope_observe(ExtRateControl *rc, size_t bits)
+{
+	double dqp, ratio, obs, sorted[16];
+	unsigned int i, j;
+
+	if ((rc->prev_attempt_qp < 0) || (bits == 0) || (rc->prev_attempt_bits == 0))
+		return;
+
+	dqp = (double)(rc->current_qp) - (double)(rc->prev_attempt_qp);
+	ratio = (double)(rc->prev_attempt_bits) / (double)bits;
+
+	/* At least one quantiser step and a size that actually moved: below that
+	 * the logarithm turns rounding into an arbitrary gradient. */
+	if ((dqp < 1.0) || (ratio < 1.1))
+		return;
+
+	obs = dqp / log2(ratio);
+	if ((obs < 0.2) || (obs > 12.0))
+		return;
+
+	rc->obs[rc->obs_head % 16u] = obs;
+	rc->obs_head++;
+	if (rc->obs_n < 16u) rc->obs_n++;
+
+	if (rc->obs_n < 3u)
+		return;
+
+	for (i = 0; i < rc->obs_n; ++i) sorted[i] = rc->obs[i];
+	for (i = 1; i < rc->obs_n; ++i)
+	{
+		double const v = sorted[i];
+		for (j = i; (j > 0) && (sorted[j - 1] > v); --j) sorted[j] = sorted[j - 1];
+		sorted[j] = v;
+	}
+	slope_apply(rc, sorted[rc->obs_n / 2u]);
 }
 
 
@@ -256,11 +352,21 @@ int ext_rate_control_check(ExtRateControl *rc, size_t bits, int is_intra)
 	 * after attempt, which costs encode time and looks worse than the
 	 * overshoot. */
 	if (rc->cap_attempts >= 4)
+	{
+		IMX_VPU_API_LOG("new CBR:   attempt %d qp %d bits %zu - attempt limit, accepted",
+		                rc->cap_attempts, rc->current_qp, bits);
 		return 0;
+	}
+
+	slope_observe(rc, bits);
 
 	qp_max = is_intra ? rc->qp_max_intra : rc->qp_max_inter;
 	if (rc->current_qp >= qp_max)
+	{
+		IMX_VPU_API_LOG("new CBR:   attempt %d qp %d bits %zu - at qp_max, accepted",
+		                rc->cap_attempts, rc->current_qp, bits);
 		return 0;
+	}
 
 	/* What the buffer can still take. The link drains one frame budget
 	 * over this picture's period, so the space available when the picture
@@ -302,7 +408,11 @@ int ext_rate_control_check(ExtRateControl *rc, size_t bits, int is_intra)
 	}
 
 	if ((double)bits <= ceiling)
+	{
+		IMX_VPU_API_LOG("new CBR:   attempt %d qp %d bits %zu ceiling %.0f - accepted",
+		                rc->cap_attempts, rc->current_qp, bits, ceiling);
 		return 0;
+	}
 
 	/* With no room left at all there is nothing to aim at, so go straight
 	 * to the coarsest quantiser allowed and let the guard end it. */
@@ -314,6 +424,12 @@ int ext_rate_control_check(ExtRateControl *rc, size_t bits, int is_intra)
 		if (qp <= rc->current_qp) qp = rc->current_qp + 1;
 		if (qp > qp_max) qp = qp_max;
 	}
+
+	IMX_VPU_API_LOG("new CBR:   attempt %d qp %d bits %zu ceiling %.0f - over by %.2fx, re-encoding at qp %d",
+	                rc->cap_attempts, rc->current_qp, bits, ceiling, (double)bits / ceiling, qp);
+
+	rc->prev_attempt_qp = rc->current_qp;
+	rc->prev_attempt_bits = bits;
 
 	rc->current_qp = qp;
 	rc->cap_attempts++;

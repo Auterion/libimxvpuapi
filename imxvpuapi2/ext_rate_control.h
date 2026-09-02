@@ -126,7 +126,28 @@ typedef struct
 	double first_intra_share;
 	double cplx_min, cplx_max;
 	double alpha;
+	/* QP per doubling of picture size: how far the quantiser has to move to
+	 * halve the bits. Not a constant of the codec - it is the local gradient,
+	 * and it depends on how much of the picture is being coded at all.
+	 * Measured 3.7 on a clip alternating stills with motion and 1.7 on
+	 * uniformly detailed footage, so this starts at a default and is then
+	 * corrected from what the encoder actually does; see slope_band(). */
 	double slope;
+	unsigned int slope_corrections;
+	/* Observations of the gradient, each from one re-encode: two quantisers
+	 * and two sizes for the same picture, so only QP differs. Per-picture
+	 * samples cannot substitute - normalising them by coded blocks removes
+	 * part of the QP dependence being measured, because a coarser quantiser
+	 * skips more blocks, and the fit then runs to the clamp.
+	 *
+	 * Kept as a window and reduced by median rather than averaged: single
+	 * observations ranged 0.98 to 6.01 on a clip whose gradient is 1.7, and
+	 * an EMA of that made the correction hunt between 1.2 and 2.4. */
+	double obs[16];
+	unsigned int obs_n, obs_head;
+	/* The previous attempt at this picture - the other half of a pair. */
+	int prev_attempt_qp;
+	size_t prev_attempt_bits;
 
 	/* --- state --- */
 	/* Bits handed to the link that it has not drained yet. */
