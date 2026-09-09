@@ -1820,14 +1820,21 @@ void imx_vpu_api_enc_close(ImxVpuApiEncoder *encoder)
 		IMX_VPU_API_INFO(
 			"new CBR summary: %lu pictures, %.0f kbps of %.0f kbps configured, "
 			"%lu re-encodes, "
-			"HRD buffer emptied on %lu pictures, fill mean %.2f max %.2f",
+			"HRD buffer emptied on %lu pictures, fill mean %.2f max %.2f, "
+			"idle capacity repaid on %lu pictures (%.0f kbit, %.1f%% of the stream), "
+			"standing rate error %.1f%%, mean repayment ceiling %.2f",
 			rc->num_pictures,
 			rc->sum_bits / pictures * rc->frame_rate / 1000.0,
 			rc->bit_per_pic * rc->frame_rate / 1000.0,
 			rc->num_reencodes,
 			rc->num_bucket_empty,
 			rc->sum_fill / pictures,
-			rc->max_fill
+			rc->max_fill,
+			rc->num_debt_lifts,
+			rc->sum_lift / 1000.0,
+			(rc->sum_bits > 0.0) ? (rc->sum_lift * 100.0 / rc->sum_bits) : 0.0,
+			rc->rate_err_ema * 100.0,
+			(rc->num_debt_lifts > 0) ? (rc->sum_fill_used / (double)(rc->num_debt_lifts)) : 0.0
 		);
 	}
 

@@ -59,6 +59,7 @@ typedef struct
 	 * that scale with it are rescaled on restore. */
 	uint32_t rc_total_blocks;
 	double rc_bucket;
+	double rc_debt;
 	double rc_cplx_per_block, rc_cplx_prev, rc_cplx_ema;
 	double rc_complexity_x;
 	int32_t rc_have_complexity_x;

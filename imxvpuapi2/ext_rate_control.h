@@ -149,9 +149,34 @@ typedef struct
 	int prev_attempt_qp;
 	size_t prev_attempt_bits;
 
+	/* Repayment of link capacity the encoder left unused. See
+	 * ext_rate_control_init() for why the bucket alone cannot do this.
+	 * debt_cap bounds how much idle capacity may be remembered; debt_gain is
+	 * the share of the outstanding debt offered back per picture; debt_fill
+	 * is how far towards one frame budget a repaid target may be raised. */
+	double debt_cap, debt_gain, debt_fill, debt_fill_max, debt_err_alpha;
+	/* The three shortfall bands: entry threshold, consecutive pictures of
+	 * evidence required, and the ceiling each grants. Tunable because the
+	 * right reaction speed depends on how fast the content changes. */
+	double debt_t[3], debt_f[3];
+	unsigned int debt_n[3];
+
 	/* --- state --- */
 	/* Bits handed to the link that it has not drained yet. */
 	double bucket;
+	/* Integral of the rate shortfall: bits the link was ready to carry that
+	 * the encoder did not produce. One sided - it remembers falling behind,
+	 * not running ahead - and bounded by debt_cap. */
+	double debt;
+	/* Slow EMA of the relative rate shortfall, (budget - coded) / budget.
+	 * Near zero means the rate is being delivered. This is what decides how
+	 * far the repayment ceiling stretches; it is deliberately slower than the
+	 * debt so a single hard passage does not stretch it. */
+	double rate_err_ema;
+	/* The repayment ceiling currently in force, and how many consecutive
+	 * pictures of evidence have accumulated for the next step up. */
+	double debt_fill_now;
+	unsigned int debt_err_run;
 	/* Cost of one coded block at Qstep 1, smoothed, and the previous
 	 * picture's cost derived from it. */
 	double cplx_per_block, cplx_prev, cplx_ema;
@@ -178,6 +203,12 @@ typedef struct
 	/* Pictures where the bucket hit its floor, i.e. where the link had
 	 * drained everything and the accounting identity above stops holding. */
 	unsigned long num_bucket_empty;
+	/* Pictures whose target was raised to repay idle capacity, and the bits
+	 * that repayment added. */
+	unsigned long num_debt_lifts;
+	double sum_lift;
+	/* Sum of the repayment ceiling actually used, for reporting its mean. */
+	double sum_fill_used;
 	double sum_bits;
 	double sum_fill;
 	double max_fill;

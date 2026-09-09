@@ -148,6 +148,106 @@ int ext_rate_control_init(ExtRateControl *rc, ExtRateControlParams const *params
 	rc->cplx_min = env_double("EXT_RC_CPLX_MIN", 0.25);
 	rc->cplx_max = env_double("EXT_RC_CPLX_MAX", 4.00);
 	rc->alpha = env_double("EXT_RC_ALPHA", 0.3);
+	/* Repaying link capacity the encoder left unused.
+	 *
+	 * The bucket term above is integral action on rate error, but it is
+	 * clipped at empty: once the link has drained everything, the bucket
+	 * cannot record that the stream is *still* behind, so its bias saturates
+	 * at 1 + gain * setpoint - 1.20 at the defaults - and a content term that
+	 * asks for a quarter of the budget wins permanently. Measured on
+	 * near-static VGA footage at 100 kbps: 63 kbps delivered, the buffer
+	 * empty on 227 of 350 pictures, and mean fill sitting exactly on the
+	 * setpoint. The controller believed it was in equilibrium while giving
+	 * away a third of the link, and a constant-QP encode of the same clip
+	 * showed the missing bits were worth 1.8 dB, so they were not bits
+	 * nobody needed.
+	 *
+	 * This carries the shortfall the bucket cannot, and repays it only where
+	 * repaying is free. A target *below* one frame budget is raised towards
+	 * one frame budget and never above it; a picture of exactly one frame
+	 * budget leaves the bucket where it found it, so repayment cannot raise
+	 * buffer occupancy - mean or peak - by construction. The peaks are left
+	 * to the cap. The missing bits are in the troughs anyway, and the troughs
+	 * are the latency-free place to put them back.
+	 *
+	 * Because the debt integrates the shortfall rather than the lift it
+	 * granted, it settles where the delivered rate equals the budget: repay
+	 * too little and it keeps growing, too much and it shrinks. Repaying the
+	 * lift instead makes it proportional action, which splits the difference
+	 * and stalls halfway - measured, that reached 57% of the budget and
+	 * stopped.
+	 *
+	 * debt_cap bounds how much idle capacity may be remembered so a long calm
+	 * passage cannot bank a burst for the motion after it, and debt_gain how
+	 * much is offered back per picture. Neither is critical once the gate in
+	 * ext_rate_control_pre() is in place: cap 4 / gain 0.5 and cap 8 / gain
+	 * 1.0 measure identically, because it is the gate and not the reservoir
+	 * that decides when repayment happens.
+	 *
+	 * debt_fill is the one that matters. It stops a repaid target short of the
+	 * full frame budget, which leaves the buffer still draining on a repaid
+	 * picture and so leaves room for the QP model to overshoot - and on this
+	 * content it overshoots by up to 95%. Measured over five clips, against
+	 * the shipped library: at 1.0 the mean rate error goes -17.1% -> -11.7%
+	 * for +2.6 ms on p95 buffer occupancy; at 0.8 it goes -17.1% -> -12.6%
+	 * for +0.3 ms, which is noise, with peak occupancy 1 ms lower than the
+	 * baseline's. 0.8 is the operating point because latency is the priority;
+	 * raise it towards 1.0 to trade about a point of rate error per 2 ms. */
+	rc->debt_cap  = env_double("EXT_RC_DEBT_CAP", 4.0) * rc->bit_per_pic;
+	rc->debt_gain = env_double("EXT_RC_DEBT_GAIN", 0.5);
+	/* The repayment ceiling is progressive rather than fixed.
+	 *
+	 * A fixed 0.8 is the right resting value - it leaves the buffer draining
+	 * on a repaid picture, which is what keeps the QP model's overshoot from
+	 * turning into latency. But on content the rate control genuinely cannot
+	 * keep up with, 0.8 *is* the binding constraint: measured on an aerial
+	 * VGA pan at 700 kbps, the mean picture landed on 0.801 frame budgets,
+	 * exactly the ceiling, for a 19.9% rate shortfall.
+	 *
+	 * So it stretches towards debt_fill_max while the delivered rate is
+	 * persistently short and relaxes back as soon as it is not. The signal is
+	 * a slow EMA of the relative shortfall, not the debt: the debt is an
+	 * integrator and parks wherever it must to produce the lift being asked
+	 * for, so it saturates on well behaved content too and cannot tell the
+	 * two apart. The rate error can.
+	 *
+	 * Dead band below debt_err_lo, full stretch at debt_err_hi, linear
+	 * between. alpha is slow on purpose - about a 100 picture window - so one
+	 * hard passage does not spend the latency margin. */
+	rc->debt_fill      = env_double("EXT_RC_DEBT_FILL",      0.80);
+	rc->debt_fill_max  = env_double("EXT_RC_DEBT_FILL_MAX",  0.95);
+	rc->debt_err_alpha = env_double("EXT_RC_DEBT_ERR_ALPHA", 0.05);
+	/* Worst band first. Thresholds are relative rate shortfall; the counts are
+	 * how many consecutive pictures must agree before the step is granted.
+	 *
+	 * Chosen by measurement, and deliberately not the fastest set tried.
+	 * Tighter thresholds and counts (0.120/0.060/0.025 with 2/5/12) do react
+	 * far sooner - the ceiling reaches 0.90 by picture 8 rather than 66 - but
+	 * over 36 operating points they bought 0.07 points of rate for 0.02 dB of
+	 * PSNR and 0.36 ms of p95 occupancy, and they cost 0.11-0.35 dB on dense
+	 * detail footage by redistributing bits badly: at 700 kbps they were worse
+	 * on 130 pictures and better on 2, rescuing two pictures the slower set
+	 * had starved to 3.4 kbit while shaving 130 decent ones, with the measured
+	 * minimum PSNR unchanged. Fast reaction has a real case on content that
+	 * changes - a cut, a camera switch, a mid-stream bitrate change - but a
+	 * single-scene benchmark cannot show it, so the slower set is the default
+	 * until a transient test says otherwise. The knobs below make that a
+	 * one line experiment.
+	 *
+	 * A faster signal is not the answer either: at alpha 0.10 the ceiling
+	 * slams to its maximum on the first picture and then chatters through 19
+	 * steps, delivering less rate than the slowest setting here. */
+	rc->debt_t[0] = env_double("EXT_RC_DEBT_T1", 0.20); rc->debt_n[0] = (unsigned)env_int("EXT_RC_DEBT_N1",  5); rc->debt_f[0] = env_double("EXT_RC_DEBT_F1", 0.95);
+	rc->debt_t[1] = env_double("EXT_RC_DEBT_T2", 0.10); rc->debt_n[1] = (unsigned)env_int("EXT_RC_DEBT_N2", 15); rc->debt_f[1] = env_double("EXT_RC_DEBT_F2", 0.90);
+	rc->debt_t[2] = env_double("EXT_RC_DEBT_T3", 0.05); rc->debt_n[2] = (unsigned)env_int("EXT_RC_DEBT_N3", 40); rc->debt_f[2] = env_double("EXT_RC_DEBT_F3", 0.85);
+	if (rc->debt_gain < 0.0) rc->debt_gain = 0.0;
+	if (rc->debt_fill < 0.0) rc->debt_fill = 0.0;
+	if (rc->debt_fill > 1.0) rc->debt_fill = 1.0;
+	if (rc->debt_fill_max < rc->debt_fill) rc->debt_fill_max = rc->debt_fill;
+	if (rc->debt_fill_max > 1.0) rc->debt_fill_max = 1.0;
+	rc->debt_fill_now = rc->debt_fill;
+	rc->debt_err_run = 0;
+
 	/* QP per doubling of rate. Measured on a VC8000E by coding 250 pictures
 	 * at every QP from 20 to 42: rate follows Qstep^-1.62, i.e. 3.71 QP per
 	 * doubling, not the 6.00 that a plain R ~ 1/Qstep proportion assumes.
@@ -173,6 +273,10 @@ void ext_rate_control_set_bitrate(ExtRateControl *rc, unsigned int bitrate_bps)
 		return;
 
 	rc->bit_per_pic = (double)bitrate_bps / rc->frame_rate;
+	/* Expressed in frame budgets, so it follows the new rate. The debt itself
+	 * is a bit count already incurred and stays, only re-clamped. */
+	rc->debt_cap = env_double("EXT_RC_DEBT_CAP", 4.0) * rc->bit_per_pic;
+	if (rc->debt > rc->debt_cap) rc->debt = rc->debt_cap;
 
 	/* bucket_cap is deliberately left alone: it is a buffer size in bits,
 	 * set by whoever knows how much coded data may be in flight, and that
@@ -216,6 +320,36 @@ int ext_rate_control_pre(ExtRateControl *rc, int is_intra)
 
 	if (target < rc->bit_per_pic * rc->target_min) target = rc->bit_per_pic * rc->target_min;
 	if (target > rc->bit_per_pic * rc->target_max) target = rc->bit_per_pic * rc->target_max;
+
+	/* Repay idle link capacity, in the troughs only. After the clamps above,
+	 * so the ceiling on a repaid target is exactly one frame budget and not
+	 * something target_max could lift further.
+	 *
+	 * Gated on the buffer being no fuller than the setpoint. Without that
+	 * gate the repayment fights the very term that bounds latency: the bucket
+	 * term lowers the target as the buffer fills, and a lift that ignores it
+	 * puts the bits back into a buffer that already has a queue in it.
+	 * Measured on 720p aerial footage, ungated repayment moved peak occupancy
+	 * from 74 ms to 99 ms for 7 points of rate; gated, the rate is the same
+	 * and the peak is not. The setpoint is the standing queue the controller
+	 * already accepts, so repaying below it cannot add to what the design
+	 * already allows. */
+	if ((rc->debt > 0.0) && (rc->debt_gain > 0.0) && (fill <= rc->setpoint))
+	{
+		double const fill_share = rc->debt_fill_now;
+		double const fill_to = rc->bit_per_pic * fill_share;
+
+		if (target < fill_to)
+		{
+			double lift = rc->debt * rc->debt_gain;
+			if (lift > (fill_to - target)) lift = fill_to - target;
+			target += lift;
+			rc->sum_lift += lift;
+			rc->sum_fill_used += fill_share;
+			rc->num_debt_lifts++;
+		}
+	}
+
 	rc->current_target = (int)target;
 
 	/* complexity_x is what the stream costs at QP 0, so subtracting the
@@ -274,6 +408,34 @@ static unsigned int slope_band(double slope, double est, double *step)
 	if (r >= 1.3) { *step = 0.25; return 16; }
 	*step = 0.0;
 	return 0;
+}
+
+
+/* Bands on the standing rate shortfall: the worse and the more sustained it
+ * is, the further the repayment ceiling stretches. Same graduated shape as
+ * slope_band() above, and for the same reason - a big miss is unmistakable and
+ * is answered quickly, a small one could be the estimate wandering and waits.
+ *
+ * Asymmetric on purpose: slow to stretch, immediate to relax. The margin
+ * between the resting ceiling and one frame budget is latency headroom, so it
+ * is given up reluctantly and taken back as soon as the rate is delivered.
+ *
+ * Returns the ceiling this shortfall justifies and how many consecutive
+ * pictures of evidence it needs before being granted. */
+static double debt_fill_band(ExtRateControl const *rc, double err, unsigned int *needed)
+{
+	unsigned int i;
+
+	for (i = 0; i < 3; ++i)
+	{
+		if (err >= rc->debt_t[i])
+		{
+			*needed = rc->debt_n[i];
+			return rc->debt_f[i];
+		}
+	}
+	*needed = 0;
+	return rc->debt_fill;
 }
 
 
@@ -480,6 +642,45 @@ void ext_rate_control_post(ExtRateControl *rc, size_t bits, int is_intra, ExtRat
 		}
 		else
 			rc->complexity_x += rc->alpha * (x - rc->complexity_x);
+	}
+
+	/* Integrate the rate error before the bucket clips it away. Positive
+	 * means the link was ready to carry bits the encoder did not produce. */
+	rc->debt += rc->bit_per_pic - b;
+	if (rc->debt < 0.0) rc->debt = 0.0;
+	if (rc->debt > rc->debt_cap) rc->debt = rc->debt_cap;
+
+	/* Standing relative shortfall, the signal the repayment ceiling follows.
+	 * Signed, so running over target pulls it back down again. */
+	if (rc->bit_per_pic > 0.0)
+	{
+		double const e = (rc->bit_per_pic - b) / rc->bit_per_pic;
+		unsigned int needed;
+		double cand;
+
+		rc->rate_err_ema += rc->debt_err_alpha * (e - rc->rate_err_ema);
+
+		cand = debt_fill_band(rc, rc->rate_err_ema, &needed);
+		if (cand < rc->debt_fill) cand = rc->debt_fill;
+		if (cand > rc->debt_fill_max) cand = rc->debt_fill_max;
+
+		if (cand > rc->debt_fill_now)
+		{
+			rc->debt_err_run++;
+			if (rc->debt_err_run >= needed)
+			{
+				IMX_VPU_API_LOG("new CBR: picture %lu rate short by %.1f%%, repayment ceiling %.2f -> %.2f",
+				                rc->num_pictures, rc->rate_err_ema * 100.0, rc->debt_fill_now, cand);
+				rc->debt_fill_now = cand;
+				rc->debt_err_run = 0;
+			}
+		}
+		else
+		{
+			if (cand < rc->debt_fill_now)
+				rc->debt_fill_now = cand;      /* rate is back: relax at once */
+			rc->debt_err_run = 0;
+		}
 	}
 
 	rc->bucket += b - rc->bit_per_pic;

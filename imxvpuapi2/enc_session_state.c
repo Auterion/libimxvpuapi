@@ -64,6 +64,7 @@ void imx_vpu_api_enc_session_save_rc(ImxVpuApiEncSession *session, ExtRateContro
 	session->rc_valid = 1;
 	session->rc_total_blocks = rc->total_blocks;
 	session->rc_bucket = rc->bucket;
+	session->rc_debt = rc->debt;
 	session->rc_cplx_per_block = rc->cplx_per_block;
 	session->rc_cplx_prev = rc->cplx_prev;
 	session->rc_cplx_ema = rc->cplx_ema;
@@ -109,6 +110,11 @@ void imx_vpu_api_enc_session_restore_rc(ImxVpuApiEncSession const *session, ExtR
 		                    rc->bucket / 1000.0, rc->bucket_cap / 1000.0);
 		rc->bucket = rc->bucket_cap;
 	}
+
+	/* A bit count the link owes the stream, like the bucket level: a property
+	 * of the link and the rate, which the frame size does not enter into. */
+	rc->debt = session->rc_debt;
+	if (rc->debt > rc->debt_cap) rc->debt = rc->debt_cap;
 
 	rc->cplx_per_block = session->rc_cplx_per_block;
 	rc->cplx_prev = session->rc_cplx_prev * ratio;
