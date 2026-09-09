@@ -75,6 +75,9 @@ void imx_vpu_api_enc_session_save_rc(ImxVpuApiEncSession *session, ExtRateContro
 	session->rc_num_pictures = (uint32_t)(rc->num_pictures);
 	session->rc_num_reencodes = (uint32_t)(rc->num_reencodes);
 	session->rc_num_bucket_empty = (uint32_t)(rc->num_bucket_empty);
+	session->rc_num_skipped = (uint32_t)(rc->num_skipped);
+	session->rc_num_dropped = (uint32_t)(rc->num_dropped);
+	session->rc_max_skip_run = (uint32_t)(rc->max_skip_run);
 	session->rc_sum_bits = rc->sum_bits;
 	session->rc_sum_fill = rc->sum_fill;
 	session->rc_max_fill = rc->max_fill;
@@ -133,6 +136,9 @@ void imx_vpu_api_enc_session_restore_rc(ImxVpuApiEncSession const *session, ExtR
 	rc->intra_bootstrap_pending = 1;
 	rc->num_reencodes = session->rc_num_reencodes;
 	rc->num_bucket_empty = session->rc_num_bucket_empty;
+	rc->num_skipped = session->rc_num_skipped;
+	rc->num_dropped = session->rc_num_dropped;
+	rc->max_skip_run = session->rc_max_skip_run;
 	rc->sum_bits = session->rc_sum_bits;
 	rc->sum_fill = session->rc_sum_fill;
 	rc->max_fill = session->rc_max_fill;

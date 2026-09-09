@@ -65,6 +65,10 @@ typedef struct
 	int32_t rc_have_complexity_x;
 	int32_t rc_prev_qp, rc_current_qp;
 	uint32_t rc_num_pictures, rc_num_reencodes, rc_num_bucket_empty;
+	/* The frame skipping valve's tally, so that the close summary reports the
+	 * whole stream and not just its last segment. The run counter is not
+	 * carried: a new source starts with a clean liveness budget. */
+	uint32_t rc_num_skipped, rc_num_dropped, rc_max_skip_run;
 	double rc_sum_bits, rc_sum_fill, rc_max_fill;
 }
 ImxVpuApiEncSession;

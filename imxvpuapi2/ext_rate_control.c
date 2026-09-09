@@ -15,6 +15,9 @@
 #include "ext_rate_control.h"
 
 
+static void observe_complexity(ExtRateControl *rc, double b, int is_intra, ExtRateControlStats const *cu_stats);
+
+
 /* Every tunable can be overridden from the environment, because the useful
  * ones are only found by sweeping them on the target against real footage.
  * The defaults below are the settings that came out of that sweep. */
@@ -240,6 +243,75 @@ int ext_rate_control_init(ExtRateControl *rc, ExtRateControlParams const *params
 	rc->debt_t[0] = env_double("EXT_RC_DEBT_T1", 0.20); rc->debt_n[0] = (unsigned)env_int("EXT_RC_DEBT_N1",  5); rc->debt_f[0] = env_double("EXT_RC_DEBT_F1", 0.95);
 	rc->debt_t[1] = env_double("EXT_RC_DEBT_T2", 0.10); rc->debt_n[1] = (unsigned)env_int("EXT_RC_DEBT_N2", 15); rc->debt_f[1] = env_double("EXT_RC_DEBT_F2", 0.90);
 	rc->debt_t[2] = env_double("EXT_RC_DEBT_T3", 0.05); rc->debt_n[2] = (unsigned)env_int("EXT_RC_DEBT_N3", 40); rc->debt_f[2] = env_double("EXT_RC_DEBT_F3", 0.85);
+
+	/* The safety valve, on by default. What it prevents is unbounded
+	 * latency, and a caller whose qp_max is low enough to reach it has no
+	 * other protection: the re-encode ladder has already run out of rungs
+	 * by then. It should not open at all on a feasible operating point -
+	 * the threshold is the buffer overflow limit, which a working stream
+	 * does not reach - so leaving it armed costs nothing until it is
+	 * needed. EXT_RC_SKIP=0 disarms it. */
+	rc->skip_enable = env_int("EXT_RC_SKIP", 1);
+	/* The valve asks the same question at two points, and both are worth
+	 * having.
+	 *
+	 * ext_rate_control_should_drop() is the rule proper: the picture has
+	 * been encoded, it is at qp_max, it does not fit, so it is not sent.
+	 * Nothing is forecast, so nothing can be forecast wrong.
+	 *
+	 * ext_rate_control_should_skip() asks before the encode, off the
+	 * content model, and saves the encode when the answer is already
+	 * obvious.
+	 *
+	 * The pre-check is off by default, because measuring turned out to be
+	 * both simpler and better. The two are not interchangeable - a picture
+	 * refused before the encode is never measured, so the content model does
+	 * not move for it and the pictures after it are quantised differently -
+	 * and on the stress clip at qp_max 44, against a 107 ms buffer:
+	 *
+	 *   pre-check only    165 refused   17 overflows   peak 118 ms
+	 *   measured only     127 refused    0 overflows   peak 107 ms
+	 *   both              152 refused    0 overflows   peak 107 ms
+	 *
+	 * The measured rule alone cannot overflow the buffer, which is the whole
+	 * point, and adding the pre-check to it only costs 25 more dropped
+	 * pictures - 0.5 fps - for nothing. The pre-check survives for the case
+	 * this board is not in: if encode time is ever the binding constraint,
+	 * refusing a picture before spending an encode on it is worth having.
+	 *
+	 * EXT_RC_SKIP_PREDICT=1 arms it; EXT_RC_SKIP_DROP=0 disarms the measured
+	 * rule. That is how the table above was taken. */
+	rc->skip_predict = env_int("EXT_RC_SKIP_PREDICT", 0);
+	rc->skip_drop = env_int("EXT_RC_SKIP_DROP", 1);
+	rc->skip_room_share = env_double("EXT_RC_SKIP_ROOM", 1.0);
+	rc->cap_attempt_limit = env_int("EXT_RC_CAP_ATTEMPTS", 4);
+	/* Skipping buys room at one frame budget per picture and the room
+	 * saturates once the buffer is empty, so refusing more pictures in a
+	 * row than the buffer holds frame budgets cannot create any more room -
+	 * that is the natural limit, and past it the only thing left to do is
+	 * code the picture and take the overflow.
+	 *
+	 * Then held to 8, so that a large buffer cannot turn the valve into a
+	 * visible freeze: at 30 fps eight pictures is 267 ms, which is about as
+	 * long as a stall can last before it reads as a stall rather than as a
+	 * stutter. A 700 ms buffer would otherwise allow 21.
+	 *
+	 * That reasoning holds only while the bucket is at most full. Where a
+	 * single picture can blow past the buffer on its own - the H1, whose
+	 * predicted pictures cannot be re-encoded - it throttles the recovery
+	 * instead, and that encoder raises this for itself; see the note beside
+	 * skip_predict in imxvpuapi2_imx8m_hantro_h1_encoder.c. It is left alone
+	 * here because the VC8000E is measured with it and does not need it: the
+	 * re-encode ladder bounds every picture, so the bucket never gets far
+	 * enough over the cap for the limit to bite. */
+	{
+		int run = (rc->bit_per_pic > 0.0)
+		        ? (int)ceil(rc->bucket_cap / rc->bit_per_pic)
+		        : 1;
+		if (run < 1) run = 1;
+		if (run > 8) run = 8;
+		rc->skip_max_run = (unsigned int)env_int("EXT_RC_SKIP_MAX", run);
+	}
 	if (rc->debt_gain < 0.0) rc->debt_gain = 0.0;
 	if (rc->debt_fill < 0.0) rc->debt_fill = 0.0;
 	if (rc->debt_fill > 1.0) rc->debt_fill = 1.0;
@@ -267,6 +339,170 @@ int ext_rate_control_init(ExtRateControl *rc, ExtRateControlParams const *params
 }
 
 
+/* What the next picture is predicted to cost at the coarsest quantiser the
+ * controller may use, and the room the buffer has for it.
+ *
+ * The room is what is left in the buffer *now*, with no credit for the
+ * draining that happens while the picture is going out. That is deliberately
+ * stricter than the ceiling ext_rate_control_check() re-encodes against,
+ * which subtracts one frame budget of drain first and so bounds the level at
+ * the *end* of the picture's period rather than the peak during it. The two
+ * differ by exactly one frame budget, and for a re-encode that is the right
+ * call - it is aiming a quantiser at a size, and the end-of-period level is
+ * what the controller's own accounting carries forward.
+ *
+ * For the valve it is the wrong call, and measurably so. Replaying the stress
+ * clip at 1400 kbps into a 107 ms buffer with qp_max at 44: of 344 pictures
+ * that overflowed the buffer at their peak, 308 had "fitted" under the
+ * end-of-period rule and only 36 were the prediction genuinely missing. The
+ * question a valve has to answer is whether the picture fits in the buffer as
+ * it stands, so that is the question it asks.
+ *
+ * Being a share of the level rather than a fixed margin also makes the test
+ * adaptive in the right direction on its own: with the buffer nearly empty it
+ * is barely stricter than the re-encode ceiling, and it tightens sharply as
+ * the buffer fills, which is where a picture that does not fit does real
+ * damage.
+ *
+ * Returns 0 when there is nothing to predict from, which is a reason to code
+ * the picture rather than to refuse it.
+ */
+static int skip_pressure(ExtRateControl const *rc, int is_intra, double *est, double *room)
+{
+	*room = rc->bucket_cap - rc->bucket;
+	if (*room < 0.0) *room = 0.0;
+	*est = 0.0;
+
+	/* There is nothing to predict an intra picture from: what an inter
+	 * picture cost says nothing about one coded from scratch. Intra pictures
+	 * are handled by the measured rule instead, on their real coded size,
+	 * and deferred rather than dropped - see
+	 * ext_rate_control_should_drop(). */
+	if (is_intra)
+		return 0;
+
+	if (!rc->have_complexity_x)
+		return 0;
+
+	/* complexity_x is log2(bits) + qp/slope, i.e. what this content would
+	 * cost at QP 0, so this inverts it at qp_max. */
+	*est = pow(2.0, rc->complexity_x - (double)(rc->qp_max_inter) / rc->slope);
+	return 1;
+}
+
+
+int ext_rate_control_should_skip(ExtRateControl const *rc, int is_intra)
+{
+	double est, room;
+
+	if ((rc == NULL) || !rc->skip_enable || !rc->skip_predict)
+		return 0;
+
+	/* Liveness comes first: the stream must never stop. */
+	if (rc->skip_run >= rc->skip_max_run)
+		return 0;
+
+	if (!skip_pressure(rc, is_intra, &est, &room))
+		return 0;
+
+	return (est > (room * rc->skip_room_share));
+}
+
+
+int ext_rate_control_should_drop(ExtRateControl const *rc, size_t bits, int is_intra)
+{
+	double room;
+
+	if ((rc == NULL) || !rc->skip_enable || !rc->skip_drop)
+		return 0;
+	if (rc->skip_run >= rc->skip_max_run)
+		return 0;
+
+	/* The quantiser must have no moves left, and there are two ways to run
+	 * out of them. The obvious one is qp_max. The other is the re-encode
+	 * ladder spending its attempts: ext_rate_control_check() deliberately
+	 * accepts a picture it has failed to shrink four times over, because
+	 * grinding it down further costs encode time and looks worse than the
+	 * overshoot - but at that point "accept it" was the only option it had,
+	 * and dropping it is the better one.
+	 *
+	 * That second route is not a corner case. Over the 137 standard clips,
+	 * every picture that overflowed the buffer was *below* qp_max and had
+	 * come out of the ladder's attempt limit - 25 of them on
+	 * deadline_176x144 alone. Gating only on qp_max left the valve watching
+	 * them go past.
+	 *
+	 * Below both limits the picture is still the ladder's problem, and
+	 * taking it here would trade frame rate for something quality could
+	 * have bought. */
+	if ((rc->current_qp < (is_intra ? rc->qp_max_intra : rc->qp_max_inter))
+	 && (rc->cap_attempts < rc->cap_attempt_limit))
+		return 0;
+
+	/* And it must not fit in the buffer as it stands. */
+	room = rc->bucket_cap - rc->bucket;
+	if (room < 0.0) room = 0.0;
+
+	return ((double)bits > (room * rc->skip_room_share));
+}
+
+
+void ext_rate_control_skip(ExtRateControl *rc, int is_intra, size_t bits, ExtRateControlStats const *cu_stats)
+{
+	double est = 0.0, room = 0.0;
+
+	if (rc == NULL)
+		return;
+
+	skip_pressure(rc, is_intra, &est, &room);
+	if (bits > 0)
+		est = (double)bits;
+
+	IMX_VPU_API_INFO(
+		"new CBR: picture %lu skipped - %.1f kbit %s at qp %d, and the HRD buffer "
+		"has room for %.1f kbit (%.1f of %.1f kbit in flight, refusal %u of %u)",
+		rc->num_pictures,
+		est / 1000.0,
+		(bits > 0) ? "coded" : "predicted",
+		rc->qp_max_inter,
+		room / 1000.0,
+		rc->bucket / 1000.0, rc->bucket_cap / 1000.0,
+		rc->skip_run + 1, rc->skip_max_run
+	);
+
+	/* The link drains over this picture's period whether or not anything
+	 * was coded into it, and that is the whole mechanism. */
+	rc->bucket -= rc->bit_per_pic;
+	if (rc->bucket < 0.0)
+	{
+		rc->bucket = 0.0;
+		rc->num_bucket_empty++;
+	}
+
+	/* Deliberately not fed to the debt integrator or to the standing rate
+	 * error. Those exist to repay capacity the encoder left unused, and
+	 * these bits were not left unused - they were refused, because the
+	 * buffer could not take them. Counting them as a shortfall would have
+	 * the controller raise later targets to put back exactly the bits it
+	 * had just declined, refilling the buffer the skip drained. */
+
+	/* A picture that was encoded and then discarded still measured the
+	 * content, and that measurement is worth keeping even though the bits
+	 * are not going anywhere: it is what the next picture's QP is predicted
+	 * from, and throwing it away would mean paying for the encode twice.
+	 * The bucket above is the only thing the bits must not touch. */
+	if (bits > 0)
+		observe_complexity(rc, (double)bits, is_intra, cu_stats);
+
+	rc->skip_run++;
+	if (rc->skip_run > rc->max_skip_run)
+		rc->max_skip_run = rc->skip_run;
+	rc->num_skipped++;
+	if (bits > 0)
+		rc->num_dropped++;
+}
+
+
 void ext_rate_control_set_bitrate(ExtRateControl *rc, unsigned int bitrate_bps)
 {
 	if ((rc == NULL) || (bitrate_bps == 0) || (rc->frame_rate <= 0.0))
@@ -289,7 +525,7 @@ void ext_rate_control_set_bitrate(ExtRateControl *rc, unsigned int bitrate_bps)
 }
 
 
-int ext_rate_control_pre(ExtRateControl *rc, int is_intra)
+int ext_rate_control_pre(ExtRateControl *rc, int is_intra, size_t overhead_bits)
 {
 	double fill, scale, target, qp;
 
@@ -348,6 +584,25 @@ int ext_rate_control_pre(ExtRateControl *rc, int is_intra)
 			rc->sum_fill_used += fill_share;
 			rc->num_debt_lifts++;
 		}
+	}
+
+	/* The target so far is a budget for what goes on the link, and the
+	 * caller is about to put overhead_bits of parameter sets and prefix SEI
+	 * in front of the picture. Aim the picture at what is left, so the
+	 * access unit lands on the target instead of overshooting it by the size
+	 * of a parameter set at every GOP boundary.
+	 *
+	 * Charging the overhead in ext_rate_control_post() keeps the bucket
+	 * honest about what the link carried, but it cannot prevent the
+	 * overshoot - by then the picture has been coded. Only telling the
+	 * controller in advance does that, which is what this is. On the stress
+	 * clip the tax is ~800 bits on one picture in 30, so it moves that
+	 * picture's QP by about a tenth of a step: the point is not the quality,
+	 * it is that the budget stops being systematically wrong. */
+	if (overhead_bits > 0)
+	{
+		target -= (double)overhead_bits;
+		if (target < 1.0) target = 1.0;
 	}
 
 	rc->current_target = (int)target;
@@ -502,18 +757,25 @@ static void slope_observe(ExtRateControl *rc, size_t bits)
 }
 
 
-int ext_rate_control_check(ExtRateControl *rc, size_t bits, int is_intra)
+int ext_rate_control_check(ExtRateControl *rc, size_t bits, size_t overhead_bits, int is_intra)
 {
-	double ceiling, drained, remaining;
+	double ceiling, remaining;
+	double wire;
 	int qp, qp_max;
 
 	if (rc == NULL)
 		return 0;
+	/* The ceiling bounds what goes on the link, so it is measured against
+	 * the whole access unit; the gradient below is learned from the picture
+	 * alone. Adding a constant to both halves of a re-encode pair would
+	 * compress their ratio and so overstate the QP per doubling, which is
+	 * the one number here that is fitted rather than configured. */
+	wire = (double)bits + (double)overhead_bits;
 	/* The ceiling is a soft one by design. A picture the encoder simply
 	 * cannot shrink gets through rather than being ground down attempt
 	 * after attempt, which costs encode time and looks worse than the
 	 * overshoot. */
-	if (rc->cap_attempts >= 4)
+	if (rc->cap_attempts >= rc->cap_attempt_limit)
 	{
 		IMX_VPU_API_LOG("new CBR:   attempt %d qp %d bits %zu - attempt limit, accepted",
 		                rc->cap_attempts, rc->current_qp, bits);
@@ -530,15 +792,25 @@ int ext_rate_control_check(ExtRateControl *rc, size_t bits, int is_intra)
 		return 0;
 	}
 
-	/* What the buffer can still take. The link drains one frame budget
-	 * over this picture's period, so the space available when the picture
-	 * goes in is the level left after that drain. A picture bigger than
-	 * this overflows the buffer, which is the one thing that is never
-	 * allowed - so unlike the discretionary cap below, this applies to
-	 * intra pictures too. */
-	drained = rc->bucket - rc->bit_per_pic;
-	if (drained < 0.0) drained = 0.0;
-	remaining = rc->bucket_cap - drained;
+	/* What the buffer can still take: what is left in it right now. A
+	 * picture bigger than this overflows the buffer, which is the one thing
+	 * that is never allowed - so unlike the discretionary cap below, this
+	 * applies to intra pictures too.
+	 *
+	 * "Right now", with no credit for the frame budget the link drains while
+	 * the picture is going out. Crediting it was the original form, and it
+	 * bounds the level at the *end* of the picture's period rather than its
+	 * peak during it - which lets through a picture that overflows the
+	 * buffer by up to one frame budget. Measured on the stress clip in IDR
+	 * mode at qp_max 44, that was 44 of 46 buffer overflows: every one under
+	 * a frame budget over, and every one with quantiser headroom left, so
+	 * the ladder had the means to shrink them and simply was not asking.
+	 *
+	 * It is also the same line ext_rate_control_should_drop() measures
+	 * against, which is what makes the two agree: the ladder shrinks a
+	 * picture until it fits the buffer, and the valve is reached only when
+	 * the quantiser has run out of ways to do that. */
+	remaining = rc->bucket_cap - rc->bucket;
 	if (remaining < 0.0) remaining = 0.0;
 	ceiling = remaining;
 
@@ -569,7 +841,7 @@ int ext_rate_control_check(ExtRateControl *rc, size_t bits, int is_intra)
 		if (first < ceiling) ceiling = first;
 	}
 
-	if ((double)bits <= ceiling)
+	if (wire <= ceiling)
 	{
 		IMX_VPU_API_LOG("new CBR:   attempt %d qp %d bits %zu ceiling %.0f - accepted",
 		                rc->cap_attempts, rc->current_qp, bits, ceiling);
@@ -582,13 +854,13 @@ int ext_rate_control_check(ExtRateControl *rc, size_t bits, int is_intra)
 		qp = qp_max;
 	else
 	{
-		qp = rc->current_qp + (int)lround(rc->slope * log2((double)bits / ceiling));
+		qp = rc->current_qp + (int)lround(rc->slope * log2(wire / ceiling));
 		if (qp <= rc->current_qp) qp = rc->current_qp + 1;
 		if (qp > qp_max) qp = qp_max;
 	}
 
 	IMX_VPU_API_LOG("new CBR:   attempt %d qp %d bits %zu ceiling %.0f - over by %.2fx, re-encoding at qp %d",
-	                rc->cap_attempts, rc->current_qp, bits, ceiling, (double)bits / ceiling, qp);
+	                rc->cap_attempts, rc->current_qp, bits, ceiling, wire / ceiling, qp);
 
 	rc->prev_attempt_qp = rc->current_qp;
 	rc->prev_attempt_bits = bits;
@@ -601,13 +873,11 @@ int ext_rate_control_check(ExtRateControl *rc, size_t bits, int is_intra)
 }
 
 
-void ext_rate_control_post(ExtRateControl *rc, size_t bits, int is_intra, ExtRateControlStats const *cu_stats)
+/* What this picture says about the content, which is independent of whether
+ * the picture is going to be sent. Called for every picture the encoder
+ * produced, including one the valve then discards. */
+static void observe_complexity(ExtRateControl *rc, double b, int is_intra, ExtRateControlStats const *cu_stats)
 {
-	double b = (double)bits;
-
-	if (rc == NULL)
-		return;
-
 	if ((b > 0.0) && !is_intra)
 	{
 		double coded = (double)(rc->total_blocks);
@@ -643,6 +913,36 @@ void ext_rate_control_post(ExtRateControl *rc, size_t bits, int is_intra, ExtRat
 		else
 			rc->complexity_x += rc->alpha * (x - rc->complexity_x);
 	}
+}
+
+
+void ext_rate_control_post(ExtRateControl *rc, size_t bits, size_t overhead_bits, int is_intra, ExtRateControlStats const *cu_stats)
+{
+	/* Two different sizes, and they are not interchangeable.
+	 *
+	 * The content model is told what the *picture* cost, because that is
+	 * what a quantiser has any influence over: charging it for a parameter
+	 * set would teach it that a picture carrying one is more expensive
+	 * content than it is.
+	 *
+	 * The bucket is charged the whole access unit - picture, parameter sets,
+	 * prefix SEI - because the bucket models the link, and the link carries
+	 * all of it. Leaving the overhead out is not the small rounding error it
+	 * looks like: measured on the stress clip it averages only 3.3 bytes a
+	 * picture, but it arrives in bursts of about 800 bits at each GOP
+	 * boundary, and until the buffer next drains to empty the bucket sits
+	 * that much below the truth. That is enough to overflow a picture the
+	 * controller had correctly judged to fit, which is how a frame skipping
+	 * valve that provably cannot overflow the buffer was still measured
+	 * overflowing it 24 times. */
+	double b = (double)bits;
+	double const wire = (double)bits + (double)overhead_bits;
+
+	if (rc == NULL)
+		return;
+
+	observe_complexity(rc, b, is_intra, cu_stats);
+	b = wire;
 
 	/* Integrate the rate error before the bucket clips it away. Positive
 	 * means the link was ready to carry bits the encoder did not produce. */
@@ -692,6 +992,10 @@ void ext_rate_control_post(ExtRateControl *rc, size_t bits, int is_intra, ExtRat
 	rc->prev_qp = rc->current_qp;
 	rc->num_pictures++;
 	rc->sum_bits += b;
+	/* A picture got through, so the run of refusals is over. Counting runs
+	 * rather than a total is what keeps the valve from starving the stream:
+	 * the limit is on consecutive skips, and one coded picture clears it. */
+	rc->skip_run = 0;
 	if (is_intra)
 		rc->intra_bootstrap_pending = 0;
 }

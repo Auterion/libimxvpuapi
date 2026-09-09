@@ -219,6 +219,11 @@ struct _ImxVpuApiEncoder
 	 * This is used after flushing to make sure the next frame is an
 	 * I/IDR frame. */
 	BOOL force_IDR_frame;
+	/* An intra picture the frame skipping valve deferred rather than let
+	 * through, so that the request outlives the input frame it arrived on
+	 * and is applied to the next picture that is coded.
+	 * IMX_VPU_API_FRAME_TYPE_UNKNOWN means none is pending. */
+	ImxVpuApiFrameType postponed_frame_type;
 
 	/* How many bytes of encoded frame data are currently stored in
 	 * the stream buffer. This number is always less than or equal to
@@ -1312,7 +1317,10 @@ static ImxVpuApiEncReturnCodes init_vcenc_instance(ImxVpuApiEncoder *encoder,
 			rate_control_config.qpMaxI  = encoder->new_cbr.qp_max_intra;
 			rate_control_config.qpMinPB = encoder->new_cbr.qp_min_inter;
 			rate_control_config.qpMaxPB = encoder->new_cbr.qp_max_inter;
-			rate_control_config.qpHdr = ext_rate_control_pre(&encoder->new_cbr, 1);
+			/* 0: the header does not exist yet - VCEncStrmStart() below is
+			 * what produces it - and the bootstrap allowance bounds this
+			 * picture anyway. */
+			rate_control_config.qpHdr = ext_rate_control_pre(&encoder->new_cbr, 1, 0);
 		}
 
 		enc_ret = VCEncSetRateCtrl(encoder->encoder, &rate_control_config);
@@ -1816,6 +1824,11 @@ void imx_vpu_api_enc_close(ImxVpuApiEncoder *encoder)
 	{
 		ExtRateControl const *rc = &encoder->new_cbr;
 		double const pictures = (double)(rc->num_pictures);
+		/* The rate is bits over elapsed time, and a skipped picture still
+		 * takes up its slot on the timeline. Dividing by coded pictures
+		 * alone would report a stream that dropped a third of its
+		 * pictures at the same kbps as one that kept them. */
+		double const slots = (double)(rc->num_pictures + rc->num_skipped);
 
 		IMX_VPU_API_INFO(
 			"new CBR summary: %lu pictures, %.0f kbps of %.0f kbps configured, "
@@ -1824,7 +1837,7 @@ void imx_vpu_api_enc_close(ImxVpuApiEncoder *encoder)
 			"idle capacity repaid on %lu pictures (%.0f kbit, %.1f%% of the stream), "
 			"standing rate error %.1f%%, mean repayment ceiling %.2f",
 			rc->num_pictures,
-			rc->sum_bits / pictures * rc->frame_rate / 1000.0,
+			rc->sum_bits / slots * rc->frame_rate / 1000.0,
 			rc->bit_per_pic * rc->frame_rate / 1000.0,
 			rc->num_reencodes,
 			rc->num_bucket_empty,
@@ -1836,6 +1849,23 @@ void imx_vpu_api_enc_close(ImxVpuApiEncoder *encoder)
 			rc->rate_err_ema * 100.0,
 			(rc->num_debt_lifts > 0) ? (rc->sum_fill_used / (double)(rc->num_debt_lifts)) : 0.0
 		);
+
+		/* Only when it opened. A line saying "0 pictures skipped" on every
+		 * healthy stream trains people to stop reading it, and this is
+		 * the one number that says the operating point was not feasible. */
+		if (rc->num_skipped > 0)
+			IMX_VPU_API_INFO(
+				"new CBR summary: the frame skipping valve refused %lu of %.0f pictures "
+				"(%.1f%%, %.1f fps delivered of %.1f, longest run %u, %lu of them "
+				"encoded first and discarded on their measured size) - qp_max %d was "
+				"not enough to hold the configured rate, so frame rate was traded for "
+				"latency",
+				rc->num_skipped, slots,
+				rc->num_skipped * 100.0 / slots,
+				pictures / slots * rc->frame_rate, rc->frame_rate,
+				rc->max_skip_run, rc->num_dropped,
+				rc->qp_max_inter
+			);
 	}
 
 	if (encoder->encoder != NULL)
@@ -2295,6 +2325,16 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 	encoder_input->picture_cnt = encoder->num_encoded_pictures;
 
 	requested_frame_type = encoder->staged_raw_frame.frame_types[0];
+
+	/* An intra request the valve deferred outranks whatever this input frame
+	 * asked for. The deferral only ever moves an intra picture to a later
+	 * one, so this can promote a picture to intra and never demote one. */
+	if (((encoder->postponed_frame_type == IMX_VPU_API_FRAME_TYPE_I)
+	  || (encoder->postponed_frame_type == IMX_VPU_API_FRAME_TYPE_IDR))
+	 && (requested_frame_type != IMX_VPU_API_FRAME_TYPE_I)
+	 && (requested_frame_type != IMX_VPU_API_FRAME_TYPE_IDR))
+		requested_frame_type = encoder->postponed_frame_type;
+
 	if (is_first_picture)
 	{
 		if (encoder->refresh_active)
@@ -2344,8 +2384,27 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 		encoder->has_header = TRUE;
 	}
 
+	/* Re-send the parameter sets every GOP, so a receiver that joined late or
+	 * lost them can start decoding without waiting for a new stream.
+	 *
+	 * In every mode, not just the refresh ones. gstimxvpuenc does this too -
+	 * it caches the first frame's parameter sets and appends them to the
+	 * output buffer every gop-size frames when the frame does not already
+	 * carry them - and doing it there is invisible to the rate control,
+	 * because it happens after imx_vpu_api_enc_get_encoded_frame_ext() has
+	 * returned and the bits have been accounted. That is a real leak: 89
+	 * bytes of VPS, SPS and PPS reach the link that the leaky bucket was
+	 * never charged for, once per GOP. Measured in IDR mode on the stress
+	 * clip, 39 insertions over 1187 pictures, 27768 bits the rate control
+	 * could not see - enough to put a picture over a 150 kbit buffer.
+	 *
+	 * Emitting them here instead costs the same bytes in the same place and
+	 * charges them, and it also stops the element from adding a second copy:
+	 * its guard is `!encoded_frame.has_header`. This condition used to
+	 * require a refresh mode, which is why the leak only ever showed in IDR
+	 * mode - with a sweep running, this branch already fired and the element
+	 * stayed out of it. */
 	if (!encoder->has_header && (encoder->num_encoded_pictures > 0) &&
-	    (encoder->refresh_active || encoder->vendor_gdr_active) &&
 	    (encoder->open_params.gop_size > 0) &&
 	    (((int)(encoder->num_encoded_pictures) % (int)(encoder->open_params.gop_size)) == 0))
 	{
@@ -2485,6 +2544,53 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 		}
 	}
 
+	/* Everything the refresh scheduler below is about to advance.
+	 *
+	 * The measured decision point runs *after* the scheduler, so a picture
+	 * discarded there has already had its sweep step taken and, if a
+	 * receiver had asked for a region, that request taken off the queue -
+	 * and none of it is going anywhere, because the picture is not. Left
+	 * alone that silently breaks the guarantee the sweep exists to make:
+	 * every CTB row intra coded once per period, and a region a receiver
+	 * asked for after losing data actually sent. Restoring these puts the
+	 * scheduler back where it was, so the next picture is offered the same
+	 * band and the same request.
+	 *
+	 * Taken here rather than next to the scheduler because the predictive
+	 * decision point jumps straight to `skipped` from below, and the
+	 * restore there has to be well defined on both paths. For that path it
+	 * is a copy of state that has not moved, i.e. a no-op. */
+	ImxVpuApiIntraRefreshState const refresh_state_before = encoder->refresh_state;
+	int const forced_q_head_before = encoder->forced_intra_q_head;
+	int const forced_q_count_before = encoder->forced_intra_q_count;
+
+	/* The rate control's last resort. A picture that cannot be made to fit
+	 * in the HRD buffer even at the coarsest quantiser allowed is not coded
+	 * at all: past qp_max the re-encode ladder has no rungs left, and every
+	 * further picture would go in on top of a buffer that is already full,
+	 * so the queue - which is the latency - would grow without bound.
+	 *
+	 * This has to happen here, ahead of everything that carries per-picture
+	 * state: the refresh sweep just below, the SEI that describes its band,
+	 * and the GOP position VCEncFindNextPic() advances at the end. A skipped
+	 * picture must leave every one of them exactly where it was, so that the
+	 * next input frame takes the slot this one would have had. A sweep step
+	 * spent on a picture that is never coded would leave those CTB rows
+	 * unrefreshed for a whole further period with a receiver told they were
+	 * clean.
+	 *
+	 * Nothing is handed to the hardware, so no reference picture moves
+	 * either: the next picture predicts from the same reconstruction the
+	 * decoder is holding. */
+	if (encoder->new_cbr_active && !is_first_picture
+	 && ext_rate_control_should_skip(&(encoder->new_cbr),
+	                                 (encoder_input->codingType == VCENC_INTRA_FRAME)))
+	{
+		ext_rate_control_skip(&(encoder->new_cbr),
+		                      (encoder_input->codingType == VCENC_INTRA_FRAME), 0, NULL);
+		goto skipped;
+	}
+
 	int sei_refresh = 0, sei_top = 0, sei_bottom = 0;
 
 	/* One refresh scheduler for what used to be three modes. An IDR
@@ -2589,10 +2695,19 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 		}
 	}
 
+	/* Everything imx_vpu_api_enc_get_encoded_frame_ext() will put on the
+	 * link ahead of the picture itself. Both are known by now: has_header
+	 * was decided at the top, and recovery_sei_size by the refresh
+	 * scheduler just above. The rate control is charged for all of it, so
+	 * the ceiling it re-encodes against, the valve's fit test and the bucket
+	 * all measure the same thing the link carries. */
+	size_t const overhead_bits = ((encoder->has_header ? encoder->header_data_size : 0)
+	                            + encoder->recovery_sei_size) * 8;
+
 	/* New CBR: pick this picture's QP before handing it to the encoder. */
 	if (encoder->new_cbr_active)
 	{
-		int qp = ext_rate_control_pre(&encoder->new_cbr, (encoder_input->codingType == VCENC_INTRA_FRAME));
+		int qp = ext_rate_control_pre(&encoder->new_cbr, (encoder_input->codingType == VCENC_INTRA_FRAME), overhead_bits);
 
 		encoder->cached_rate_ctrl.qpHdr = qp;
 		enc_ret = VCEncSetRateCtrl(encoder->encoder, &(encoder->cached_rate_ctrl));
@@ -2634,7 +2749,7 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 		int kept_qp = encoder->cached_rate_ctrl.qpHdr;
 		int qp;
 
-		while ((qp = ext_rate_control_check(&encoder->new_cbr, (size_t)(encoder_output.streamSize) * 8, is_intra)) > 0)
+		while ((qp = ext_rate_control_check(&encoder->new_cbr, (size_t)(encoder_output.streamSize) * 8, overhead_bits, is_intra)) > 0)
 		{
 			VCEncOut retry_output;
 
@@ -2654,6 +2769,38 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 		 * what the model learns from - the QP the kept bits were coded at is
 		 * the only one that describes them. */
 		encoder->new_cbr.current_qp = kept_qp;
+
+		/* The ladder's last rung. The picture is at qp_max and still does
+		 * not fit in the buffer, so it is not sent: there is nothing left
+		 * to trade quality for, and sending it would put the queue - which
+		 * is the latency - past the buffer the caller asked for.
+		 *
+		 * Discarding it here is safe precisely because none of this
+		 * picture's own bookkeeping has advanced yet. VCEncFindNextPic()
+		 * below is what moves the GOP on, so skipping to `skipped` leaves
+		 * the next input frame to be encoded in this picture's slot,
+		 * against the same reference, overwriting the reconstruction that
+		 * is being thrown away. Encoder and decoder stay in step. The
+		 * first picture of the stream is exempt: it carries the header and
+		 * starts the stream, and there is no earlier reference for a later
+		 * frame to be coded against. */
+		if (!is_first_picture
+		 && ext_rate_control_should_drop(&(encoder->new_cbr),
+		                                 (size_t)(encoder_output.streamSize) * 8 + overhead_bits,
+		                                 is_intra))
+		{
+			ExtRateControlStats cu_stats;
+			unsigned int const total_blocks =
+				(unsigned int)((encoder->open_params.frame_width / 8)
+				             * (encoder->open_params.frame_height / 8));
+
+			vc8000e_fill_rc_stats(&cu_stats, &encoder_output, total_blocks);
+			/* The model learns the picture's own cost; the overhead was
+			 * never going to be sent for a picture that is not sent. */
+			ext_rate_control_skip(&(encoder->new_cbr), is_intra,
+			                      (size_t)(encoder_output.streamSize) * 8, &cu_stats);
+			goto skipped;
+		}
 	}
 
 	if (enc_ret == VCENC_HRD_ERROR)
@@ -2743,6 +2890,7 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 		ext_rate_control_post(
 			&encoder->new_cbr,
 			(size_t)(encoder_output.streamSize) * 8,
+			overhead_bits,
 			(encoder_output.codingType == VCENC_INTRA_FRAME),
 			&cu_stats
 		);
@@ -2786,11 +2934,50 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 	encoder->encoded_frame_available = TRUE;
 
 	encoder->force_IDR_frame = FALSE;
+	encoder->postponed_frame_type = IMX_VPU_API_FRAME_TYPE_UNKNOWN;
 
 	encoder->num_encoded_pictures++;
 
 	*output_code = IMX_VPU_API_ENC_OUTPUT_CODE_ENCODED_FRAME_AVAILABLE;
 
+	goto finish;
+
+
+	/* Shared by the valve's two decision points: the predictive one before
+	 * the encode and the measured one after it. Reached only by goto - the
+	 * success path above jumps over it. */
+skipped:
+	encoder->refresh_state = refresh_state_before;
+	encoder->forced_intra_q_head = forced_q_head_before;
+	encoder->forced_intra_q_count = forced_q_count_before;
+
+	/* An intra picture is deferred, never dropped. The GOP's own periodic
+	 * IDR needs nothing: the GOP position does not advance either, so the
+	 * next frame is offered the same coding type again. force_IDR_frame
+	 * likewise re-arms itself, being cleared only once a picture has been
+	 * coded. A type that arrived on the raw frame would otherwise expire
+	 * with it, so that one is carried forward explicitly. */
+	if ((requested_frame_type == IMX_VPU_API_FRAME_TYPE_I)
+	 || (requested_frame_type == IMX_VPU_API_FRAME_TYPE_IDR))
+	{
+		encoder->postponed_frame_type = requested_frame_type;
+		IMX_VPU_API_INFO("the intra picture is deferred to the next frame, not dropped");
+	}
+
+	encoder->skipped_frame_context = encoder->staged_raw_frame.context;
+	encoder->skipped_frame_pts = encoder->staged_raw_frame.pts;
+	encoder->skipped_frame_dts = encoder->staged_raw_frame.dts;
+	encoder->skipped_frame_available = TRUE;
+
+	/* has_header is cleared only when a picture is handed out with the
+	 * header attached, so it stays pending for the next one; the size
+	 * accumulated for it above belongs to that picture and not to this one,
+	 * which is not being sent. */
+	*encoded_frame_size = 0;
+	encoder->num_bytes_in_stream_buffer = 0;
+
+	*output_code = IMX_VPU_API_ENC_OUTPUT_CODE_FRAME_SKIPPED;
+	ret = IMX_VPU_API_ENC_RETURN_CODE_OK;
 
 finish:
 	if (encoder->staged_raw_frame_set)

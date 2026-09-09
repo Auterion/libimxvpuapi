@@ -783,7 +783,12 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_get_encoded_frame_ext(ImxVpuApiEncoder *
 	/* Copy encoded frame metadata. */
 
 	encoded_frame->data_size = encoder->encoded_frame_data_size;
-	encoded_frame->has_header = (encoder->encoded_frame_type == IMX_VPU_API_FRAME_TYPE_IDR);
+	/* What this frame actually carries, from either source: the parameter
+	 * sets the library prepends, or the ones the vendor writes into every
+	 * IDR itself. Reported honestly because callers gate on it - a stale
+	 * TRUE tells a caller the sets are there when they are not. */
+	encoded_frame->has_header = encoder->must_prepend_header_data
+	                         || (encoder->encoded_frame_type == IMX_VPU_API_FRAME_TYPE_IDR);
 	encoded_frame->frame_type = encoder->encoded_frame_type;
 	encoded_frame->context = encoder->encoded_frame_context;
 	encoded_frame->pts = encoder->encoded_frame_pts;
@@ -1667,25 +1672,60 @@ H1H264Encoder;
  * its own QP as a delta against it. Prepending the older sets makes a decoder
  * dequantise against the wrong initial QP - a stream that parses cleanly and
  * decodes to nothing like the input. */
-static void h1_h264_recapture_header(H1H264Encoder *encoder, size_t header_size)
+/* Take the parameter sets h1_h264_restart() has just written out of the stream
+ * buffer, which the next encode overwrites. Staged rather than installed
+ * directly, because the attempt they belong to may still fail, and then the
+ * picture that gets kept is the previous one, coded against the previous
+ * parameter sets. Returns NULL if there is nothing to copy. */
+static uint8_t *h1_h264_stage_header(H1H264Encoder *encoder, size_t header_size)
 {
 	ImxVpuApiEncoder *base = encoder->base;
 	uint8_t *fresh;
 
 	if (header_size == 0)
-		return;
+		return NULL;
 
 	fresh = malloc(header_size);
 	if (fresh == NULL)
-		return;
+		return NULL;
 
 	imx_dma_buffer_start_sync_session(base->stream_buffer);
 	memcpy(fresh, base->stream_buffer_virtual_address, header_size);
 	imx_dma_buffer_stop_sync_session(base->stream_buffer);
 
+	return fresh;
+}
+
+
+/* Make a staged copy the header that goes out with this picture.
+ *
+ * Sending it is not optional. A restart writes parameter sets whose
+ * pic_init_qp follows the QP the picture is being re-encoded at, and the
+ * encoder then computes every subsequent slice_qp_delta against that new
+ * base. A decoder still holding the previous parameter sets therefore
+ * reconstructs every following picture at the wrong QP, by exactly the
+ * difference between the two pic_init_qp values, until something else
+ * replaces them.
+ *
+ * Measured before this was fixed, on the still/motion clip at 6000 kbps in
+ * IDR mode: the bootstrap ladder ended at QP 36 and a later one at QP 31, the
+ * second set never went out, and every picture from there on decoded 5 QP
+ * steps coarser than the rate control had asked for - 12 to 19 dB PSNR where
+ * the same content in GDR mode gets 30. Worse, once the rate control asked
+ * for more than 46 the stale base pushed the reconstructed QP past 51, which
+ * is not a legal h.264 QP at all: the decoder rejected those slices outright
+ * and dropped 211 of 1320 pictures. */
+static void h1_h264_install_header(H1H264Encoder *encoder, uint8_t *staged, size_t header_size)
+{
+	ImxVpuApiEncoder *base = encoder->base;
+
+	if (staged == NULL)
+		return;
+
 	free(base->header_data);
-	base->header_data = fresh;
+	base->header_data = staged;
 	base->header_data_size = header_size;
+	base->must_prepend_header_data = TRUE;
 }
 
 
@@ -2331,6 +2371,62 @@ static ImxVpuApiEncReturnCodes h1_h264_open_encoder(ImxVpuApiEncoder *base, void
 			{
 				encoder->new_cbr_active = TRUE;
 
+				/* The frame skipping valve on this encoder is the forecast
+				 * only, and it is armed by default here rather than in
+				 * ext_rate_control_init() because the reason is this
+				 * hardware and not the controller.
+				 *
+				 * The VC8000E decides on the measured size of the coded
+				 * picture and discards it if it does not fit, which is exact.
+				 * That is not available here: H264EncStrmEncode() rotates the
+				 * reference buffer, bumps frameCnt and bumps the slice
+				 * header's frameNum, all inside the call and with no separate
+				 * "advance" step to withhold. Discarding a picture afterwards
+				 * would leave this encoder predicting from a reconstruction
+				 * the decoder never received, and leave a frameNum gap the
+				 * decoder reads as a lost frame. So the decision has to be
+				 * taken before the encode, from the content model, and it is
+				 * therefore a forecast: it bounds the buffer in the common
+				 * case but cannot promise what the measured rule promises.
+				 *
+				 * ext_rate_control_should_drop() is deliberately never called
+				 * on this encoder. */
+				if (getenv("EXT_RC_SKIP_PREDICT") == NULL)
+					encoder->new_cbr.skip_predict = 1;
+
+				/* And the run limit is raised, for this encoder only.
+				 *
+				 * The controller's default refuses no more pictures in a row
+				 * than the buffer holds frame budgets, on the reasoning that
+				 * further refusals cannot free any more room. That holds
+				 * while the bucket is at most full, which on the VC8000E it
+				 * is, because its re-encode ladder bounds every picture.
+				 *
+				 * Here it is not. A predicted picture cannot be re-encoded on
+				 * this hardware, so a scene cut lands whole: measured at 28
+				 * to 39 frame budgets on the stress clip, into a buffer of
+				 * three. The bucket is then many budgets past the cap and
+				 * every further skip does buy one back, so the buffer-derived
+				 * limit throttles exactly the recovery it should allow. A
+				 * quarter of a second is the liveness bound that actually
+				 * matters - about as long as a stall can last before it reads
+				 * as a stall rather than a stutter.
+				 *
+				 * Measured on the stress clip, raising it from 4 to 8 is
+				 * better on both axes at once: p95 buffer occupancy 352 ->
+				 * 238 ms at 6000 kbps and 1018 -> 918 ms at 1400 kbps, while
+				 * dropping *fewer* pictures (347 against 356, 185 against
+				 * 218). A buffer left hovering just over the cap refuses four
+				 * pictures in every five indefinitely; one longer run drains
+				 * it and stops. */
+				if (getenv("EXT_RC_SKIP_MAX") == NULL)
+				{
+					unsigned int const fps = (unsigned int)(encoder->new_cbr.frame_rate + 0.5);
+					unsigned int run = (fps + 3) / 4;
+					if (run < 1) run = 1;
+					encoder->new_cbr.skip_max_run = run;
+				}
+
 				/* Everything that would otherwise decide a QP is switched off,
 				 * because the QP comes from ext_rate_control_pre() instead and
 				 * any second opinion silently overrides it. mbRc in particular
@@ -2362,7 +2458,7 @@ static ImxVpuApiEncReturnCodes h1_h264_open_encoder(ImxVpuApiEncoder *base, void
 				                   ? encoder->new_cbr.qp_min_intra : encoder->new_cbr.qp_min_inter;
 				rate_control.qpMax = (encoder->new_cbr.qp_max_intra > encoder->new_cbr.qp_max_inter)
 				                   ? encoder->new_cbr.qp_max_intra : encoder->new_cbr.qp_max_inter;
-				rate_control.qpHdr = ext_rate_control_pre(&(encoder->new_cbr), 1);
+				rate_control.qpHdr = ext_rate_control_pre(&(encoder->new_cbr), 1, 0);
 
 				IMX_VPU_API_INFO("new CBR: %u kbps, %.2f fps, %.0f kbit HRD buffer (%.0f ms at this rate), QP %d..%d",
 				                 open_params->bitrate,
@@ -2684,6 +2780,22 @@ static ImxVpuApiEncReturnCodes h1_h264_encode_frame(void *h1_encoder, ImxVpuApiF
 		encoder->base->encoded_frame_is_sync_point = FALSE;
 		if (frame_type == IMX_VPU_API_FRAME_TYPE_UNKNOWN)
 			frame_type = IMX_VPU_API_FRAME_TYPE_P;
+
+		/* Re-send the parameter sets once per GOP, so a receiver that joined
+		 * late or lost them can start decoding. Only in this mode: there is
+		 * no IDR here to carry them, whereas the vendor writes them into
+		 * every IDR itself, and adding a copy there would put two sets on
+		 * the link.
+		 *
+		 * It has to come from the library rather than from gstimxvpuenc,
+		 * which used to append a cached copy every gop-size frames. That
+		 * happened after imx_vpu_api_enc_get_encoded_frame_ext() had
+		 * returned and the bits had been accounted, so the rate control was
+		 * never charged for them: 89 bytes onto the link per GOP that the
+		 * leaky bucket could not see. */
+		if ((base->open_params.gop_size > 0)
+		 && ((encoder->gop_frame_counter % base->open_params.gop_size) == 0))
+			base->must_prepend_header_data = TRUE;
 	}
 	else if ((encoder->gop_frame_counter % base->open_params.gop_size) == 0)
 	{
@@ -2748,6 +2860,28 @@ static ImxVpuApiEncReturnCodes h1_h264_encode_frame(void *h1_encoder, ImxVpuApiF
 		int sei_refresh = 0, sei_top = 0, sei_bottom = 0;
 
 		encoder->recovery_sei_size = 0;
+
+		/* The valve, such as this encoder can have one. Taken here, before
+		 * the refresh sweep below steps and before the picture is handed to
+		 * the hardware at all: nothing has moved yet, so there is nothing to
+		 * roll back and no reference to get out of step. An intra picture is
+		 * never refused, and neither is the first picture of the stream,
+		 * which carries the parameter sets. */
+		if (encoder->new_cbr_active && !is_intra && (encoder->num_encoded_pictures > 0)
+		 && ext_rate_control_should_skip(&(encoder->new_cbr), 0))
+		{
+			ext_rate_control_skip(&(encoder->new_cbr), 0, 0, NULL);
+
+			/* The caller turns this into
+			 * IMX_VPU_API_ENC_OUTPUT_CODE_FRAME_SKIPPED and finishes the
+			 * queued frame, which is the same path the hardware's own
+			 * H264ENC_NOTCODED_FRAME takes. num_encoded_pictures is not
+			 * advanced, so the next input frame takes this picture's place in
+			 * the GOP. */
+			*encoded_frame_size = 0;
+			*encoded_frame_type = IMX_VPU_API_FRAME_TYPE_SKIP;
+			return IMX_VPU_API_ENC_RETURN_CODE_OK;
+		}
 
 		/* The refresh sweep. An intra picture refreshes everything by
 		 * itself, so the sweep sits that one out without losing its place -
@@ -2827,7 +2961,9 @@ static ImxVpuApiEncReturnCodes h1_h264_encode_frame(void *h1_encoder, ImxVpuApiF
 		/* New CBR: pick this picture's QP before handing it to the encoder. */
 		if (encoder->new_cbr_active)
 		{
-			int const qp = ext_rate_control_pre(&(encoder->new_cbr), is_intra);
+			int const qp = ext_rate_control_pre(&(encoder->new_cbr), is_intra,
+			                                    (base->must_prepend_header_data
+			                                     ? base->header_data_size : 0) * 8);
 
 			encoder->cached_rate_ctrl.qpHdr = qp;
 			enc_ret = H264EncSetRateCtrl(encoder->handle, &(encoder->cached_rate_ctrl));
@@ -2887,7 +3023,9 @@ static ImxVpuApiEncReturnCodes h1_h264_encode_frame(void *h1_encoder, ImxVpuApiF
 			size_t bits = (size_t)(encoder_output.streamSize) * 8;
 			int qp;
 
-			while ((qp = ext_rate_control_check(&(encoder->new_cbr), bits, 1)) > 0)
+			while ((qp = ext_rate_control_check(&(encoder->new_cbr), bits,
+			                                    (base->must_prepend_header_data
+			                                     ? base->header_data_size : 0) * 8, 1)) > 0)
 			{
 				H264EncOut retry_output;
 
@@ -2897,19 +3035,25 @@ static ImxVpuApiEncReturnCodes h1_h264_encode_frame(void *h1_encoder, ImxVpuApiF
 				                    &header_size) != IMX_VPU_API_ENC_RETURN_CODE_OK)
 					return IMX_VPU_API_ENC_RETURN_CODE_ERROR;
 
-				/* Before the encode below overwrites the stream buffer, and
-				 * unconditionally: this picture is coded against the QP in
-				 * the parameter sets the restart just wrote. */
-				h1_h264_recapture_header(encoder, header_size);
+				/* Before the encode below overwrites the stream buffer. */
+				uint8_t *staged = h1_h264_stage_header(encoder, header_size);
 
 				memset(&retry_output, 0, sizeof(retry_output));
 				if (H264EncStrmEncode(encoder->handle, &(encoder->input), &retry_output,
 				                      NULL, NULL, NULL) != H264ENC_FRAME_READY)
 				{
+					/* The kept picture is the previous attempt, which was coded
+					 * against the previous parameter sets, so these do not
+					 * describe it and must not go out. */
+					free(staged);
 					IMX_VPU_API_WARNING("re-encode at QP %d did not produce a picture; "
 					                    "keeping the previous attempt", qp);
 					break;
 				}
+
+				/* This attempt is the one being kept, so its parameter sets are
+				 * the ones that describe it and every picture after it. */
+				h1_h264_install_header(encoder, staged, header_size);
 
 				IMX_VPU_API_DEBUG("new CBR: intra picture %" PRIu32 " re-encoded at QP %d, "
 				                  "%u -> %u bits", encoder->num_encoded_pictures, qp,
@@ -2953,7 +3097,9 @@ static ImxVpuApiEncReturnCodes h1_h264_encode_frame(void *h1_encoder, ImxVpuApiF
 		int const coded_intra = (encoder_output.codingType == H264ENC_INTRA_FRAME)
 		                     || (encoder_output.codingType == H264ENC_NONIDR_INTRA_FRAME);
 
-		ext_rate_control_post(&(encoder->new_cbr), bits, coded_intra, NULL);
+		ext_rate_control_post(&(encoder->new_cbr), bits,
+		                      (base->must_prepend_header_data ? base->header_data_size : 0) * 8,
+		                      coded_intra, NULL);
 
 		IMX_VPU_API_LOG("new CBR: picture %" PRIu32 " qp %d target %d bits %u HRD buffer %.0f/%.0f kbit",
 		                encoder->num_encoded_pictures,

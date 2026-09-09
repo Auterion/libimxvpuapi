@@ -161,6 +161,43 @@ typedef struct
 	double debt_t[3], debt_f[3];
 	unsigned int debt_n[3];
 
+	/* --- the frame skipping valve --- */
+	/* The re-encode ladder in ext_rate_control_check() ends at qp_max, and
+	 * past that rung the controller has no authority left. If the content
+	 * still needs more bits than the buffer can take, every further picture
+	 * goes in on top of a buffer that is already full and the queue - which
+	 * is the latency - grows without bound.
+	 *
+	 * That failure is invisible in a mean bitrate. Measured on the
+	 * still/motion stress clip at 1400 kbps into a 107 ms buffer with
+	 * qp_max pinned at its own median of 44: the stream came out at -4.5%
+	 * of target, which looks healthy, while p95 buffer occupancy was
+	 * 1025 ms and 619 of 1320 pictures overflowed. The bits were not too
+	 * many, they were in the wrong place in time.
+	 *
+	 * So the last rung is to not code the picture at all. This is a bypass
+	 * valve and not a rate control tool: it trades frame rate for latency
+	 * at the point where there is nothing left to trade quality for, and it
+	 * is meant never to open on an operating point that is actually
+	 * feasible.
+	 *
+	 * skip_enable turns the valve off. skip_room_share scales its threshold
+	 * in units of the room the buffer has left, so below 1.0 the valve
+	 * opens before a picture would strictly have overflowed. skip_max_run
+	 * bounds how many pictures in a row it may refuse, so the stream can
+	 * never stop. */
+	int skip_enable;
+	/* The valve's two decision points, separately disableable. Both are on
+	 * by default and both change which pictures are refused - see
+	 * ext_rate_control_init(). */
+	int skip_predict, skip_drop;
+	double skip_room_share;
+	unsigned int skip_max_run;
+	/* How many times ext_rate_control_check() may re-encode one picture
+	 * before accepting whatever it has. Shared with the valve, which treats
+	 * reaching it as the quantiser having run out of moves. */
+	int cap_attempt_limit;
+
 	/* --- state --- */
 	/* Bits handed to the link that it has not drained yet. */
 	double bucket;
@@ -177,6 +214,9 @@ typedef struct
 	 * pictures of evidence have accumulated for the next step up. */
 	double debt_fill_now;
 	unsigned int debt_err_run;
+	/* Pictures the valve has refused back to back. Reset by the next
+	 * picture that is coded. */
+	unsigned int skip_run;
 	/* Cost of one coded block at Qstep 1, smoothed, and the previous
 	 * picture's cost derived from it. */
 	double cplx_per_block, cplx_prev, cplx_ema;
@@ -209,6 +249,12 @@ typedef struct
 	double sum_lift;
 	/* Sum of the repayment ceiling actually used, for reporting its mean. */
 	double sum_fill_used;
+	/* Pictures the valve refused to send, how many of those had been encoded
+	 * first and were then discarded on their measured size rather than
+	 * refused on the forecast, and the longest run. */
+	unsigned long num_skipped;
+	unsigned long num_dropped;
+	unsigned int max_skip_run;
 	double sum_bits;
 	double sum_fill;
 	double max_fill;
@@ -220,20 +266,89 @@ ExtRateControl;
  * (no bitrate, no frame rate, no frame size). */
 int ext_rate_control_init(ExtRateControl *rc, ExtRateControlParams const *params);
 
-/* QP to encode the next picture at. */
-int ext_rate_control_pre(ExtRateControl *rc, int is_intra);
+/* QP to encode the next picture at. overhead_bits is what the caller will
+ * prepend to this picture on its way to the link - parameter sets, prefix SEI
+ * - and is taken off the picture's budget so that the access unit as a whole
+ * lands on the target. Pass 0 if the picture is the whole access unit. */
+int ext_rate_control_pre(ExtRateControl *rc, int is_intra, size_t overhead_bits);
 
 /* Bits the rate control aimed for. Valid after ext_rate_control_pre();
  * for logging and diagnostics only. */
 int ext_rate_control_target(ExtRateControl const *rc);
 
-/* Call with the size of the picture just encoded. Returns a QP to re-encode
- * it at, or 0 to keep it. Loop until it returns 0. */
-int ext_rate_control_check(ExtRateControl *rc, size_t bits, int is_intra);
+/* Call with the size of the picture just encoded, and with whatever the
+ * caller will prepend to it on the way to the link. Returns a QP to re-encode
+ * it at, or 0 to keep it. Loop until it returns 0.
+ *
+ * The ceiling is applied to the two together, because that is what the buffer
+ * has to hold; the QP gradient is learned from the picture alone. */
+int ext_rate_control_check(ExtRateControl *rc, size_t bits, size_t overhead_bits, int is_intra);
 
-/* Call once per picture with the attempt that was kept. cu_stats may be NULL,
- * in which case the picture is assumed to have coded every block. */
-void ext_rate_control_post(ExtRateControl *rc, size_t bits, int is_intra, ExtRateControlStats const *cu_stats);
+/* Call once per picture with the attempt that was kept. bits is the coded
+ * picture; overhead_bits is everything else the access unit carries onto the
+ * link - parameter sets, prefix SEI - which the leaky bucket is charged for
+ * and the content model is not. cu_stats may be NULL, in which case the
+ * picture is assumed to have coded every block. */
+void ext_rate_control_post(ExtRateControl *rc, size_t bits, size_t overhead_bits, int is_intra, ExtRateControlStats const *cu_stats);
+
+/* Whether the next picture should be skipped rather than coded, because even
+ * at the coarsest quantiser allowed it cannot be made to fit in the buffer.
+ *
+ * Call this *before* advancing anything that carries per-picture state - an
+ * intra refresh sweep, a GOP position, a picture counter - because a skipped
+ * picture has to leave all of it exactly where it was, so that the next
+ * picture takes the slot this one would have had.
+ *
+ * Never true for an intra picture: there is nothing to predict one from. The
+ * measured rule takes those, and defers rather than drops them.
+ *
+ * Pure: it reads rc and changes nothing. Tell the controller what was
+ * actually done with ext_rate_control_skip().
+ *
+ * This runs before the encode, so all it has to go on is the content model.
+ * Its purpose is to save an encode when the answer is already obvious, but it
+ * is not merely an optimisation on top of ext_rate_control_should_drop(): a
+ * picture refused here is never measured, so the content model does not move
+ * for it and later pictures are quantised differently. The two paths select
+ * different pictures, and having both is measurably better than either -
+ * see ext_rate_control_init(). */
+int ext_rate_control_should_skip(ExtRateControl const *rc, int is_intra);
+
+/* The rule itself: whether the picture that was just encoded must be
+ * discarded rather than sent, because the quantiser is already at its maximum
+ * and the picture still does not fit in the buffer. Nothing is predicted
+ * here - these are the bits the encoder produced.
+ *
+ * Discarding is safe as long as the caller has not yet advanced the coded
+ * picture's own bookkeeping: the next input frame is then encoded in the slot
+ * this one would have had, predicting from the same reference picture and
+ * overwriting the discarded reconstruction, so the encoder and the decoder
+ * stay in step. Advancing first and discarding afterwards would leave the
+ * encoder predicting from a picture the decoder never received.
+ *
+ * This applies to intra pictures too, and for them the caller must read it
+ * as "defer", not "drop": re-arm the intra request so the next picture coded
+ * carries it. An intra picture is the only one a decoder can start from, so it
+ * must never be lost - but it can arrive a frame or two later, and it has to
+ * be allowed to, because an intra picture the quantiser cannot shrink to fit
+ * is otherwise a guaranteed buffer overflow. A periodic IDR at a scene cut is
+ * exactly that: measured at 222 kbit against 122 kbit of buffer with
+ * qp_max_intra already reached. The run limit bounds the deferral, so the
+ * picture is always coded in the end.
+ *
+ * Pure, like should_skip(). Report what was done with
+ * ext_rate_control_skip(). */
+int ext_rate_control_should_drop(ExtRateControl const *rc, size_t bits, int is_intra);
+
+/* Account for a picture the caller did not send. The link drains over that
+ * picture's period, and that drain is the entire mechanism - it is how
+ * skipping buys the buffer back. The bucket is never charged the bits.
+ *
+ * bits is 0 for a picture that was never encoded, and the coded size for one
+ * that was encoded and then discarded; in the second case the measurement is
+ * still fed to the content model, because it describes the content whether or
+ * not the picture is sent. cu_stats may be NULL. */
+void ext_rate_control_skip(ExtRateControl *rc, int is_intra, size_t bits, ExtRateControlStats const *cu_stats);
 
 /* Retarget at a new link rate. The bucket keeps both its level and its size:
  * the level is a debt already incurred and is still owed, and the size is how
