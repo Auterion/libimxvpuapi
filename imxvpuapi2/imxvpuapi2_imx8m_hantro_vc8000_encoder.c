@@ -853,7 +853,9 @@ static ImxVpuApiEncReturnCodes init_vcenc_instance(ImxVpuApiEncoder *encoder,
 		preprocessing_config.xOffset = 0;
 		preprocessing_config.yOffset = 0;
 		preprocessing_config.inputType = encoder_pixel_format;
-		preprocessing_config.rotation = VCENC_ROTATE_0;
+		/* The VC8000E PP rotates in its internal RGB domain while reading the
+		 * input frame: no extra DDR pass, chroma-exact for any input format. */
+		preprocessing_config.rotation = open_params->rotation_180 ? VCENC_ROTATE_180R : VCENC_ROTATE_0;
 		preprocessing_config.mirror = VCENC_MIRROR_NO;
 		preprocessing_config.colorConversion.type = VCENC_RGBTOYUV_BT601_FULL_RANGE;
 		preprocessing_config.input_alignment = INPUT_ALIGNMENT;

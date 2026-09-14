@@ -2295,8 +2295,16 @@ typedef struct
 	 * cost; quality plateaus around 16. Only affects use-intra-refresh (GDR) mode. */
 	uint8_t gdr_refresh_period;
 
+	/* If nonzero, the encoder pre-processor rotates the picture by 180 degrees
+	 * during encode ingest (VC8000E VCENC_ROTATE_180R). The PP rotates while
+	 * reading the input frame, so the rotation adds no extra DDR pass and is
+	 * chroma-exact for any input format. 90-degree rotations are not exposed:
+	 * they would swap the coded width/height versus the negotiated input.
+	 * Only implemented for the VC8000E (i.MX8MP); other encoders ignore it. */
+	uint8_t rotation_180;
+
 	/* Reserved bytes for ABI compatibility. */
-	uint8_t reserved[IMX_VPU_API_RESERVED_SIZE - sizeof(unsigned int) - sizeof(int) - sizeof(uint32_t) - sizeof(uint16_t) - sizeof(uint16_t) - sizeof(int8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t)  - sizeof(uint8_t)];
+	uint8_t reserved[IMX_VPU_API_RESERVED_SIZE - sizeof(unsigned int) - sizeof(int) - sizeof(uint32_t) - sizeof(uint16_t) - sizeof(uint16_t) - sizeof(int8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t) - sizeof(uint8_t)  - sizeof(uint8_t) - sizeof(uint8_t)];
 }
 ImxVpuApiEncOpenParams;
 
