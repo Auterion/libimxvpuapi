@@ -1640,6 +1640,10 @@ typedef struct
 	ExtRateControl new_cbr;
 
 	BOOL refresh_active;
+	/* An out-of-order full-picture refresh is owed, because a keyframe was
+	 * asked for while sweeping. Cleared only once the picture carrying it
+	 * has been coded, so a skipped picture cannot lose it. */
+	BOOL pending_full_refresh;
 	ImxVpuApiIntraRefreshCfg refresh_cfg;
 	ImxVpuApiIntraRefreshState refresh_state;
 
@@ -2356,6 +2360,10 @@ static ImxVpuApiEncReturnCodes h1_h264_open_encoder(ImxVpuApiEncoder *base, void
 			ExtRateControlParams rc_params;
 
 			imx_vpu_api_enc_session_rc_params(&rc_params, open_params);
+			/* Whole intra pictures, or a sweep? The controller treats a
+			 * keyframe it cannot fit differently in each case, and only
+			 * the encoder knows which mechanism the plan resolved to. */
+			rc_params.keyframe_mode = !encoder->refresh_active;
 
 			if (ext_rate_control_init(&(encoder->new_cbr), &rc_params) != 0)
 			{
@@ -2836,6 +2844,20 @@ static ImxVpuApiEncReturnCodes h1_h264_encode_frame(void *h1_encoder, ImxVpuApiF
 	else
 		encoder->base->encoded_frame_is_sync_point = FALSE;
 
+	/* Sweeping a refresh, a keyframe request is served with one picture coded
+	 * entirely intra rather than with an IDR - the same rule as on the
+	 * VC8000E, and for the same reasons: an IDR is the bitrate spike the
+	 * sweep exists to avoid, and it resets the reference structure too. */
+	if (encoder->refresh_active && !encoder->is_first_frame
+	 && ((frame_type == IMX_VPU_API_FRAME_TYPE_I)
+	  || (frame_type == IMX_VPU_API_FRAME_TYPE_IDR)))
+	{
+		IMX_VPU_API_DEBUG("refresh mode: keyframe request served as an out-of-order "
+		                  "full-picture refresh rather than an IDR");
+		encoder->pending_full_refresh = TRUE;
+		frame_type = IMX_VPU_API_FRAME_TYPE_UNKNOWN;
+	}
+
 	switch (frame_type)
 	{
 		case IMX_VPU_API_FRAME_TYPE_I:
@@ -2867,10 +2889,16 @@ static ImxVpuApiEncReturnCodes h1_h264_encode_frame(void *h1_encoder, ImxVpuApiF
 		 * roll back and no reference to get out of step. An intra picture is
 		 * never refused, and neither is the first picture of the stream,
 		 * which carries the parameter sets. */
-		if (encoder->new_cbr_active && !is_intra && (encoder->num_encoded_pictures > 0)
-		 && ext_rate_control_should_skip(&(encoder->new_cbr), 0))
+		if (encoder->new_cbr_active && (encoder->num_encoded_pictures > 0)
+		 && ((!is_intra && ext_rate_control_should_skip(&(encoder->new_cbr), 0))
+		  || (is_intra && !ext_rate_control_keyframe_ready(&(encoder->new_cbr)))))
 		{
-			ext_rate_control_skip(&(encoder->new_cbr), 0, 0, NULL);
+			/* A keyframe the buffer has no room for is deferred rather than
+			 * coarsened: the request stays armed and this picture's period
+			 * drains a frame budget, so it lands a picture or two later at
+			 * the quantiser it was predicted at. Everything else is the
+			 * valve's forecast, which never refuses an intra picture. */
+			ext_rate_control_skip(&(encoder->new_cbr), is_intra, 0, NULL);
 
 			/* The caller turns this into
 			 * IMX_VPU_API_ENC_OUTPUT_CODE_FRAME_SKIPPED and finishes the
@@ -2890,15 +2918,29 @@ static ImxVpuApiEncReturnCodes h1_h264_encode_frame(void *h1_encoder, ImxVpuApiF
 		{
 			ImxVpuApiIntraRefreshBand band;
 
-			/* No forced region: imx_vpu_api_enc_set_intra_refresh_region()
-			 * is not implemented on this encoder, so the only source of
-			 * bands is the sweep itself. */
-			imx_vpu_api_intra_refresh_step(&(encoder->refresh_state), &(encoder->refresh_cfg),
-			                               0, 0, &band);
-
-			if (band.recovery_count > 0)
+			if (encoder->pending_full_refresh)
+			{
+				/* The whole picture at once. The band spans the picture in
+				 * coding units, so every slice it is divided into comes out
+				 * intra, and a recovery point of 0 tells a decoder joining
+				 * here that it need wait for nothing. */
+				imx_vpu_api_intra_refresh_full(&(encoder->refresh_cfg), &band);
+				imx_vpu_api_intra_refresh_realign(&(encoder->refresh_state));
 				encoder->recovery_sei_size = imx_vpu_api_build_recovery_point_sei(
-					encoder->recovery_sei, band.recovery_count, 1);
+					encoder->recovery_sei, 0, 1);
+			}
+			else
+			{
+				/* No forced region: imx_vpu_api_enc_set_intra_refresh_region()
+				 * is not implemented on this encoder, so the only source of
+				 * bands is the sweep itself. */
+				imx_vpu_api_intra_refresh_step(&(encoder->refresh_state), &(encoder->refresh_cfg),
+				                               0, 0, &band);
+
+				if (band.recovery_count > 0)
+					encoder->recovery_sei_size = imx_vpu_api_build_recovery_point_sei(
+						encoder->recovery_sei, band.recovery_count, 1);
+			}
 
 			if (band.apply)
 			{
@@ -3108,6 +3150,11 @@ static ImxVpuApiEncReturnCodes h1_h264_encode_frame(void *h1_encoder, ImxVpuApiF
 		                (unsigned int)bits,
 		                encoder->new_cbr.bucket / 1000.0, encoder->new_cbr.bucket_cap / 1000.0);
 	}
+
+	/* The out-of-order refresh has been coded, so it is no longer owed. Down
+	 * here and not at the decision: a picture the rate control refused must
+	 * leave the request armed for the next one. */
+	encoder->pending_full_refresh = FALSE;
 
 	encoder->num_encoded_pictures++;
 	encoder->is_first_frame = FALSE;

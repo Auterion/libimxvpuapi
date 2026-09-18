@@ -97,6 +97,19 @@ typedef struct
 	 * range, and an arbitrary floor pins it there and starves the stream. */
 	unsigned int qp_min_inter, qp_max_inter;
 	unsigned int qp_min_intra, qp_max_intra;
+
+	/* Non-zero when the encoder places whole intra pictures - a periodic or
+	 * requested IDR - and zero when it sweeps an intra refresh instead.
+	 *
+	 * It changes what happens to an intra picture the buffer cannot take.
+	 * Sweeping, every picture carries a band and no single one is large, so
+	 * the ordinary ladder applies. Placing whole intra pictures, the
+	 * ladder's only move is to coarsen the one picture a decoder can start
+	 * from, and coarsening it repeatedly as the buffer slowly drains is
+	 * visible as a quality pulse on every keyframe. So in that mode the
+	 * controller drains the buffer first and codes the picture after -
+	 * see ext_rate_control_keyframe_ready(). */
+	unsigned int keyframe_mode;
 }
 ExtRateControlParams;
 
@@ -118,6 +131,7 @@ typedef struct
 	double cap_share;
 	int qp_min_inter, qp_max_inter;
 	int qp_min_intra, qp_max_intra;
+	int keyframe_mode;
 
 	/* --- tuning; see ext_rate_control_init() for what each one does --- */
 	double gain, setpoint, target_min, target_max;
@@ -217,6 +231,28 @@ typedef struct
 	/* Pictures the valve has refused back to back. Reset by the next
 	 * picture that is coded. */
 	unsigned int skip_run;
+
+	/* --- placing a keyframe into a buffer that is too full --- */
+	/* What the last coded intra picture cost, in bits. This is the forecast
+	 * for the next one: an intra picture has no content model of its own to
+	 * be predicted from - that is why the predictive valve never refuses
+	 * one - but the previous intra picture of the same stream is a far
+	 * better estimate than nothing, and it is the only one available before
+	 * the encode.
+	 *
+	 * Deciding before the encode is not forced - both encoders can redo a
+	 * keyframe - but it is what saves the work: an encode whose result is
+	 * already known not to fit costs a full picture on the hardware and, on
+	 * H1, a vendor instance restart per attempt.
+	 *
+	 * 0 until an intra picture has been coded, which reads as "no forecast",
+	 * and the keyframe is then placed without waiting. */
+	double last_intra_bits;
+	/* Bits an intra picture is waiting for room for. Non-zero means pictures
+	 * are being skipped to drain the buffer and the keyframe request is
+	 * still outstanding; the run is bounded by skip_max_run like any other
+	 * refusal, so the picture is always coded in the end. */
+	double intra_drain_bits;
 	/* Cost of one coded block at Qstep 1, smoothed, and the previous
 	 * picture's cost derived from it. */
 	double cplx_per_block, cplx_prev, cplx_ema;
@@ -254,6 +290,10 @@ typedef struct
 	 * refused on the forecast, and the longest run. */
 	unsigned long num_skipped;
 	unsigned long num_dropped;
+	/* Times the buffer had to be drained before a keyframe could be placed,
+	 * and pictures spent doing it. */
+	unsigned long num_intra_drains;
+	unsigned long num_intra_drain_pics;
 	unsigned int max_skip_run;
 	double sum_bits;
 	double sum_fill;
@@ -326,6 +366,16 @@ int ext_rate_control_should_skip(ExtRateControl const *rc, int is_intra);
  * stay in step. Advancing first and discarding afterwards would leave the
  * encoder predicting from a picture the decoder never received.
  *
+ * An intra picture is the one every encoder can redo, whatever else it
+ * cannot. Discarding or re-encoding an *inter* picture needs the encoder to
+ * roll back its reference state, which not all of them can - H1 commits
+ * frameCnt, frameNum and the reference rotation inside H264EncStrmEncode().
+ * An intra picture has no reference dependency, so on that hardware it is
+ * redone by restarting the vendor instance, which is byte-deterministic for
+ * the same input (see h1_h264_restart()). So the keyframe rules below apply
+ * uniformly: both encoders can re-encode a keyframe as many times as asked,
+ * and only predicted pictures differ.
+ *
  * This applies to intra pictures too, and for them the caller must read it
  * as "defer", not "drop": re-arm the intra request so the next picture coded
  * carries it. An intra picture is the only one a decoder can start from, so it
@@ -349,6 +399,30 @@ int ext_rate_control_should_drop(ExtRateControl const *rc, size_t bits, int is_i
  * still fed to the content model, because it describes the content whether or
  * not the picture is sent. cu_stats may be NULL. */
 void ext_rate_control_skip(ExtRateControl *rc, int is_intra, size_t bits, ExtRateControlStats const *cu_stats);
+
+/* Bits the HRD buffer can still take right now, i.e. what one picture may
+ * add without overflowing it. Never negative. Pure. */
+double ext_rate_control_room(ExtRateControl const *rc);
+
+/* Whether an intra picture can be placed in the next coded picture, or
+ * whether the caller should skip pictures to drain the buffer first.
+ *
+ * Returns non-zero when the keyframe should be coded now. Returns zero to ask
+ * the caller to skip this input picture - without encoding it, and leaving the
+ * keyframe request armed - so that the buffer drains by one frame budget and
+ * the question can be asked again on the next one.
+ *
+ * Only ever zero in keyframe mode, and only while a forecast exists and the
+ * buffer has less room than that forecast. Sweeping an intra refresh, a
+ * keyframe is a band rather than a whole picture and this always says yes.
+ *
+ * Liveness is bounded by skip_max_run, the same limit the valve uses: once it
+ * is reached this says yes regardless, so a keyframe can never be withheld
+ * indefinitely.
+ *
+ * Pure. Report a picture skipped for this reason with
+ * ext_rate_control_skip(), which is also what advances the drain. */
+int ext_rate_control_keyframe_ready(ExtRateControl const *rc);
 
 /* Retarget at a new link rate. The bucket keeps both its level and its size:
  * the level is a debt already incurred and is still owed, and the size is how

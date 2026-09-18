@@ -278,6 +278,11 @@ struct _ImxVpuApiEncoder
 	 * gdrDuration. That is what this encoder did before any of the above, and
 	 * what rate_control_mode 0 still gets, down to the bytes. */
 	BOOL refresh_active;
+	/* An out-of-order full-picture refresh is owed, because a keyframe was
+	 * asked for while sweeping. Survives a skipped or discarded picture -
+	 * it is cleared only once the picture carrying it has been coded - so
+	 * the refresh cannot be lost to the rate control deferring a frame. */
+	BOOL pending_full_refresh;
 	BOOL vendor_gdr_active;
 	ImxVpuApiIntraRefreshCfg refresh_cfg;
 	ImxVpuApiIntraRefreshState refresh_state;
@@ -1149,6 +1154,10 @@ static ImxVpuApiEncReturnCodes init_vcenc_instance(ImxVpuApiEncoder *encoder,
 			ExtRateControlParams rc_params;
 
 			imx_vpu_api_enc_session_rc_params(&rc_params, open_params);
+			/* Whole intra pictures, or a sweep? The controller treats a
+			 * keyframe it cannot fit differently in each case, and only
+			 * the encoder knows which mechanism the plan resolved to. */
+			rc_params.keyframe_mode = !encoder->refresh_active;
 
 			if (ext_rate_control_init(&encoder->new_cbr, &rc_params) != 0)
 			{
@@ -2354,6 +2363,24 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 		requested_frame_type = IMX_VPU_API_FRAME_TYPE_IDR;
 	}
 
+	/* Sweeping a refresh, a keyframe request is served with one picture coded
+	 * entirely intra, not with an IDR. An IDR here would be exactly the
+	 * once-per-GOP bitrate spike the sweep exists to avoid, and it would
+	 * reset the reference structure and the picture order as well. A
+	 * full-picture intra region gives a decoder the same clean start and
+	 * leaves both alone, and the refresh tick is re-anchored to it so the
+	 * sweeps that follow are aligned to this picture rather than to the
+	 * schedule it interrupted. */
+	if (encoder->refresh_active && !is_first_picture
+	 && ((requested_frame_type == IMX_VPU_API_FRAME_TYPE_I)
+	  || (requested_frame_type == IMX_VPU_API_FRAME_TYPE_IDR)))
+	{
+		IMX_VPU_API_DEBUG("refresh mode: keyframe request served as an out-of-order "
+		                  "full-picture refresh rather than an IDR");
+		encoder->pending_full_refresh = TRUE;
+		requested_frame_type = IMX_VPU_API_FRAME_TYPE_UNKNOWN;
+	}
+
 	switch (requested_frame_type)
 	{
 		case IMX_VPU_API_FRAME_TYPE_I:
@@ -2582,13 +2609,22 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 	 * Nothing is handed to the hardware, so no reference picture moves
 	 * either: the next picture predicts from the same reconstruction the
 	 * decoder is holding. */
-	if (encoder->new_cbr_active && !is_first_picture
-	 && ext_rate_control_should_skip(&(encoder->new_cbr),
-	                                 (encoder_input->codingType == VCENC_INTRA_FRAME)))
 	{
-		ext_rate_control_skip(&(encoder->new_cbr),
-		                      (encoder_input->codingType == VCENC_INTRA_FRAME), 0, NULL);
-		goto skipped;
+		int const intra_input = (encoder_input->codingType == VCENC_INTRA_FRAME);
+
+		/* Two reasons to refuse the picture before encoding it. The valve's
+		 * forecast, and - for a keyframe - the buffer simply not having room
+		 * for one yet. The second leaves the intra request armed and drains
+		 * a frame budget, so the keyframe lands a picture or two later at
+		 * the quantiser it was predicted at instead of being ground down to
+		 * fit a buffer that was briefly full. */
+		if (encoder->new_cbr_active && !is_first_picture
+		 && (ext_rate_control_should_skip(&(encoder->new_cbr), intra_input)
+		  || (intra_input && !ext_rate_control_keyframe_ready(&(encoder->new_cbr)))))
+		{
+			ext_rate_control_skip(&(encoder->new_cbr), intra_input, 0, NULL);
+			goto skipped;
+		}
 	}
 
 	int sei_refresh = 0, sei_top = 0, sei_bottom = 0;
@@ -2607,22 +2643,40 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 		 * and only take it off if the scheduler used it - it declines on
 		 * a picture the sweep itself needs, and a request that keeps
 		 * getting declined has to stay queued rather than be dropped. */
-		if (encoder->forced_intra_q_count > 0)
+		if (encoder->pending_full_refresh)
 		{
-			int const idx = encoder->forced_intra_q_head;
+			/* The whole picture, in one go. The band is expressed in coding
+			 * units and spans the picture, so however it is divided into
+			 * slices every slice of it comes out intra. */
+			imx_vpu_api_intra_refresh_full(&(encoder->refresh_cfg), &band);
+			imx_vpu_api_intra_refresh_realign(&(encoder->refresh_state));
 
-			forced_first = (int)(encoder->forced_intra_q[idx].first);
-			forced_num = (int)(encoder->forced_intra_q[idx].num);
+			/* A recovery point of 0: this picture is complete by itself, so
+			 * a decoder joining here waits for nothing. The sweep's own
+			 * recovery_count cannot express that, being a countdown. */
+			encoder->recovery_sei_size = imx_vpu_api_build_recovery_point_sei(
+				encoder->recovery_sei, 0,
+				encoder->open_params.compression_format == IMX_VPU_API_COMPRESSION_FORMAT_H264);
 		}
-
-		imx_vpu_api_intra_refresh_step(&(encoder->refresh_state), &(encoder->refresh_cfg),
-		                               forced_first, forced_num, &band);
-
-		if (band.forced)
+		else
 		{
-			encoder->forced_intra_q_head = (encoder->forced_intra_q_head + 1)
-			                             % FORCED_INTRA_QUEUE_SIZE;
-			encoder->forced_intra_q_count--;
+			if (encoder->forced_intra_q_count > 0)
+			{
+				int const idx = encoder->forced_intra_q_head;
+
+				forced_first = (int)(encoder->forced_intra_q[idx].first);
+				forced_num = (int)(encoder->forced_intra_q[idx].num);
+			}
+
+			imx_vpu_api_intra_refresh_step(&(encoder->refresh_state), &(encoder->refresh_cfg),
+			                               forced_first, forced_num, &band);
+
+			if (band.forced)
+			{
+				encoder->forced_intra_q_head = (encoder->forced_intra_q_head + 1)
+				                             % FORCED_INTRA_QUEUE_SIZE;
+				encoder->forced_intra_q_count--;
+			}
 		}
 
 		if (band.recovery_count > 0)
@@ -2934,6 +2988,7 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 	encoder->encoded_frame_available = TRUE;
 
 	encoder->force_IDR_frame = FALSE;
+	encoder->pending_full_refresh = FALSE;
 	encoder->postponed_frame_type = IMX_VPU_API_FRAME_TYPE_UNKNOWN;
 
 	encoder->num_encoded_pictures++;

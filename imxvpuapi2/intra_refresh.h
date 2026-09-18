@@ -166,6 +166,44 @@ void imx_vpu_api_intra_refresh_step(ImxVpuApiIntraRefreshState *state,
                                     int forced_first, int forced_num,
                                     ImxVpuApiIntraRefreshBand *band);
 
+/* An out-of-order refresh: the band covering the whole picture, for a caller
+ * that has been asked for a keyframe while sweeping.
+ *
+ * Sweeping, the answer to "give me a picture a decoder can start from" is not
+ * an IDR - that is the once-per-GOP bitrate spike the sweep exists to avoid,
+ * and it resets the reference structure as well. It is this: one picture with
+ * every coding unit intra. It costs about what an IDR costs, so the caller
+ * has to have the buffer room for it, but it leaves the reference structure
+ * and the picture order alone.
+ *
+ * Slicing is untouched - the region is expressed in coding units and spans the
+ * picture, so however the picture is divided into slices, every slice of it
+ * comes out intra.
+ *
+ * recovery_count is 0: the picture is complete by itself, so a decoder
+ * starting here needs to wait for nothing.
+ *
+ * Pass the band to the encoder, then call
+ * imx_vpu_api_intra_refresh_realign() so the sweep that follows is anchored
+ * to it. */
+void imx_vpu_api_intra_refresh_full(ImxVpuApiIntraRefreshCfg const *cfg,
+                                    ImxVpuApiIntraRefreshBand *band);
+
+/* Re-anchor the sweep onto an out-of-order full-picture refresh that has just
+ * been coded.
+ *
+ * The picture refreshed everything, so the sweep in progress is complete: it
+ * is marked as such and the period restarts here. The next sweep therefore
+ * begins one period after the out-of-order picture rather than at whatever
+ * point in the old schedule came next, which is what keeps the refresh cycles
+ * aligned to it and stops a sweep from starting again immediately over a
+ * picture that is already clean.
+ *
+ * Call once, on the picture the full refresh was coded into, and only after
+ * the encoder accepted it - a picture that was skipped or discarded must
+ * leave the schedule where it was. */
+void imx_vpu_api_intra_refresh_realign(ImxVpuApiIntraRefreshState *state);
+
 /* What a caller asked for, before any of it is mapped or clamped. Plain ints,
  * so that this header stays free of encoder and GObject types and the library,
  * rcprobe and rctest can all hand it the same request.

@@ -134,6 +134,33 @@ void imx_vpu_api_intra_refresh_init(ImxVpuApiIntraRefreshState *state,
 }
 
 
+void imx_vpu_api_intra_refresh_full(ImxVpuApiIntraRefreshCfg const *cfg,
+                                    ImxVpuApiIntraRefreshBand *band)
+{
+	memset(band, 0, sizeof(*band));
+
+	band->apply = 1;
+	band->forced = 1;
+	band->top = 0;
+	band->bottom = cfg->ctb_rows - 1;
+	band->left = 0;
+	band->right = cfg->ctb_cols - 1;
+	/* Complete in this one picture, so nothing to count down. */
+	band->recovery_count = 0;
+}
+
+
+void imx_vpu_api_intra_refresh_realign(ImxVpuApiIntraRefreshState *state)
+{
+	/* Mark the sweep finished and restart the period here. step at the last
+	 * region means sweep_step_index() can never exceed it for the rest of
+	 * this period, so no band fires until sweep_pic wraps - and the wrap is
+	 * what begins the next sweep, one period from now. */
+	state->sweep_pic = 0;
+	state->step = (state->num_steps > 0) ? (state->num_steps - 1) : 0;
+}
+
+
 void imx_vpu_api_intra_refresh_step(ImxVpuApiIntraRefreshState *state,
                                     ImxVpuApiIntraRefreshCfg const *cfg,
                                     int forced_first, int forced_num,

@@ -84,6 +84,7 @@ int ext_rate_control_init(ExtRateControl *rc, ExtRateControlParams const *params
 	 * the buffer size the caller already gave. EXT_RC_CAP overrides it, in
 	 * percent, for debugging only. */
 	rc->cap_share = env_int("EXT_RC_CAP", 50) / 100.0;
+	rc->keyframe_mode = (params->keyframe_mode != 0);
 	rc->qp_min_inter = (int)params->qp_min_inter;
 	rc->qp_max_inter = (params->qp_max_inter > 0) ? (int)params->qp_max_inter : 51;
 	rc->qp_min_intra = (int)params->qp_min_intra;
@@ -391,6 +392,43 @@ static int skip_pressure(ExtRateControl const *rc, int is_intra, double *est, do
 }
 
 
+double ext_rate_control_room(ExtRateControl const *rc)
+{
+	double room;
+
+	if (rc == NULL)
+		return 0.0;
+
+	room = rc->bucket_cap - rc->bucket;
+	return (room > 0.0) ? room : 0.0;
+}
+
+
+int ext_rate_control_keyframe_ready(ExtRateControl const *rc)
+{
+	if (rc == NULL)
+		return 1;
+
+	/* Sweeping a refresh, a keyframe is one band of an ordinary picture.
+	 * There is nothing to drain for. */
+	if (!rc->keyframe_mode)
+		return 1;
+
+	/* Liveness first, exactly as the valve does it: a keyframe withheld
+	 * without bound is a stream a decoder can never join. */
+	if (rc->skip_run >= rc->skip_max_run)
+		return 1;
+
+	/* No intra picture coded yet, so no forecast. Code it and measure it -
+	 * that measurement is what makes every later decision possible, and the
+	 * bootstrap picture has its own ceiling (first_intra_share) anyway. */
+	if (rc->last_intra_bits <= 0.0)
+		return 1;
+
+	return (ext_rate_control_room(rc) >= rc->last_intra_bits);
+}
+
+
 int ext_rate_control_should_skip(ExtRateControl const *rc, int is_intra)
 {
 	double est, room;
@@ -401,6 +439,19 @@ int ext_rate_control_should_skip(ExtRateControl const *rc, int is_intra)
 	/* Liveness comes first: the stream must never stop. */
 	if (rc->skip_run >= rc->skip_max_run)
 		return 0;
+
+	/* Draining the buffer so a keyframe can be placed. This is the one case
+	 * where an intra picture is refused before being encoded: normally there
+	 * is nothing to forecast one from, but here there is - the last intra
+	 * picture's measured cost - and the request stays armed, so refusing the
+	 * picture defers the keyframe rather than losing it.
+	 *
+	 * Refusing it costs nothing and saves everything the alternative spends:
+	 * an encode whose result cannot be used, and a ladder that would coarsen
+	 * the one picture a decoder can start from, once per attempt, while the
+	 * buffer drains underneath it. */
+	if (rc->intra_drain_bits > 0.0)
+		return (ext_rate_control_room(rc) < rc->intra_drain_bits);
 
 	if (!skip_pressure(rc, is_intra, &est, &room))
 		return 0;
@@ -493,6 +544,31 @@ void ext_rate_control_skip(ExtRateControl *rc, int is_intra, size_t bits, ExtRat
 	 * The bucket above is the only thing the bits must not touch. */
 	if (bits > 0)
 		observe_complexity(rc, (double)bits, is_intra, cu_stats);
+
+	/* Arm or sustain the drain. An intra picture that was encoded and then
+	 * discarded tells us exactly what it costs, which is a better forecast
+	 * than the previous keyframe's; a picture refused before the encode
+	 * leaves the existing forecast in place. Either way the request is still
+	 * armed, so the drain ends with the keyframe coded. */
+	if (is_intra)
+	{
+		int const was_draining = (rc->intra_drain_bits > 0.0);
+
+		if (bits > 0)
+			rc->intra_drain_bits = (double)bits;
+		else if (!was_draining)
+			rc->intra_drain_bits = rc->last_intra_bits;
+
+		if (rc->intra_drain_bits > 0.0)
+		{
+			if (!was_draining)
+				rc->num_intra_drains++;
+			rc->num_intra_drain_pics++;
+			IMX_VPU_API_LOG("new CBR:   draining for a keyframe of %.1f kbit, room %.1f kbit",
+			                rc->intra_drain_bits / 1000.0,
+			                ext_rate_control_room(rc) / 1000.0);
+		}
+	}
 
 	rc->skip_run++;
 	if (rc->skip_run > rc->max_skip_run)
@@ -848,6 +924,30 @@ int ext_rate_control_check(ExtRateControl *rc, size_t bits, size_t overhead_bits
 		return 0;
 	}
 
+	/* Keyframe mode, and this is the keyframe. Do not coarsen it.
+	 *
+	 * The ladder's only lever on an intra picture is its quantiser, and the
+	 * buffer it has to fit into refills every picture, so a keyframe that
+	 * arrives when the buffer is nearly full gets ground down hard - and the
+	 * picture a decoder starts from is the worst possible one to spend
+	 * quality on. Worse, the amount of grinding depends on how full the
+	 * buffer happened to be, so consecutive keyframes come out at visibly
+	 * different quality: a pulse once per GOP.
+	 *
+	 * Accepting the attempt as-is hands it to ext_rate_control_should_drop(),
+	 * which defers it, and the drain then makes room for it at the quantiser
+	 * it was predicted at. The bootstrap picture is excluded: nothing has
+	 * been coded yet, so there is no drain forecast to wait for and its own
+	 * first_intra_share ceiling is what bounds it. */
+	if (rc->keyframe_mode && is_intra && !rc->intra_bootstrap_pending
+	 && rc->skip_enable && rc->skip_drop)
+	{
+		IMX_VPU_API_LOG("new CBR:   attempt %d qp %d bits %zu ceiling %.0f - keyframe over by "
+		                "%.2fx, not coarsened; draining the buffer for it instead",
+		                rc->cap_attempts, rc->current_qp, bits, ceiling, wire / ceiling);
+		return 0;
+	}
+
 	/* With no room left at all there is nothing to aim at, so go straight
 	 * to the coarsest quantiser allowed and let the guard end it. */
 	if (ceiling < 1.0)
@@ -942,6 +1042,16 @@ void ext_rate_control_post(ExtRateControl *rc, size_t bits, size_t overhead_bits
 		return;
 
 	observe_complexity(rc, b, is_intra, cu_stats);
+
+	/* The forecast for the next keyframe, and the end of any drain that was
+	 * waiting for this one. Recorded from the picture rather than the whole
+	 * access unit, to match what ext_rate_control_check() measures a
+	 * re-encode against; the parameter sets an IDR carries are accounted
+	 * separately by the caller and are small next to the picture. */
+	if (is_intra)
+		rc->last_intra_bits = b;
+	rc->intra_drain_bits = 0.0;
+
 	b = wire;
 
 	/* Integrate the rate error before the bucket clips it away. Positive
