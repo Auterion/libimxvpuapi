@@ -1644,6 +1644,10 @@ typedef struct
 	 * asked for while sweeping. Cleared only once the picture carrying it
 	 * has been coded, so a skipped picture cannot lose it. */
 	BOOL pending_full_refresh;
+	/* A sync point the caller asked for is outstanding; see the provenance
+	 * note in the VC8000E encoder. force_IDR_frame cannot stand in for this,
+	 * because the deferral below sets it too. */
+	BOOL pending_forced_sync;
 	ImxVpuApiIntraRefreshCfg refresh_cfg;
 	ImxVpuApiIntraRefreshState refresh_state;
 
@@ -2402,40 +2406,7 @@ static ImxVpuApiEncReturnCodes h1_h264_open_encoder(ImxVpuApiEncoder *base, void
 				if (getenv("EXT_RC_SKIP_PREDICT") == NULL)
 					encoder->new_cbr.skip_predict = 1;
 
-				/* And the run limit is raised, for this encoder only.
-				 *
-				 * The controller's default refuses no more pictures in a row
-				 * than the buffer holds frame budgets, on the reasoning that
-				 * further refusals cannot free any more room. That holds
-				 * while the bucket is at most full, which on the VC8000E it
-				 * is, because its re-encode ladder bounds every picture.
-				 *
-				 * Here it is not. A predicted picture cannot be re-encoded on
-				 * this hardware, so a scene cut lands whole: measured at 28
-				 * to 39 frame budgets on the stress clip, into a buffer of
-				 * three. The bucket is then many budgets past the cap and
-				 * every further skip does buy one back, so the buffer-derived
-				 * limit throttles exactly the recovery it should allow. A
-				 * quarter of a second is the liveness bound that actually
-				 * matters - about as long as a stall can last before it reads
-				 * as a stall rather than a stutter.
-				 *
-				 * Measured on the stress clip, raising it from 4 to 8 is
-				 * better on both axes at once: p95 buffer occupancy 352 ->
-				 * 238 ms at 6000 kbps and 1018 -> 918 ms at 1400 kbps, while
-				 * dropping *fewer* pictures (347 against 356, 185 against
-				 * 218). A buffer left hovering just over the cap refuses four
-				 * pictures in every five indefinitely; one longer run drains
-				 * it and stops. */
-				if (getenv("EXT_RC_SKIP_MAX") == NULL)
-				{
-					unsigned int const fps = (unsigned int)(encoder->new_cbr.frame_rate + 0.5);
-					unsigned int run = (fps + 3) / 4;
-					if (run < 1) run = 1;
-					encoder->new_cbr.skip_max_run = run;
-				}
-
-				/* Everything that would otherwise decide a QP is switched off,
+								/* Everything that would otherwise decide a QP is switched off,
 				 * because the QP comes from ext_rate_control_pre() instead and
 				 * any second opinion silently overrides it. mbRc in particular
 				 * would vary the QP within the picture, which would make the
@@ -2844,6 +2815,16 @@ static ImxVpuApiEncReturnCodes h1_h264_encode_frame(void *h1_encoder, ImxVpuApiF
 	else
 		encoder->base->encoded_frame_is_sync_point = FALSE;
 
+	/* A sync point the caller asked for, as opposed to one the GOP schedule
+	 * produced or the valve deferred; see the provenance note in the VC8000E
+	 * encoder. The caller's own request arrives on the raw frame, which the
+	 * deferral never touches. */
+	if (encoder->base->staged_raw_frame.frame_types[0] == IMX_VPU_API_FRAME_TYPE_I
+	 || encoder->base->staged_raw_frame.frame_types[0] == IMX_VPU_API_FRAME_TYPE_IDR)
+		encoder->pending_forced_sync = TRUE;
+	if (encoder->new_cbr_active && !encoder->is_first_frame && encoder->pending_forced_sync)
+		ext_rate_control_set_forced_sync_point(&(encoder->new_cbr));
+
 	/* Sweeping a refresh, a keyframe request is served with one picture coded
 	 * entirely intra rather than with an IDR - the same rule as on the
 	 * VC8000E, and for the same reasons: an IDR is the bitrate spike the
@@ -3136,8 +3117,44 @@ static ImxVpuApiEncReturnCodes h1_h264_encode_frame(void *h1_encoder, ImxVpuApiF
 	if (encoder->new_cbr_active)
 	{
 		size_t const bits = (size_t)(encoder_output.streamSize) * 8;
+		size_t const oh = (base->must_prepend_header_data ? base->header_data_size : 0) * 8;
 		int const coded_intra = (encoder_output.codingType == H264ENC_INTRA_FRAME)
 		                     || (encoder_output.codingType == H264ENC_NONIDR_INTRA_FRAME);
+
+		/* The measured rule, for intra pictures only, and this is the whole
+		 * reason it can exist on this encoder at all.
+		 *
+		 * Discarding a *predicted* picture here is impossible: the reference
+		 * rotation and the frame counters were committed inside
+		 * H264EncStrmEncode() and there is no way to take them back, so the
+		 * decoder would be left predicting from a reconstruction it never
+		 * received. An intra picture has no such dependency, and the picture
+		 * that replaces it resynchronises the decoder by itself - which is
+		 * why force_IDR_frame is set rather than merely re-requesting intra.
+		 * A plain I picture would leave the reference structure intact and
+		 * the gap would still be visible; an IDR resets it, so nothing
+		 * downstream can tell a picture was thrown away.
+		 *
+		 * Without this the no-overflow rule had no measured backstop on this
+		 * encoder at all: only the forecast stood between a keyframe and the
+		 * buffer, and the forecast cannot promise what a measurement can. */
+		if (coded_intra && !encoder->is_first_frame
+		 && ext_rate_control_should_drop(&(encoder->new_cbr), bits + oh, 1))
+		{
+			ext_rate_control_skip(&(encoder->new_cbr), 1, bits, NULL);
+			base->force_IDR_frame = TRUE;
+			IMX_VPU_API_INFO("new CBR: intra picture %" PRIu32 " discarded at %.1f kbit; "
+			                 "the next coded picture carries the IDR instead",
+			                 encoder->num_encoded_pictures, (double)bits / 1000.0);
+
+			/* Neither num_encoded_pictures nor the GOP counter advances, so
+			 * the next input frame takes this picture's slot - the same
+			 * contract the pre-encode refusal above keeps. */
+			*encoded_frame_size = 0;
+			*encoded_frame_type = IMX_VPU_API_FRAME_TYPE_SKIP;
+			base->num_bytes_in_stream_buffer = 0;
+			return IMX_VPU_API_ENC_RETURN_CODE_OK;
+		}
 
 		ext_rate_control_post(&(encoder->new_cbr), bits,
 		                      (base->must_prepend_header_data ? base->header_data_size : 0) * 8,
@@ -3155,6 +3172,7 @@ static ImxVpuApiEncReturnCodes h1_h264_encode_frame(void *h1_encoder, ImxVpuApiF
 	 * here and not at the decision: a picture the rate control refused must
 	 * leave the request armed for the next one. */
 	encoder->pending_full_refresh = FALSE;
+	encoder->pending_forced_sync = FALSE;
 
 	encoder->num_encoded_pictures++;
 	encoder->is_first_frame = FALSE;

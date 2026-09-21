@@ -110,6 +110,7 @@ typedef struct
 	 * controller drains the buffer first and codes the picture after -
 	 * see ext_rate_control_keyframe_ready(). */
 	unsigned int keyframe_mode;
+
 }
 ExtRateControlParams;
 
@@ -196,17 +197,31 @@ typedef struct
 	 * feasible.
 	 *
 	 * skip_enable turns the valve off. skip_room_share scales its threshold
-	 * in units of the room the buffer has left, so below 1.0 the valve
-	 * opens before a picture would strictly have overflowed. skip_max_run
-	 * bounds how many pictures in a row it may refuse, so the stream can
-	 * never stop. */
+	 * in units of the room the buffer has left, so below 1.0 the valve opens
+	 * before a picture would strictly have overflowed; it is clamped at 1.0,
+	 * because above that it would license the overflow it exists to prevent.
+	 *
+	 * The run is not bounded by a count. A picture is refused while refusing
+	 * it can still achieve something - each refusal drains a frame budget -
+	 * and sent once the bucket is empty, because the whole buffer is then on
+	 * offer and the quantiser is at its ceiling, so nothing further can be
+	 * done. The bucket drains unconditionally, so that condition is always
+	 * reached and the stream cannot stall.
+	 *
+	 * A fixed cap on the run was tried and removed: it cannot be set
+	 * correctly. Too low and a buffer hovering just over its cap refuses
+	 * most pictures indefinitely without ever draining, which measured worse
+	 * on both axes at once - p95 buffer occupancy 352 ms against 238 ms at
+	 * 6000 kbps on the stress clip, while dropping *more* pictures, 356
+	 * against 347. One longer run drains the buffer and stops; a capped one
+	 * never finishes the job. Draining to empty is that observation taken to
+	 * its conclusion. */
 	int skip_enable;
 	/* The valve's two decision points, separately disableable. Both are on
 	 * by default and both change which pictures are refused - see
 	 * ext_rate_control_init(). */
 	int skip_predict, skip_drop;
 	double skip_room_share;
-	unsigned int skip_max_run;
 	/* How many times ext_rate_control_check() may re-encode one picture
 	 * before accepting whatever it has. Shared with the valve, which treats
 	 * reaching it as the quantiser having run out of moves. */
@@ -248,10 +263,29 @@ typedef struct
 	 * 0 until an intra picture has been coded, which reads as "no forecast",
 	 * and the keyframe is then placed without waiting. */
 	double last_intra_bits;
+	/* Set for one picture that the caller has been asked to make a sync
+	 * point out of band - a decoder joining mid-stream needs somewhere to
+	 * start, and while sweeping a refresh that is a picture with every
+	 * coding unit intra rather than an IDR.
+	 *
+	 * Such a picture is coded as a predicted one, because that is what it
+	 * is structurally: no IDR, no reset of the reference list or the picture
+	 * order. So without this flag the controller sees an inter picture and
+	 * holds it to the discretionary cap, which exists to stop an ordinary
+	 * inter picture monopolising the buffer - and this one is not ordinary.
+	 * Measured on an imx8mp: the cap pinned it to 90128 bit against a
+	 * 180000 bit buffer, 0.5007 of it, so an all-intra picture came out the
+	 * size of a refresh band and the sync point it was asked for was worth
+	 * much less than it should have been.
+	 *
+	 * Raises the ceiling to the whole buffer for that picture only. Cleared
+	 * once the picture is accounted for. */
+	int forced_sync_point;
+
 	/* Bits an intra picture is waiting for room for. Non-zero means pictures
 	 * are being skipped to drain the buffer and the keyframe request is
-	 * still outstanding; the run is bounded by skip_max_run like any other
-	 * refusal, so the picture is always coded in the end. */
+	 * still outstanding; the run ends when the bucket empties, so the picture
+	 * is always coded in the end. */
 	double intra_drain_bits;
 	/* Cost of one coded block at Qstep 1, smoothed, and the previous
 	 * picture's cost derived from it. */
@@ -290,6 +324,30 @@ typedef struct
 	 * refused on the forecast, and the longest run. */
 	unsigned long num_skipped;
 	unsigned long num_dropped;
+	/* Edge reporting for the skip and overflow decisions. These are states,
+	 * not counters: each is logged when it is entered and not again until it
+	 * is left, so a stream at a hard operating point reports the handful of
+	 * decisions it took rather than a line per picture.
+	 *
+	 * skip_state: 0 coding normally, 1 refusing pictures to drain, 2 sent a
+	 * picture over the cap because nothing else was left to try.
+	 * qp_max_reported: the quantiser ceiling has been reported for this
+	 * excursion, and is re-armed when the quantiser comes back off it. */
+	int skip_state;
+	int qp_max_reported;
+
+	/* Pictures whose accounting left the buffer over its cap, and how many of
+	 * those were the one permitted case: a picture that could not be made to
+	 * fit even with the whole buffer on offer and the quantiser at its
+	 * ceiling, so sending it was the only remaining option. The two being
+	 * equal means the rule held; num_overflows exceeding
+	 * num_forced_overflows means it did not, and that is a bug rather than a
+	 * hard operating point. max_overflow_fill is the worst level reached, as
+	 * a share of the cap. */
+	unsigned long num_overflows;
+	unsigned long num_forced_overflows;
+	double max_overflow_fill;
+
 	/* Times the buffer had to be drained before a keyframe could be placed,
 	 * and pictures spent doing it. */
 	unsigned long num_intra_drains;
@@ -400,6 +458,11 @@ int ext_rate_control_should_drop(ExtRateControl const *rc, size_t bits, int is_i
  * not the picture is sent. cu_stats may be NULL. */
 void ext_rate_control_skip(ExtRateControl *rc, int is_intra, size_t bits, ExtRateControlStats const *cu_stats);
 
+/* Declare the next picture a forced sync point; see forced_sync_point above.
+ * Call before ext_rate_control_pre() for that picture, and again for each
+ * retry if it is deferred - the flag covers one accounted picture. */
+void ext_rate_control_set_forced_sync_point(ExtRateControl *rc);
+
 /* Bits the HRD buffer can still take right now, i.e. what one picture may
  * add without overflowing it. Never negative. Pure. */
 double ext_rate_control_room(ExtRateControl const *rc);
@@ -416,9 +479,9 @@ double ext_rate_control_room(ExtRateControl const *rc);
  * buffer has less room than that forecast. Sweeping an intra refresh, a
  * keyframe is a band rather than a whole picture and this always says yes.
  *
- * Liveness is bounded by skip_max_run, the same limit the valve uses: once it
- * is reached this says yes regardless, so a keyframe can never be withheld
- * indefinitely.
+ * Liveness comes from the drain: once the bucket is empty this says yes
+ * regardless, because waiting longer cannot make more room, so a keyframe can
+ * never be withheld indefinitely.
  *
  * Pure. Report a picture skipped for this reason with
  * ext_rate_control_skip(), which is also what advances the drain. */

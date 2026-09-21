@@ -283,6 +283,9 @@ struct _ImxVpuApiEncoder
 	 * it is cleared only once the picture carrying it has been coded - so
 	 * the refresh cannot be lost to the rate control deferring a frame. */
 	BOOL pending_full_refresh;
+	/* A sync point the caller asked for is outstanding; see the provenance
+	 * note in imx_vpu_api_enc_encode(). */
+	BOOL pending_forced_sync;
 	BOOL vendor_gdr_active;
 	ImxVpuApiIntraRefreshCfg refresh_cfg;
 	ImxVpuApiIntraRefreshState refresh_state;
@@ -1859,6 +1862,31 @@ void imx_vpu_api_enc_close(ImxVpuApiEncoder *encoder)
 			(rc->num_debt_lifts > 0) ? (rc->sum_fill_used / (double)(rc->num_debt_lifts)) : 0.0
 		);
 
+		/* Only when the buffer was actually breached, and worth two different
+		 * sentences: the permitted case is an operating point the content
+		 * cannot meet, and anything beyond it is the rule failing. */
+		if (rc->num_overflows > 0)
+		{
+			if (rc->num_overflows == rc->num_forced_overflows)
+				IMX_VPU_API_INFO(
+					"new CBR summary: the HRD buffer was exceeded on %lu of %.0f pictures "
+					"(%.1f%%, worst %.0f%% of cap) - every one of them a picture that did "
+					"not fit an empty buffer, so the rule held and the operating point is "
+					"simply too tight for the content",
+					rc->num_overflows, slots, rc->num_overflows * 100.0 / slots,
+					rc->max_overflow_fill * 100.0);
+			else
+				/* ERROR: this is the invariant failing, not a hard operating
+				 * point, and it must not need a log level to be noticed. */
+				IMX_VPU_API_ERROR(
+					"new CBR summary: the HRD buffer was exceeded on %lu of %.0f pictures "
+					"(worst %.0f%% of cap), and only %lu of those were unavoidable - the "
+					"other %lu broke the no-overflow rule with the buffer not empty",
+					rc->num_overflows, slots, rc->max_overflow_fill * 100.0,
+					rc->num_forced_overflows,
+					rc->num_overflows - rc->num_forced_overflows);
+		}
+
 		/* Only when it opened. A line saying "0 pictures skipped" on every
 		 * healthy stream trains people to stop reading it, and this is
 		 * the one number that says the operating point was not feasible. */
@@ -2335,6 +2363,25 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 
 	requested_frame_type = encoder->staged_raw_frame.frame_types[0];
 
+	/* Provenance, captured before anything below can blur it: only the
+	 * caller's own request for this frame counts as a requested sync point.
+	 *
+	 * Both encoders re-arm an intra request internally when the valve defers
+	 * one - here through postponed_frame_type, on the H1 through
+	 * force_IDR_frame - so by the time the coding type is resolved a
+	 * deferred *periodic* IDR is indistinguishable from a requested one.
+	 * Treating that as requested let a scheduled keyframe escape coarsening
+	 * altogether: measured on oldtown_720 at qp34, the largest picture grew
+	 * from 5.30x the frame budget to 7.71x and overflows from 3 to 13,
+	 * because the picture was never taken to qp_max at all.
+	 *
+	 * The flag survives a deferral and is cleared only once a picture
+	 * carrying it has been coded, so a genuinely requested sync point keeps
+	 * its treatment across however many refusals it takes. */
+	if ((requested_frame_type == IMX_VPU_API_FRAME_TYPE_I)
+	 || (requested_frame_type == IMX_VPU_API_FRAME_TYPE_IDR))
+		encoder->pending_forced_sync = TRUE;
+
 	/* An intra request the valve deferred outranks whatever this input frame
 	 * asked for. The deferral only ever moves an intra picture to a later
 	 * one, so this can promote a picture to intra and never demote one. */
@@ -2362,6 +2409,15 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 		IMX_VPU_API_DEBUG("forcing this frame to be encoded as IDR");
 		requested_frame_type = IMX_VPU_API_FRAME_TYPE_IDR;
 	}
+
+	/* Tell the rate control this picture is a sync point the caller asked
+	 * for, rather than one the GOP schedule produced. It is the distinction
+	 * that decides whether the picture may be coarsened to fit a buffer that
+	 * merely happens to be full: a scheduled IDR may, a requested one waits
+	 * for the buffer to drain first. Set before the valve and before
+	 * ext_rate_control_pre(), both of which read it. */
+	if (encoder->new_cbr_active && !is_first_picture && encoder->pending_forced_sync)
+		ext_rate_control_set_forced_sync_point(&(encoder->new_cbr));
 
 	/* Sweeping a refresh, a keyframe request is served with one picture coded
 	 * entirely intra, not with an IDR. An IDR here would be exactly the
@@ -2650,6 +2706,12 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 			 * slices every slice of it comes out intra. */
 			imx_vpu_api_intra_refresh_full(&(encoder->refresh_cfg), &band);
 			imx_vpu_api_intra_refresh_realign(&(encoder->refresh_state));
+
+			IMX_VPU_API_DEBUG("out-of-order full refresh: rows %d..%d cols %d..%d "
+			                  "(ctb grid %dx%d), apply %d",
+			                  band.top, band.bottom, band.left, band.right,
+			                  encoder->refresh_cfg.ctb_cols, encoder->refresh_cfg.ctb_rows,
+			                  band.apply);
 
 			/* A recovery point of 0: this picture is complete by itself, so
 			 * a decoder joining here waits for nothing. The sweep's own
@@ -2989,6 +3051,7 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 
 	encoder->force_IDR_frame = FALSE;
 	encoder->pending_full_refresh = FALSE;
+	encoder->pending_forced_sync = FALSE;
 	encoder->postponed_frame_type = IMX_VPU_API_FRAME_TYPE_UNKNOWN;
 
 	encoder->num_encoded_pictures++;

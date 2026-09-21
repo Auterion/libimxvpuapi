@@ -286,33 +286,23 @@ int ext_rate_control_init(ExtRateControl *rc, ExtRateControlParams const *params
 	rc->skip_drop = env_int("EXT_RC_SKIP_DROP", 1);
 	rc->skip_room_share = env_double("EXT_RC_SKIP_ROOM", 1.0);
 	rc->cap_attempt_limit = env_int("EXT_RC_CAP_ATTEMPTS", 4);
-	/* Skipping buys room at one frame budget per picture and the room
-	 * saturates once the buffer is empty, so refusing more pictures in a
-	 * row than the buffer holds frame budgets cannot create any more room -
-	 * that is the natural limit, and past it the only thing left to do is
-	 * code the picture and take the overflow.
-	 *
-	 * Then held to 8, so that a large buffer cannot turn the valve into a
-	 * visible freeze: at 30 fps eight pictures is 267 ms, which is about as
-	 * long as a stall can last before it reads as a stall rather than as a
-	 * stutter. A 700 ms buffer would otherwise allow 21.
-	 *
-	 * That reasoning holds only while the bucket is at most full. Where a
-	 * single picture can blow past the buffer on its own - the H1, whose
-	 * predicted pictures cannot be re-encoded - it throttles the recovery
-	 * instead, and that encoder raises this for itself; see the note beside
-	 * skip_predict in imxvpuapi2_imx8m_hantro_h1_encoder.c. It is left alone
-	 * here because the VC8000E is measured with it and does not need it: the
-	 * re-encode ladder bounds every picture, so the bucket never gets far
-	 * enough over the cap for the limit to bite. */
-	{
-		int run = (rc->bit_per_pic > 0.0)
-		        ? (int)ceil(rc->bucket_cap / rc->bit_per_pic)
-		        : 1;
-		if (run < 1) run = 1;
-		if (run > 8) run = 8;
-		rc->skip_max_run = (unsigned int)env_int("EXT_RC_SKIP_MAX", run);
-	}
+	/* With the valve off there is nothing left to stop a picture the
+	 * quantiser cannot shrink from overflowing the buffer: the ladder's
+	 * give-up paths become the end of the line. That is a legitimate thing
+	 * to ask for in an experiment and a bad thing to discover in the field,
+	 * so it is said out loud rather than inferred from a missing knob. */
+	if (!rc->skip_enable || !rc->skip_drop)
+		IMX_VPU_API_WARNING(
+			"new CBR: the frame skipping valve is %s (EXT_RC_SKIP=%d, EXT_RC_SKIP_DROP=%d) - "
+			"the HRD buffer can no longer be guaranteed, because a picture the quantiser "
+			"cannot shrink to fit has nothing left to stop it",
+			rc->skip_enable ? "half disabled" : "disabled",
+			rc->skip_enable, rc->skip_drop);
+
+	/* Above 1.0 this would license the very thing the valve exists to
+	 * prevent, so it is a ceiling and not a free parameter. */
+	if (rc->skip_room_share > 1.0) rc->skip_room_share = 1.0;
+	if (rc->skip_room_share < 0.0) rc->skip_room_share = 0.0;
 	if (rc->debt_gain < 0.0) rc->debt_gain = 0.0;
 	if (rc->debt_fill < 0.0) rc->debt_fill = 0.0;
 	if (rc->debt_fill > 1.0) rc->debt_fill = 1.0;
@@ -392,6 +382,13 @@ static int skip_pressure(ExtRateControl const *rc, int is_intra, double *est, do
 }
 
 
+void ext_rate_control_set_forced_sync_point(ExtRateControl *rc)
+{
+	if (rc != NULL)
+		rc->forced_sync_point = 1;
+}
+
+
 double ext_rate_control_room(ExtRateControl const *rc)
 {
 	double room;
@@ -409,14 +406,18 @@ int ext_rate_control_keyframe_ready(ExtRateControl const *rc)
 	if (rc == NULL)
 		return 1;
 
-	/* Sweeping a refresh, a keyframe is one band of an ordinary picture.
-	 * There is nothing to drain for. */
-	if (!rc->keyframe_mode)
+	/* Only a sync point the caller asked for waits. A periodic IDR is on the
+	 * schedule the controller has been budgeting for, and the ladder bounds
+	 * it; sweeping a refresh, a keyframe is one band of an ordinary picture
+	 * and there is nothing to drain for either. */
+	if (!rc->forced_sync_point)
 		return 1;
 
-	/* Liveness first, exactly as the valve does it: a keyframe withheld
-	 * without bound is a stream a decoder can never join. */
-	if (rc->skip_run >= rc->skip_max_run)
+	/* Nothing left to drain: the keyframe is being offered the whole buffer,
+	 * so waiting longer cannot help and withholding it any further only
+	 * delays the sync point a decoder is waiting for. Same condition the
+	 * valve uses; see ext_rate_control_should_skip(). */
+	if (rc->bucket <= 0.0)
 		return 1;
 
 	/* No intra picture coded yet, so no forecast. Code it and measure it -
@@ -436,8 +437,29 @@ int ext_rate_control_should_skip(ExtRateControl const *rc, int is_intra)
 	if ((rc == NULL) || !rc->skip_enable || !rc->skip_predict)
 		return 0;
 
-	/* Liveness comes first: the stream must never stop. */
-	if (rc->skip_run >= rc->skip_max_run)
+	/* The one condition under which a picture that does not fit is sent
+	 * anyway, and it is a physical one rather than a countdown.
+	 *
+	 * Skipping is worth doing while it can still buy something: each skipped
+	 * picture drains one frame budget out of the bucket. Once the bucket is
+	 * empty there is nothing left to buy - the picture is being offered the
+	 * whole buffer and still does not fit, and the quantiser is already at
+	 * its ceiling - so no further skipping and no coarser quantiser can
+	 * change the outcome. Sending it is then the least bad option: take the
+	 * overflow, and drain it back off over the pictures that follow, which
+	 * this same test does on its own because room stays 0 until the bucket
+	 * comes back under the cap.
+	 *
+	 * Liveness comes from the bucket, not from a limit: it drains a frame
+	 * budget per skipped picture unconditionally, so this condition is always
+	 * reached and the stream can never stall. That is why this replaced a
+	 * fixed run limit, which stopped refusing after a set count whether or
+	 * not anything could still be done - on an imx8mp at 1600 kbps into a
+	 * 180 kbit buffer that count was 4, and it let 58 of 1653 pictures
+	 * overflow, one of them 315 kbit against a 180 kbit buffer. With the
+	 * drain rule the same run measured 1 of 1255, and that one was a 200
+	 * kbit picture against a 180 kbit buffer, which nothing can place. */
+	if (rc->bucket <= 0.0)
 		return 0;
 
 	/* Draining the buffer so a keyframe can be placed. This is the one case
@@ -466,7 +488,17 @@ int ext_rate_control_should_drop(ExtRateControl const *rc, size_t bits, int is_i
 
 	if ((rc == NULL) || !rc->skip_enable || !rc->skip_drop)
 		return 0;
-	if (rc->skip_run >= rc->skip_max_run)
+	/* The one state in which a picture that does not fit has to be sent, and
+	 * it takes both halves: the buffer empty, so no further skipping can make
+	 * room, AND the quantiser at its ceiling, so no coarser attempt can make
+	 * the picture smaller. Either alone is not enough - emitting on an empty
+	 * buffer while quantiser headroom remained is what let a keyframe go out
+	 * at qp 41 and 148.9 kbit into a 108 kbit buffer when qp 51 was
+	 * available. ext_rate_control_check() lifts its attempt limit in exactly
+	 * this situation, so the ceiling is always reachable and this stays
+	 * live. */
+	if ((rc->bucket <= 0.0)
+	 && (rc->current_qp >= (is_intra ? rc->qp_max_intra : rc->qp_max_inter)))
 		return 0;
 
 	/* The quantiser must have no moves left, and there are two ways to run
@@ -486,9 +518,20 @@ int ext_rate_control_should_drop(ExtRateControl const *rc, size_t bits, int is_i
 	 * Below both limits the picture is still the ladder's problem, and
 	 * taking it here would trade frame rate for something quality could
 	 * have bought. */
-	if ((rc->current_qp < (is_intra ? rc->qp_max_intra : rc->qp_max_inter))
+	if (!(rc->forced_sync_point && is_intra && !rc->intra_bootstrap_pending)
+	 && (rc->current_qp < (is_intra ? rc->qp_max_intra : rc->qp_max_inter))
 	 && (rc->cap_attempts < rc->cap_attempt_limit))
 		return 0;
+
+	/* A requested sync point is the exception, and it has to be: such a
+	 * picture is deferred on the strength of not fitting alone.
+	 * ext_rate_control_check() deliberately does not coarsen it, so neither
+	 * route above can ever fire for one - the quantiser never moves and no
+	 * attempt is spent - and the test would hand the oversized picture
+	 * straight to the buffer. Measured on an imx8mp before this was added:
+	 * two of 45 keyframes went in over the ceiling and the buffer peaked at
+	 * 108% of cap. The remedy for a keyframe is the drain that follows the
+	 * deferral, not a coarser picture. */
 
 	/* And it must not fit in the buffer as it stands. */
 	room = rc->bucket_cap - rc->bucket;
@@ -509,16 +552,17 @@ void ext_rate_control_skip(ExtRateControl *rc, int is_intra, size_t bits, ExtRat
 	if (bits > 0)
 		est = (double)bits;
 
-	IMX_VPU_API_INFO(
+	IMX_VPU_API_LOG(
 		"new CBR: picture %lu skipped - %.1f kbit %s at qp %d, and the HRD buffer "
-		"has room for %.1f kbit (%.1f of %.1f kbit in flight, refusal %u of %u)",
+		"has room for %.1f kbit (%.1f of %.1f kbit in flight, refusal %u, %u more "
+		"would empty the bucket)",
 		rc->num_pictures,
 		est / 1000.0,
 		(bits > 0) ? "coded" : "predicted",
 		rc->qp_max_inter,
 		room / 1000.0,
 		rc->bucket / 1000.0, rc->bucket_cap / 1000.0,
-		rc->skip_run + 1, rc->skip_max_run
+		rc->skip_run + 1, (unsigned int)ceil(rc->bucket / (rc->bit_per_pic > 0.0 ? rc->bit_per_pic : 1.0))
 	);
 
 	/* The link drains over this picture's period whether or not anything
@@ -569,6 +613,28 @@ void ext_rate_control_skip(ExtRateControl *rc, int is_intra, size_t bits, ExtRat
 			                ext_rate_control_room(rc) / 1000.0);
 		}
 	}
+
+	/* Edge: refusing has begun. The per-picture line above stays, at a level
+	 * that has to be asked for, so the default output carries the decision
+	 * and not every picture it applies to.
+	 *
+	 * It is reported after the drain is armed above and not before: a
+	 * keyframe refused ahead of its encode has no measured size, and the
+	 * figure the refusal is actually waiting on is the forecast that arming
+	 * has just put in intra_drain_bits. Emitted first, this line read
+	 * "does not fit - 0.0 kbit" on every one of them. */
+	if (rc->skip_state == 0)
+	{
+		rc->skip_state = 1;
+		IMX_VPU_API_INFO(
+			"new CBR: picture %lu does not fit - %.1f kbit against %.1f kbit of room "
+			"(qp_max %d); refusing pictures to drain the buffer",
+			rc->num_pictures,
+			((est > 0.0) ? est : rc->intra_drain_bits) / 1000.0, room / 1000.0,
+			is_intra ? rc->qp_max_intra : rc->qp_max_inter);
+	}
+
+	rc->forced_sync_point = 0;
 
 	rc->skip_run++;
 	if (rc->skip_run > rc->max_skip_run)
@@ -795,13 +861,16 @@ static void slope_apply(ExtRateControl *rc, double est)
 
 /* One attempt and the next at the same picture: same content, two quantisers,
  * two sizes, so the gradient between them is measured rather than assumed. */
-static void slope_observe(ExtRateControl *rc, size_t bits)
+/* The gradient measured on this picture's own two most recent attempts, or 0
+ * when there is no usable pair yet. Same content at two quantisers, so this is
+ * measured rather than assumed - and it is specific to the picture in hand,
+ * which the learned slope cannot be. */
+static double local_slope(ExtRateControl const *rc, size_t bits)
 {
-	double dqp, ratio, obs, sorted[16];
-	unsigned int i, j;
+	double dqp, ratio, obs;
 
 	if ((rc->prev_attempt_qp < 0) || (bits == 0) || (rc->prev_attempt_bits == 0))
-		return;
+		return 0.0;
 
 	dqp = (double)(rc->current_qp) - (double)(rc->prev_attempt_qp);
 	ratio = (double)(rc->prev_attempt_bits) / (double)bits;
@@ -809,10 +878,20 @@ static void slope_observe(ExtRateControl *rc, size_t bits)
 	/* At least one quantiser step and a size that actually moved: below that
 	 * the logarithm turns rounding into an arbitrary gradient. */
 	if ((dqp < 1.0) || (ratio < 1.1))
-		return;
+		return 0.0;
 
 	obs = dqp / log2(ratio);
-	if ((obs < 0.2) || (obs > 12.0))
+	return ((obs < 0.2) || (obs > 12.0)) ? 0.0 : obs;
+}
+
+
+static void slope_observe(ExtRateControl *rc, size_t bits)
+{
+	double obs, sorted[16];
+	unsigned int i, j;
+
+	obs = local_slope(rc, bits);
+	if (obs <= 0.0)
 		return;
 
 	rc->obs[rc->obs_head % 16u] = obs;
@@ -853,9 +932,26 @@ int ext_rate_control_check(ExtRateControl *rc, size_t bits, size_t overhead_bits
 	 * overshoot. */
 	if (rc->cap_attempts >= rc->cap_attempt_limit)
 	{
-		IMX_VPU_API_LOG("new CBR:   attempt %d qp %d bits %zu - attempt limit, accepted",
-		                rc->cap_attempts, rc->current_qp, bits);
-		return 0;
+		/* The limit exists to stop a picture being ground down attempt after
+		 * attempt for no gain. It must not, however, bound encode time into a
+		 * guaranteed buffer breach: with the bucket already empty, a picture
+		 * still larger than the whole buffer, and quantiser headroom left,
+		 * accepting here overflows for certain while a coarser attempt would
+		 * not. Keep going in that one case, and only that one. */
+		double const room_now = (rc->bucket_cap > rc->bucket)
+		                      ? (rc->bucket_cap - rc->bucket) : 0.0;
+		int const qmax_now = is_intra ? rc->qp_max_intra : rc->qp_max_inter;
+
+		if (!((rc->bucket <= 0.0) && (wire > room_now) && (rc->current_qp < qmax_now)))
+		{
+			IMX_VPU_API_LOG("new CBR:   attempt %d qp %d bits %zu - attempt limit, accepted",
+			                rc->cap_attempts, rc->current_qp, bits);
+			return 0;
+		}
+		IMX_VPU_API_LOG("new CBR:   attempt %d qp %d bits %zu - past the attempt limit, but "
+		                "the buffer is empty and qp %d is still below %d, so accepting would "
+		                "overflow for certain",
+		                rc->cap_attempts, rc->current_qp, bits, rc->current_qp, qmax_now);
 	}
 
 	slope_observe(rc, bits);
@@ -865,6 +961,18 @@ int ext_rate_control_check(ExtRateControl *rc, size_t bits, size_t overhead_bits
 	{
 		IMX_VPU_API_LOG("new CBR:   attempt %d qp %d bits %zu - at qp_max, accepted",
 		                rc->cap_attempts, rc->current_qp, bits);
+		/* Edge: the ladder is out of moves. Worth one line, because from here
+		 * the only remaining lever is refusing pictures. */
+		if (!rc->qp_max_reported)
+		{
+			double const room = (rc->bucket_cap > rc->bucket)
+			                  ? (rc->bucket_cap - rc->bucket) : 0.0;
+			rc->qp_max_reported = 1;
+			IMX_VPU_API_INFO(
+				"new CBR: quantiser at its ceiling (qp %d) on picture %lu - %.1f kbit "
+				"against %.1f kbit of room; the valve is the only lever left",
+				rc->current_qp, rc->num_pictures, wire / 1000.0, room / 1000.0);
+		}
 		return 0;
 	}
 
@@ -893,7 +1001,7 @@ int ext_rate_control_check(ExtRateControl *rc, size_t bits, size_t overhead_bits
 	/* The discretionary cap, a share of the whole buffer, applies to inter
 	 * pictures only - an intra picture carries a whole refresh and is held
 	 * to the overflow limit alone. */
-	if (!is_intra && (rc->cap_share > 0.0))
+	if (!is_intra && !rc->forced_sync_point && (rc->cap_share > 0.0))
 	{
 		double const soft = rc->bucket_cap * rc->cap_share;
 		if (soft < ceiling) ceiling = soft;
@@ -924,7 +1032,20 @@ int ext_rate_control_check(ExtRateControl *rc, size_t bits, size_t overhead_bits
 		return 0;
 	}
 
-	/* Keyframe mode, and this is the keyframe. Do not coarsen it.
+	/* A sync point the caller asked for out of band, and the buffer has room
+	 * left to drain. Do not coarsen it yet.
+	 *
+	 * Only a requested one. A periodic IDR arrives on a schedule the rate
+	 * control has been budgeting for all along, and the ordinary ladder
+	 * bounds it perfectly well - measured on the clip corpus, holding
+	 * periodic IDRs to the ladder gives 53 overflows and a largest picture
+	 * of 6.5x the frame budget, while deferring their coarsening the way a
+	 * requested one is deferred gives 459 overflows and 8.4x, for no
+	 * measurable quality gain: on the clips where neither arm dropped a
+	 * picture, PSNR was 34.97 dB against 34.94. A requested sync point is
+	 * different because its timing is not the encoder's to choose, so
+	 * coarsening it would be a quality pulse imposed by whatever the buffer
+	 * happened to hold when a viewer joined.
 	 *
 	 * The ladder's only lever on an intra picture is its quantiser, and the
 	 * buffer it has to fit into refills every picture, so a keyframe that
@@ -939,8 +1060,23 @@ int ext_rate_control_check(ExtRateControl *rc, size_t bits, size_t overhead_bits
 	 * it was predicted at. The bootstrap picture is excluded: nothing has
 	 * been coded yet, so there is no drain forecast to wait for and its own
 	 * first_intra_share ceiling is what bounds it. */
-	if (rc->keyframe_mode && is_intra && !rc->intra_bootstrap_pending
-	 && rc->skip_enable && rc->skip_drop)
+	if (rc->forced_sync_point && is_intra && !rc->intra_bootstrap_pending
+	 && rc->skip_enable && rc->skip_drop
+	 /* Only while draining can still achieve something. Once the bucket is
+	  * empty the picture is being offered the whole buffer and still does
+	  * not fit, so it is genuinely too big rather than merely unlucky in its
+	  * timing, and coarsening is then the right remedy instead of a quality
+	  * pulse imposed by a transient. Letting the ladder run only from here
+	  * is what bounds the picture: skipping alone cannot, because no amount
+	  * of draining places a picture larger than the buffer.
+	  *
+	  * Measured on the clip corpus in IDR mode with this condition absent -
+	  * i.e. never coarsening a keyframe - against the shipping library:
+	  * 5309 overflows against 53, p95 occupancy 836 kbit against 336, peak
+	  * 1735 ms against 146, 1130 pictures dropped against 203, and mean
+	  * PSNR 22.89 dB against 31.54. The largest picture reached 25x the
+	  * frame budget into a buffer holding 3.3 of them. */
+	 && (rc->bucket > 0.0))
 	{
 		IMX_VPU_API_LOG("new CBR:   attempt %d qp %d bits %zu ceiling %.0f - keyframe over by "
 		                "%.2fx, not coarsened; draining the buffer for it instead",
@@ -954,7 +1090,23 @@ int ext_rate_control_check(ExtRateControl *rc, size_t bits, size_t overhead_bits
 		qp = qp_max;
 	else
 	{
-		qp = rc->current_qp + (int)lround(rc->slope * log2(wire / ceiling));
+		/* Steer by this picture's own gradient once it has one, and fall back
+		 * on the learned slope only for the first step, where nothing has
+		 * been measured yet.
+		 *
+		 * The learned slope is a median over a window that mixes intra and
+		 * inter pictures, and their gradients differ by roughly threefold, so
+		 * on an intra picture it understates the step badly. Measured on
+		 * oldtown_720 picture 50 at a 108 kbit buffer: the gradient between
+		 * the picture's own first two attempts was 6.36 QP per doubling while
+		 * the learned slope was 2.02, so every step was a third of the size
+		 * it needed - qp 33, 36, 38, 40, 41 - and the ladder spent its
+		 * attempt limit at qp 41 and 148.9 kbit with qp 51 still available
+		 * and the buffer overflowing as a result. At the measured gradient
+		 * the second step lands on qp 45, which fits. */
+		double const g = local_slope(rc, bits);
+
+		qp = rc->current_qp + (int)lround((g > 0.0 ? g : rc->slope) * log2(wire / ceiling));
 		if (qp <= rc->current_qp) qp = rc->current_qp + 1;
 		if (qp > qp_max) qp = qp_max;
 	}
@@ -1051,6 +1203,7 @@ void ext_rate_control_post(ExtRateControl *rc, size_t bits, size_t overhead_bits
 	if (is_intra)
 		rc->last_intra_bits = b;
 	rc->intra_drain_bits = 0.0;
+	rc->forced_sync_point = 0;
 
 	b = wire;
 
@@ -1093,11 +1246,60 @@ void ext_rate_control_post(ExtRateControl *rc, size_t bits, size_t overhead_bits
 		}
 	}
 
-	rc->bucket += b - rc->bit_per_pic;
-	if (rc->bucket < 0.0)
 	{
-		rc->bucket = 0.0;
-		rc->num_bucket_empty++;
+		/* Whether the rule was honoured is decided here, because here is where
+		 * the bucket learns what the picture cost. Logged once per episode -
+		 * on the transition into overflow, not on every picture that stays
+		 * there - so a stream at a hard operating point reports each event
+		 * rather than a line per frame. */
+		double const room_before = (rc->bucket_cap > rc->bucket)
+		                         ? (rc->bucket_cap - rc->bucket) : 0.0;
+		int const was_empty = (rc->bucket <= 0.0);
+		int const was_over = (rc->bucket > rc->bucket_cap);
+
+		rc->bucket += b - rc->bit_per_pic;
+		if (rc->bucket < 0.0)
+		{
+			rc->bucket = 0.0;
+			rc->num_bucket_empty++;
+		}
+
+		if (rc->bucket > rc->bucket_cap)
+		{
+			double const fill = rc->bucket / rc->bucket_cap;
+
+			rc->num_overflows++;
+			if (was_empty)
+				rc->num_forced_overflows++;
+			if (fill > rc->max_overflow_fill)
+				rc->max_overflow_fill = fill;
+
+			if (!was_over)
+			{
+				rc->skip_state = 2;
+				if (was_empty)
+					/* ERROR, not WARNING: the library's default threshold is
+					 * ERROR, and a breached buffer is the one thing an
+					 * operator must not have to opt in to see. Rare by
+					 * construction - once per hard operating point - so it
+					 * cannot spam. The text, not the level, says whether the
+					 * rule held. */
+					IMX_VPU_API_ERROR(
+						"new CBR: picture %lu of %.1f kbit does not fit even an empty "
+						"%.1f kbit HRD buffer, so it was sent rather than withheld "
+						"further; buffer now %.0f%% of cap and pictures will be refused "
+						"until it drains",
+						rc->num_pictures, b / 1000.0, rc->bucket_cap / 1000.0,
+						fill * 100.0);
+				else
+					IMX_VPU_API_ERROR(
+						"new CBR: HRD buffer overflowed to %.0f%% of cap on picture %lu "
+						"- %.1f kbit into %.1f kbit of room, with the buffer not empty, "
+						"so something could still have been done. The no-overflow rule "
+						"was broken; this is a bug, not a hard operating point",
+						fill * 100.0, rc->num_pictures, b / 1000.0, room_before / 1000.0);
+			}
+		}
 	}
 	rc->prev_qp = rc->current_qp;
 	rc->num_pictures++;
@@ -1105,6 +1307,22 @@ void ext_rate_control_post(ExtRateControl *rc, size_t bits, size_t overhead_bits
 	/* A picture got through, so the run of refusals is over. Counting runs
 	 * rather than a total is what keeps the valve from starving the stream:
 	 * the limit is on consecutive skips, and one coded picture clears it. */
+	/* Edge: back to normal. Either the picture fit again or the buffer has
+	 * drained back under its cap - both mean the excursion is over, and it is
+	 * the one edge that says the stream recovered rather than that it is
+	 * still in trouble. */
+	if ((rc->skip_state != 0) && (rc->bucket <= rc->bucket_cap))
+	{
+		IMX_VPU_API_INFO(
+			"new CBR: picture %lu fits again - %.1f kbit with the buffer at %.0f%% of "
+			"cap after %u refusals; no longer skipping",
+			rc->num_pictures, b / 1000.0, rc->bucket * 100.0 / rc->bucket_cap,
+			rc->skip_run);
+		rc->skip_state = 0;
+	}
+	if (rc->current_qp < (is_intra ? rc->qp_max_intra : rc->qp_max_inter))
+		rc->qp_max_reported = 0;
+
 	rc->skip_run = 0;
 	if (is_intra)
 		rc->intra_bootstrap_pending = 0;
