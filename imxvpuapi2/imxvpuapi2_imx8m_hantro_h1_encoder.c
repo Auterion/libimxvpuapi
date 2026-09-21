@@ -2368,6 +2368,15 @@ static ImxVpuApiEncReturnCodes h1_h264_open_encoder(ImxVpuApiEncoder *base, void
 			 * keyframe it cannot fit differently in each case, and only
 			 * the encoder knows which mechanism the plan resolved to. */
 			rc_params.keyframe_mode = !encoder->refresh_active;
+			/* This encoder cannot take a predicted picture back: the
+			 * references are rotated and the counters advanced inside
+			 * H264EncStrmEncode(), so a picture the model mis-sized goes
+			 * out as it is. Bounding how far the quantiser may fall in one
+			 * picture bounds how wrong that picture can be. Measured on
+			 * vtc1nw_720x480 at 800 kbps: qp 27 -> 17 in one step, 149 kbit
+			 * into an 88 kbit buffer. The VC8000E leaves this unbounded,
+			 * because its ladder re-encodes the same mistake away. */
+			rc_params.qp_down_step = 4;
 
 			if (ext_rate_control_init(&(encoder->new_cbr), &rc_params) != 0)
 			{

@@ -111,6 +111,25 @@ typedef struct
 	 * see ext_rate_control_keyframe_ready(). */
 	unsigned int keyframe_mode;
 
+	/* How far the quantiser may fall in one picture, relative to the last
+	 * picture actually coded. 0 means unbounded, which is the right setting
+	 * wherever an oversized picture can be re-encoded.
+	 *
+	 * It exists for the encoders where it cannot. The QP comes from
+	 * inverting an exponential model, so an error in the model is an error
+	 * in the exponent: on vtc1nw_720x480 the complexity EMA sat at 19.52
+	 * between a cheap mode at 18.7 and an expensive one at 21.8, asked for
+	 * qp 17 ten steps below the last measured picture, predicted 31 kbit and
+	 * got 149 - 4.8x, which is 2^2.25 of model error. Bounding the step
+	 * bounds the extrapolation, and with it the size of the mistake a single
+	 * picture can make. Raising the quantiser stays unbounded: that
+	 * direction makes pictures smaller, and refusing to let the controller
+	 * retreat quickly is what would cause the overflow.
+	 *
+	 * Set on the H1, where a predicted picture is committed the moment
+	 * H264EncStrmEncode() returns and the model error reaches the wire. Left
+	 * at 0 on the VC8000E, whose ladder re-encodes the mistake away. */
+	unsigned int qp_down_step;
 }
 ExtRateControlParams;
 
@@ -133,6 +152,9 @@ typedef struct
 	int qp_min_inter, qp_max_inter;
 	int qp_min_intra, qp_max_intra;
 	int keyframe_mode;
+	/* Largest fall in QP allowed from one coded picture to the next; 0 is
+	 * unbounded. See ExtRateControlParams. */
+	int qp_down_step;
 
 	/* --- tuning; see ext_rate_control_init() for what each one does --- */
 	double gain, setpoint, target_min, target_max;
@@ -345,6 +367,8 @@ typedef struct
 	 * hard operating point. max_overflow_fill is the worst level reached, as
 	 * a share of the cap. */
 	unsigned long num_overflows;
+	/* How many pictures had their QP fall clamped by qp_down_step. */
+	unsigned long num_qp_down_clamped;
 	unsigned long num_forced_overflows;
 	double max_overflow_fill;
 

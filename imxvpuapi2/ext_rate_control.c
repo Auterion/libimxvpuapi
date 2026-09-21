@@ -85,6 +85,11 @@ int ext_rate_control_init(ExtRateControl *rc, ExtRateControlParams const *params
 	 * percent, for debugging only. */
 	rc->cap_share = env_int("EXT_RC_CAP", 50) / 100.0;
 	rc->keyframe_mode = (params->keyframe_mode != 0);
+	/* Bound on how far the quantiser may fall in one picture. The caller
+	 * sets it per encoder - see ExtRateControlParams - and the environment
+	 * can override it for a sweep. Negative is meaningless; 0 is unbounded. */
+	rc->qp_down_step = env_int("EXT_RC_QP_DOWN_STEP", (int)params->qp_down_step);
+	if (rc->qp_down_step < 0) rc->qp_down_step = 0;
 	rc->qp_min_inter = (int)params->qp_min_inter;
 	rc->qp_max_inter = (params->qp_max_inter > 0) ? (int)params->qp_max_inter : 51;
 	rc->qp_min_intra = (int)params->qp_min_intra;
@@ -761,6 +766,25 @@ int ext_rate_control_pre(ExtRateControl *rc, int is_intra, size_t overhead_bits)
 	}
 	else
 		rc->current_qp = (rc->prev_qp >= 0) ? rc->prev_qp : 32;
+
+	/* One direction only. Falling QP means a bigger picture, and the model
+	 * that asked for the fall was last checked against reality at prev_qp,
+	 * so the further below it this lands the less the prediction is worth.
+	 * Rising QP needs no bound: it makes pictures smaller, and slowing the
+	 * controller's retreat is how a buffer overflows.
+	 *
+	 * prev_qp is the last picture actually coded, not the last one
+	 * attempted, so a run of refusals does not let the bound drift away
+	 * from a measured operating point. */
+	if ((rc->qp_down_step > 0) && (rc->prev_qp >= 0)
+	 && (rc->current_qp < (rc->prev_qp - rc->qp_down_step)))
+	{
+		IMX_VPU_API_LOG("new CBR:   qp %d is %d below the last coded picture's %d; "
+		                "holding at %d", rc->current_qp, rc->prev_qp - rc->current_qp,
+		                rc->prev_qp, rc->prev_qp - rc->qp_down_step);
+		rc->current_qp = rc->prev_qp - rc->qp_down_step;
+		rc->num_qp_down_clamped++;
+	}
 
 	{
 		int const lo = is_intra ? rc->qp_min_intra : rc->qp_min_inter;

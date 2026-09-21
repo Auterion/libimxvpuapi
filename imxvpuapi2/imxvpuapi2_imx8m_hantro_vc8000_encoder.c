@@ -1161,6 +1161,12 @@ static ImxVpuApiEncReturnCodes init_vcenc_instance(ImxVpuApiEncoder *encoder,
 			 * keyframe it cannot fit differently in each case, and only
 			 * the encoder knows which mechanism the plan resolved to. */
 			rc_params.keyframe_mode = !encoder->refresh_active;
+			/* qp_down_step is deliberately left at 0 here. A picture this
+			 * encoder mis-sizes is re-encoded by the ladder before anything
+			 * reaches the wire, so bounding the quantiser's fall would only
+			 * slow the controller down on genuine content changes without
+			 * preventing anything. Contrast the H1 encoder, which cannot
+			 * re-encode a predicted picture and sets it. */
 
 			if (ext_rate_control_init(&encoder->new_cbr, &rc_params) != 0)
 			{
