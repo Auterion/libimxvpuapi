@@ -1240,8 +1240,16 @@ static ImxVpuApiEncReturnCodes init_vcenc_instance(ImxVpuApiEncoder *encoder,
 		rate_control_config.hrd = !!(open_params->flags & IMX_VPU_API_ENC_H26x_OPEN_PARAMS_FLAG_USE_HRD);
 		/* 0 means one second of bitrate, and the hardware model gets the
 		 * five frame budget floor it needs - see
-		 * imx_vpu_api_enc_hrd_buffer_bits(). */
-		rate_control_config.hrdCpbSize = imx_vpu_api_enc_hrd_buffer_bits(open_params, 5);
+		 * imx_vpu_api_enc_hrd_buffer_bits().
+		 *
+		 * Sized only when the hardware model is actually on. The floor warns
+		 * when it clamps, and the field is inert at hrd=0 - which is every
+		 * rate-control=1 stream, since the new CBR path zeroes hrd below - so
+		 * computing it regardless made a 180 kbit buffer log "clamping" to 266
+		 * kbit on a stream whose rate control was honouring 180 kbit exactly.
+		 * Matches what the H1 encoder already does. */
+		if (rate_control_config.hrd)
+			rate_control_config.hrdCpbSize = imx_vpu_api_enc_hrd_buffer_bits(open_params, 5);
 		rate_control_config.bitrateWindow = open_params->gop_size;
 		rate_control_config.intraQpDelta = open_params->intra_qp_delta;
 		rate_control_config.tolMovingBitRate = 2000;
