@@ -329,6 +329,7 @@ int ext_rate_control_init(ExtRateControl *rc, ExtRateControlParams const *params
 	rc->prev_attempt_bits = 0;
 
 	rc->prev_qp = -1;
+	rc->prev_target = 0.0;
 	rc->intra_bootstrap_pending = 1;
 
 	return 0;
@@ -776,14 +777,40 @@ int ext_rate_control_pre(ExtRateControl *rc, int is_intra, size_t overhead_bits)
 	 * prev_qp is the last picture actually coded, not the last one
 	 * attempted, so a run of refusals does not let the bound drift away
 	 * from a measured operating point. */
-	if ((rc->qp_down_step > 0) && (rc->prev_qp >= 0)
-	 && (rc->current_qp < (rc->prev_qp - rc->qp_down_step)))
+	if ((rc->qp_down_step > 0) && (rc->prev_qp >= 0))
 	{
-		IMX_VPU_API_LOG("new CBR:   qp %d is %d below the last coded picture's %d; "
-		                "holding at %d", rc->current_qp, rc->prev_qp - rc->current_qp,
-		                rc->prev_qp, rc->prev_qp - rc->qp_down_step);
-		rc->current_qp = rc->prev_qp - rc->qp_down_step;
-		rc->num_qp_down_clamped++;
+		/* Only the unexplained part of the fall is bounded. When the budget
+		 * itself has grown, the QP that budget buys is lower by
+		 * slope*log2(ratio), and refusing that is not caution - it is
+		 * quantising this picture for the previous picture's budget.
+		 *
+		 * That is not hypothetical: with a small buffer the target hits
+		 * target_min every time the buffer fills, the QP spikes, and the
+		 * budget recovers in one picture while a flat bound needs three or
+		 * four to walk back down. On akiyo_352x288 at 235 kbps the target
+		 * went 1175 -> 7770 bits between two pictures and the encoder spent
+		 * the next three quantising for the 1175. Over the library that was
+		 * a systematic 12% rate shortfall - 119 of 136 clips under target
+		 * and not one over it.
+		 *
+		 * A fall the budget did not pay for still gets qp_down_step and no
+		 * more, which is what catches the model errors this exists for: on
+		 * parkrun the target was unchanged across the collapse from qp 32 to
+		 * qp 6, so the allowance stays 4. */
+		int allowed = rc->qp_down_step;
+
+		if ((rc->prev_target > 0.0) && (target > rc->prev_target))
+			allowed += (int)lround(rc->slope * log2(target / rc->prev_target));
+
+		if (rc->current_qp < (rc->prev_qp - allowed))
+		{
+			IMX_VPU_API_LOG("new CBR:   qp %d is %d below the last coded picture's %d "
+			                "(%d earned by the budget); holding at %d",
+			                rc->current_qp, rc->prev_qp - rc->current_qp, rc->prev_qp,
+			                allowed - rc->qp_down_step, rc->prev_qp - allowed);
+			rc->current_qp = rc->prev_qp - allowed;
+			rc->num_qp_down_clamped++;
+		}
 	}
 
 	{
@@ -1326,6 +1353,7 @@ void ext_rate_control_post(ExtRateControl *rc, size_t bits, size_t overhead_bits
 		}
 	}
 	rc->prev_qp = rc->current_qp;
+	rc->prev_target = (double)(rc->current_target);
 	rc->num_pictures++;
 	rc->sum_bits += b;
 	/* A picture got through, so the run of refusals is over. Counting runs

@@ -155,6 +155,10 @@ typedef struct
 	/* Largest fall in QP allowed from one coded picture to the next; 0 is
 	 * unbounded. See ExtRateControlParams. */
 	int qp_down_step;
+	/* The target the last coded picture was aimed at. The step bound is on
+	 * the *unexplained* part of a QP fall, so a fall the budget itself has
+	 * earned has to be recognised and allowed. */
+	double prev_target;
 
 	/* --- tuning; see ext_rate_control_init() for what each one does --- */
 	double gain, setpoint, target_min, target_max;
