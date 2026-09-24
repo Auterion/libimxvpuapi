@@ -217,6 +217,24 @@ void imx_vpu_api_intra_refresh_step(ImxVpuApiIntraRefreshState *state,
 		split_range(cfg->ctb_cols, state->col_steps, col_step,
 		            &(band->left), &(band->right));
 
+		/* One row of margin past the region this step owns, so the next
+		 * band starts on a row this one already coded intra.
+		 *
+		 * Contiguous bands are not enough to make the sweep recoverable.
+		 * Nothing stops an already refreshed row from predicting out of
+		 * a row the sweep has not reached yet, and the hardware searches
+		 * up to 64 pixels - one h.265 CTB row - vertically, so with the
+		 * bands merely touching, the row at the frontier pulls from
+		 * unrefreshed picture on every inter picture and the error walks
+		 * back up as fast as the sweep cleans. Measured: a decoder
+		 * joining mid stream never converged on any tested entry point.
+		 * The vendor sweep does not have this problem because its band
+		 * is two rows advancing one - the extra row is exactly the
+		 * reach - and it recovers in the 11 pictures its recovery point
+		 * advertises. See intra_refresh.h on what else this needs. */
+		if (band->bottom < (cfg->ctb_rows - 1))
+			band->bottom++;
+
 		if (band->bottom > (cfg->ctb_rows - 1))
 			band->bottom = cfg->ctb_rows - 1;
 		if (band->right > (cfg->ctb_cols - 1))
