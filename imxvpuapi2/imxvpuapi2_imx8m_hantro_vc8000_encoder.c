@@ -2884,7 +2884,11 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 	 * attempt that is kept is reported to the rate control, so its model
 	 * never sees the discarded ones. Re-encoding is deterministic and leaves
 	 * the reference chain intact - the encoder has not been told to advance
-	 * yet, which is what VCEncFindNextPic() below does. */
+	 * yet, which is what VCEncFindNextPic() below does. Except for one
+	 * counter: h.264's frame_num, which the encoder steps on every call, so
+	 * each discarded attempt is undone with VCEncDiscardPicture() first, or
+	 * the stream gets a frame_num gap per attempt and decoders lose their
+	 * references. */
 	if (encoder->new_cbr_active && (enc_ret == VCENC_FRAME_READY))
 	{
 		int const is_intra = (encoder_output.codingType == VCENC_INTRA_FRAME);
@@ -2899,6 +2903,7 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 			if (VCEncSetRateCtrl(encoder->encoder, &(encoder->cached_rate_ctrl)) != VCENC_OK)
 				break;
 
+			VCEncDiscardPicture(encoder->encoder);
 			memset(&retry_output, 0, sizeof(retry_output));
 			if (encode_one_picture(encoder, encoder_input, &retry_output) != VCENC_FRAME_READY)
 				break;
@@ -2941,6 +2946,7 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 			 * never going to be sent for a picture that is not sent. */
 			ext_rate_control_skip(&(encoder->new_cbr), is_intra,
 			                      (size_t)(encoder_output.streamSize) * 8, &cu_stats);
+			VCEncDiscardPicture(encoder->encoder);
 			goto skipped;
 		}
 	}
