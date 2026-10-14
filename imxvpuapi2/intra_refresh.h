@@ -132,6 +132,11 @@ typedef struct
 	 * long, and telling it to wait out the idle tail as well would make it
 	 * hold back frames it could already show. */
 	int recovery_count;
+
+	/* This picture begins a sweep. Set even when recovery_count is 0, which
+	 * is what a sweep of a single region gives: the picture is then complete
+	 * by itself, and is still the point a decoder can join at. */
+	int sweep_start;
 }
 ImxVpuApiIntraRefreshBand;
 

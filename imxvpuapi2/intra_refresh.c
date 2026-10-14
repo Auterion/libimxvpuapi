@@ -245,6 +245,8 @@ void imx_vpu_api_intra_refresh_step(ImxVpuApiIntraRefreshState *state,
 
 		if (step == 0)
 		{
+			band->sweep_start = 1;
+
 			/* The picture the last region of this sweep lands on,
 			 * which is when the picture is completely refreshed. */
 			band->recovery_count =

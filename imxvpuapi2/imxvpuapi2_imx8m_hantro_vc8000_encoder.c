@@ -2484,10 +2484,12 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 	/* Re-send the parameter sets every GOP, so a receiver that joined late or
 	 * lost them can start decoding without waiting for a new stream.
 	 *
-	 * In every mode, not just the refresh ones. gstimxvpuenc does this too -
-	 * it caches the first frame's parameter sets and appends them to the
-	 * output buffer every gop-size frames when the frame does not already
-	 * carry them - and doing it there is invisible to the rate control,
+	 * In every mode but a sweep driven from here, which sends them with its
+	 * recovery points instead - see the refresh scheduler below.
+	 * gstimxvpuenc used to do this too - it cached the first frame's
+	 * parameter sets and appended them to the output buffer every gop-size
+	 * frames when the frame did not already carry them - and doing it there
+	 * is invisible to the rate control,
 	 * because it happens after imx_vpu_api_enc_get_encoded_frame_ext() has
 	 * returned and the bits have been accounted. That is a real leak: 89
 	 * bytes of VPS, SPS and PPS reach the link that the leaky bucket was
@@ -2501,7 +2503,7 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 	 * require a refresh mode, which is why the leak only ever showed in IDR
 	 * mode - with a sweep running, this branch already fired and the element
 	 * stayed out of it. */
-	if (!encoder->has_header && (encoder->num_encoded_pictures > 0) &&
+	if (!encoder->has_header && !encoder->refresh_active && (encoder->num_encoded_pictures > 0) &&
 	    (encoder->open_params.gop_size > 0) &&
 	    (((int)(encoder->num_encoded_pictures) % (int)(encoder->open_params.gop_size)) == 0))
 	{
@@ -2755,11 +2757,21 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 			}
 		}
 
-		if (band.recovery_count > 0)
+		if (band.sweep_start)
 		{
 			encoder->recovery_sei_size = imx_vpu_api_build_recovery_point_sei(
 				encoder->recovery_sei, band.recovery_count,
 				encoder->open_params.compression_format == IMX_VPU_API_COMPRESSION_FORMAT_H264);
+		}
+
+		/* With a sweep running the parameter sets go with every recovery
+		 * point SEI - each sweep start and the full refresh - rather than
+		 * on the GOP cadence above, which a keyframe request's realign of
+		 * the sweep would leave out of step with it. */
+		if ((encoder->recovery_sei_size > 0) && !encoder->has_header)
+		{
+			encoder->has_header = TRUE;
+			*encoded_frame_size += encoder->header_data_size;
 		}
 
 		if (band.apply)

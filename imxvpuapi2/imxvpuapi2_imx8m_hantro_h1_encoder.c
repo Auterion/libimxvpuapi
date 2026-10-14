@@ -2769,21 +2769,11 @@ static ImxVpuApiEncReturnCodes h1_h264_encode_frame(void *h1_encoder, ImxVpuApiF
 		if (frame_type == IMX_VPU_API_FRAME_TYPE_UNKNOWN)
 			frame_type = IMX_VPU_API_FRAME_TYPE_P;
 
-		/* Re-send the parameter sets once per GOP, so a receiver that joined
-		 * late or lost them can start decoding. Only in this mode: there is
-		 * no IDR here to carry them, whereas the vendor writes them into
-		 * every IDR itself, and adding a copy there would put two sets on
-		 * the link.
-		 *
-		 * It has to come from the library rather than from gstimxvpuenc,
-		 * which used to append a cached copy every gop-size frames. That
-		 * happened after imx_vpu_api_enc_get_encoded_frame_ext() had
-		 * returned and the bits had been accounted, so the rate control was
-		 * never charged for them: 89 bytes onto the link per GOP that the
-		 * leaky bucket could not see. */
-		if ((base->open_params.gop_size > 0)
-		 && ((encoder->gop_frame_counter % base->open_params.gop_size) == 0))
-			base->must_prepend_header_data = TRUE;
+		/* The parameter sets are re-sent with every recovery point SEI, in
+		 * the sweep block below, and not on a GOP cadence: a keyframe
+		 * request realigns the sweep but not the GOP counter, which left
+		 * the two apart for the rest of the stream, and the full refresh
+		 * that answered the request went out without them. */
 	}
 	else if ((encoder->gop_frame_counter % base->open_params.gop_size) == 0)
 	{
@@ -2927,10 +2917,17 @@ static ImxVpuApiEncReturnCodes h1_h264_encode_frame(void *h1_encoder, ImxVpuApiF
 				imx_vpu_api_intra_refresh_step(&(encoder->refresh_state), &(encoder->refresh_cfg),
 				                               0, 0, &band);
 
-				if (band.recovery_count > 0)
+				if (band.sweep_start)
 					encoder->recovery_sei_size = imx_vpu_api_build_recovery_point_sei(
 						encoder->recovery_sei, band.recovery_count, 1);
 			}
+
+			/* A decoder joins at a recovery point, so that is where the
+			 * parameter sets go: on every sweep start and on the full
+			 * refresh, and charged to the rate control like the rest of
+			 * the picture. The vendor writes them into IDRs itself. */
+			if (encoder->recovery_sei_size > 0)
+				base->must_prepend_header_data = TRUE;
 
 			if (band.apply)
 			{
