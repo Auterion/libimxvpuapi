@@ -521,6 +521,21 @@ int ext_rate_control_keyframe_ready(ExtRateControl const *rc);
  * receiver rather than of the rate the encoder was asked for. */
 void ext_rate_control_set_bitrate(ExtRateControl *rc, unsigned int bitrate_bps);
 
+/* Resize the HRD buffer to buffer_bits, which the caller has already resolved
+ * (0 and the floor are the caller's business, as they are at init). A level
+ * above the new size is clamped to it: the controller then sees a full buffer
+ * and codes coarse, or refuses pictures, until the link has drained it. */
+void ext_rate_control_set_buffer(ExtRateControl *rc, unsigned int buffer_bits);
+
+/* Replace the QP range, with the same meaning and clamping as the fields of
+ * ExtRateControlParams. The quantiser the controller is carrying - the last
+ * one coded, and the one it would code at next - is clamped into the new
+ * inter range, so the next picture starts inside it rather than jumping to it
+ * from wherever the old range had left it. */
+void ext_rate_control_set_qp_range(ExtRateControl *rc,
+                                   unsigned int qp_min_inter, unsigned int qp_max_inter,
+                                   unsigned int qp_min_intra, unsigned int qp_max_intra);
+
 
 #ifdef __cplusplus
 }

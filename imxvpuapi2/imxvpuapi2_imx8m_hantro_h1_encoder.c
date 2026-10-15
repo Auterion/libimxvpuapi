@@ -621,13 +621,32 @@ void imx_vpu_api_enc_flush(ImxVpuApiEncoder *encoder)
 ImxVpuApiEncReturnCodes imx_vpu_api_enc_set_bitrate(ImxVpuApiEncoder *encoder, unsigned int bitrate)
 {
 	IMX_VPU_API_UNUSED_PARAM(encoder);
-	IMX_VPU_API_UNUSED_PARAM(bitrate);
+
+	if (bitrate == 0)
+	{
+		IMX_VPU_API_ERROR("bitrate 0 is not a bitrate: constant quantization can only be chosen at open");
+		return IMX_VPU_API_ENC_RETURN_CODE_INVALID_PARAMS;
+	}
+
 
 	/* XXX: Not supporting this, since CBR bitstreams with changing
 	 * bit rates  can mess up decoders, which expect no such chnages.
 	 * This function might be deprecated in a future version. */
 
 	return IMX_VPU_API_ENC_RETURN_CODE_OK;
+}
+
+
+/* Live reconfiguration needs the rate control and the refresh sweep to be the
+ * library's to steer between pictures, which so far is only the case on the
+ * VC8000E at rate_control_mode 1. */
+ImxVpuApiEncReturnCodes imx_vpu_api_enc_reconfigure(ImxVpuApiEncoder *encoder, ImxVpuApiEncReconfigParams const *params)
+{
+	IMX_VPU_API_UNUSED_PARAM(encoder);
+	IMX_VPU_API_UNUSED_PARAM(params);
+	IMX_VPU_API_ERROR("reconfigure is not supported on this encoder (Hantro H1); "
+	                  "only the VC8000E implements it");
+	return IMX_VPU_API_ENC_RETURN_CODE_INVALID_CALL;
 }
 
 

@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 #include <imxdmabuffer/imxdmabuffer.h>
 
 
@@ -2761,8 +2762,158 @@ void imx_vpu_api_enc_flush(ImxVpuApiEncoder *encoder);
  *
  * IMX_VPU_API_ENC_RETURN_CODE_INVALID_CALL: Function was called even
  * though rate control was disabled in the encoder's ImxVpuApiEncOpenParams.
+ *
+ * IMX_VPU_API_ENC_RETURN_CODE_INVALID_PARAMS: bitrate is 0, or (VC8000E) the
+ * encoder refused it, e.g. below 10 kbps. The previous bitrate stays.
  */
 ImxVpuApiEncReturnCodes imx_vpu_api_enc_set_bitrate(ImxVpuApiEncoder *encoder, unsigned int bitrate);
+
+/* Field groups of ImxVpuApiEncReconfigParams. Only the groups named in flags
+ * are read; everything else keeps its current value. A group is applied as a
+ * whole, so every field of a group that is named has to be filled in, with
+ * the value it is meant to keep if it is not meant to change. */
+typedef enum
+{
+	/* bitrate */
+	IMX_VPU_API_ENC_RECONFIG_BITRATE       = (1u << 0),
+	/* hrd_buffer_size */
+	IMX_VPU_API_ENC_RECONFIG_HRD_BUFFER    = (1u << 1),
+	/* qp_min_inter, qp_max_inter, qp_min_intra, qp_max_intra */
+	IMX_VPU_API_ENC_RECONFIG_QP_RANGE      = (1u << 2),
+	/* intra_refresh_period, intra_refresh_duration, intra_refresh_height */
+	IMX_VPU_API_ENC_RECONFIG_INTRA_REFRESH = (1u << 3),
+	/* slice_height */
+	IMX_VPU_API_ENC_RECONFIG_SLICE         = (1u << 4),
+}
+ImxVpuApiEncReconfigFlags;
+
+/* Every flag this version of the library knows. Any other bit in
+ * ImxVpuApiEncReconfigParams.flags is rejected. */
+#define IMX_VPU_API_ENC_RECONFIG_ALL_FLAGS \
+	(IMX_VPU_API_ENC_RECONFIG_BITRATE | IMX_VPU_API_ENC_RECONFIG_HRD_BUFFER \
+	 | IMX_VPU_API_ENC_RECONFIG_QP_RANGE | IMX_VPU_API_ENC_RECONFIG_INTRA_REFRESH \
+	 | IMX_VPU_API_ENC_RECONFIG_SLICE)
+
+/* A set of encoder settings to change while the encoder runs, for
+ * imx_vpu_api_enc_reconfigure(). Initialize it with
+ * imx_vpu_api_enc_init_reconfig_params(), then set flags and the fields of
+ * the groups they name.
+ *
+ * The struct is designed to grow: new groups are appended at the end, and
+ * struct_size tells the library how much of it the caller knows about, so a
+ * caller built against an older, shorter version keeps working. */
+typedef struct
+{
+	/* sizeof(ImxVpuApiEncReconfigParams) as the caller was built with. Set by
+	 * imx_vpu_api_enc_init_reconfig_params(); do not change it. */
+	uint32_t struct_size;
+	/* Bitwise OR of ImxVpuApiEncReconfigFlags: which groups to apply. */
+	uint32_t flags;
+
+	/* BITRATE group. Link rate in kbps, at least 1. Unlike
+	 * imx_vpu_api_enc_set_bitrate(), this can be combined with
+	 * hrd_buffer_size so that the buffer keeps its length in time. */
+	unsigned int bitrate;
+
+	/* HRD_BUFFER group. HRD buffer size in kbits, i.e. how much coded data
+	 * may be in flight. 0 = one second of the bitrate, and if the BITRATE
+	 * group is applied at the same time, that is one second of the new
+	 * bitrate. The rate control enforces a floor of 2.5 frame budgets and
+	 * clamps to it with a warning, exactly as at open time. At most 65535,
+	 * the range of ImxVpuApiEncOpenParams.hrd_buffer_size. */
+	unsigned int hrd_buffer_size;
+
+	/* QP_RANGE group. Same meaning as the fields of the same name in
+	 * ImxVpuApiEncOpenParams: 0..51, a maximum of 0 means no ceiling (51),
+	 * and a minimum above its maximum is rejected. */
+	unsigned int qp_min_inter, qp_max_inter;
+	unsigned int qp_min_intra, qp_max_intra;
+
+	/* INTRA_REFRESH group. Same meaning as the fields of the same name in
+	 * ImxVpuApiEncOpenParams. intra_refresh_period: 0 = what 0 meant at
+	 * open, i.e. the deprecated gdr_refresh_period or roll_size if one was
+	 * set, else gop_size; at most 65535. intra_refresh_duration: 0 = the period, at most 255, and a
+	 * duration longer than the period is clamped to it.
+	 * intra_refresh_height: coding-unit rows, 0 = the codec default, at most
+	 * the number of coding-unit rows in the picture.
+	 *
+	 * Applying this group restarts the sweep at the top of the picture on
+	 * the next coded picture, with a recovery point SEI, so recovery under
+	 * the new schedule starts at once rather than at the next scheduled
+	 * sweep start. Regions queued with
+	 * imx_vpu_api_enc_set_intra_refresh_region() stay queued. */
+	unsigned int intra_refresh_period;
+	unsigned int intra_refresh_duration;
+	unsigned int intra_refresh_height;
+
+	/* SLICE group. Slice height in coding-unit rows, 0 = one slice per
+	 * picture, at most the number of coding-unit rows in the picture.
+	 * h.265 signals the slice layout in the slice headers, so no new
+	 * parameter sets are needed. */
+	unsigned int slice_height;
+
+	/* Future groups are appended here; struct_size keeps old callers valid. */
+}
+ImxVpuApiEncReconfigParams;
+
+/* Initializes params: zeroes it, sets struct_size and clears flags.
+ *
+ * Inline on purpose. struct_size has to be the size of the struct the
+ * *caller* was compiled with, and a function inside the library would write
+ * the library's size instead - and then the library would read past the end
+ * of an older caller's shorter struct. */
+static inline void imx_vpu_api_enc_init_reconfig_params(ImxVpuApiEncReconfigParams *params)
+{
+	memset(params, 0, sizeof(ImxVpuApiEncReconfigParams));
+	params->struct_size = (uint32_t)sizeof(ImxVpuApiEncReconfigParams);
+}
+
+/* Changes encoder settings while the encoder runs, without reopening it,
+ * without a keyframe and without new parameter sets.
+ *
+ * The parameters are validated here, synchronously, and staged. The settings
+ * that live in the encoder hardware's own configuration (the slice layout and
+ * the mirrored rate control fields) are handed to it here as well, so that a
+ * refusal is this call's return code. They all take effect together, at the
+ * next picture boundary - the next imx_vpu_api_enc_encode() call - so no
+ * picture is ever coded with half of a reconfiguration, and OK means the next
+ * picture is coded with all of it. A second call before that picture merges into what is
+ * already staged; for each group, the later call wins. A call that is invalid
+ * in any part is rejected as a whole and leaves both the encoder and anything
+ * staged unchanged. Every rejection is logged with its reason at error level.
+ *
+ * A staged bitrate and one set with imx_vpu_api_enc_set_bitrate() are the
+ * same setting: whichever call came last wins.
+ *
+ * Must not be called concurrently with the other imx_vpu_api_enc_*
+ * functions on the same encoder.
+ *
+ * Only implemented for the VC8000E, and only with rate_control_mode 1, which
+ * is where the rate control, the refresh sweep and the slice layout are under
+ * the library's control.
+ *
+ * @param encoder Encoder instance. Must not be NULL.
+ * @param params What to change. Must not be NULL. Initialize it with
+ *        imx_vpu_api_enc_init_reconfig_params().
+ * @return Return code indicating the outcome. Valid values:
+ *
+ * IMX_VPU_API_ENC_RETURN_CODE_OK: Staged. A params with no flags set is valid
+ * and changes nothing.
+ *
+ * IMX_VPU_API_ENC_RETURN_CODE_INVALID_CALL: The encoder cannot do this: it was
+ * not opened with rate_control_mode 1; it was opened with a bitrate of 0 and
+ * the BITRATE, HRD_BUFFER or QP_RANGE group is named; it was opened without
+ * intra refresh and the INTRA_REFRESH group is named; or the backend does not
+ * support reconfiguration at all (H1, CODA).
+ *
+ * IMX_VPU_API_ENC_RETURN_CODE_INVALID_PARAMS: Unknown flag bits, a
+ * struct_size this library cannot read, a value out of range, or a minimum QP
+ * above its maximum.
+ *
+ * IMX_VPU_API_ENC_RETURN_CODE_ERROR: The encoder hardware refused the slice
+ * layout or the rate control fields. Nothing changed.
+ */
+ImxVpuApiEncReturnCodes imx_vpu_api_enc_reconfigure(ImxVpuApiEncoder *encoder, ImxVpuApiEncReconfigParams const *params);
 
 void imx_vpu_api_enc_set_intra_refresh_region(ImxVpuApiEncoder *encoder, unsigned int first_ctb_row, unsigned int num_ctb_rows);
 
