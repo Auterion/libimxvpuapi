@@ -179,40 +179,48 @@ int imx_vpu_api_enc_session_unpack(ImxVpuApiEncSession *session, ImxVpuApiEncSes
 }
 
 
-unsigned int imx_vpu_api_enc_hrd_buffer_bits(ImxVpuApiEncOpenParams const *open_params,
-                                             double min_frame_budgets)
+unsigned int imx_vpu_api_enc_buffer_bits(unsigned int hrd_buffer_kbits, unsigned int bitrate_kbps,
+                                         unsigned int frame_rate_numerator,
+                                         unsigned int frame_rate_denominator,
+                                         double min_frame_budgets)
 {
-	unsigned int const bitrate_bps = open_params->bitrate * 1000u;
+	unsigned int const bitrate_bps = bitrate_kbps * 1000u;
 	unsigned int bits;
 
 	/* 0 means one second of bitrate. The two are numerically equal - one is
 	 * kbits, the other kbps - which is the point: a buffer that scales with
 	 * the rate, rather than a fixed kbit count meaning half a second at one
 	 * setting and two at another. */
-	bits = (open_params->hrd_buffer_size > 0)
-	     ? (((unsigned int)(open_params->hrd_buffer_size)) * 1000u)
-	     : bitrate_bps;
+	bits = (hrd_buffer_kbits > 0) ? (hrd_buffer_kbits * 1000u) : bitrate_bps;
 
 	if ((min_frame_budgets > 0.0)
-	 && (open_params->frame_rate_numerator > 0) && (open_params->frame_rate_denominator > 0))
+	 && (frame_rate_numerator > 0) && (frame_rate_denominator > 0))
 	{
 		unsigned int const min_bits = (unsigned int)((double)(bitrate_bps) * min_frame_budgets
-		                                             * open_params->frame_rate_denominator
-		                                             / open_params->frame_rate_numerator);
+		                                             * frame_rate_denominator
+		                                             / frame_rate_numerator);
 
 		if (bits < min_bits)
 		{
 			IMX_VPU_API_WARNING("hrd-buffer-size %u kbit is below %.1f frame budgets (%u kbit) at "
 			                    "%u kbps and %u/%u fps; clamping",
 			                    bits / 1000u, min_frame_budgets, min_bits / 1000u,
-			                    open_params->bitrate,
-			                    open_params->frame_rate_numerator,
-			                    open_params->frame_rate_denominator);
+			                    bitrate_kbps, frame_rate_numerator, frame_rate_denominator);
 			bits = min_bits;
 		}
 	}
 
 	return bits;
+}
+
+
+unsigned int imx_vpu_api_enc_hrd_buffer_bits(ImxVpuApiEncOpenParams const *open_params,
+                                             double min_frame_budgets)
+{
+	return imx_vpu_api_enc_buffer_bits(open_params->hrd_buffer_size, open_params->bitrate,
+	                                   open_params->frame_rate_numerator,
+	                                   open_params->frame_rate_denominator,
+	                                   min_frame_budgets);
 }
 
 
@@ -234,7 +242,7 @@ void imx_vpu_api_enc_session_rc_params(ExtRateControlParams *params,
 	 * peak against 75 - for nothing measurable on the rate. The hardware HRD
 	 * is a different matter and keeps its own floor; see the callers that
 	 * pass one. */
-	params->buffer_bits = imx_vpu_api_enc_hrd_buffer_bits(open_params, 2.5);
+	params->buffer_bits = imx_vpu_api_enc_hrd_buffer_bits(open_params, IMX_VPU_API_ENC_RC_MIN_FRAME_BUDGETS);
 
 	params->qp_min_inter = open_params->qp_min_inter;
 	params->qp_max_inter = open_params->qp_max_inter;

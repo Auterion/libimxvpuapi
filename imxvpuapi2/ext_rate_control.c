@@ -49,6 +49,21 @@ static int env_int(char const *name, int fallback)
 }
 
 
+static void apply_qp_range(ExtRateControl *rc,
+                           unsigned int qp_min_inter, unsigned int qp_max_inter,
+                           unsigned int qp_min_intra, unsigned int qp_max_intra)
+{
+	rc->qp_min_inter = (int)qp_min_inter;
+	rc->qp_max_inter = (qp_max_inter > 0) ? (int)qp_max_inter : 51;
+	rc->qp_min_intra = (int)qp_min_intra;
+	rc->qp_max_intra = (qp_max_intra > 0) ? (int)qp_max_intra : 51;
+	if (rc->qp_max_inter > 51) rc->qp_max_inter = 51;
+	if (rc->qp_max_intra > 51) rc->qp_max_intra = 51;
+	if (rc->qp_max_inter < rc->qp_min_inter) rc->qp_max_inter = rc->qp_min_inter;
+	if (rc->qp_max_intra < rc->qp_min_intra) rc->qp_max_intra = rc->qp_min_intra;
+}
+
+
 int ext_rate_control_init(ExtRateControl *rc, ExtRateControlParams const *params)
 {
 	double fps;
@@ -90,14 +105,8 @@ int ext_rate_control_init(ExtRateControl *rc, ExtRateControlParams const *params
 	 * can override it for a sweep. Negative is meaningless; 0 is unbounded. */
 	rc->qp_down_step = env_int("EXT_RC_QP_DOWN_STEP", (int)params->qp_down_step);
 	if (rc->qp_down_step < 0) rc->qp_down_step = 0;
-	rc->qp_min_inter = (int)params->qp_min_inter;
-	rc->qp_max_inter = (params->qp_max_inter > 0) ? (int)params->qp_max_inter : 51;
-	rc->qp_min_intra = (int)params->qp_min_intra;
-	rc->qp_max_intra = (params->qp_max_intra > 0) ? (int)params->qp_max_intra : 51;
-	if (rc->qp_max_inter > 51) rc->qp_max_inter = 51;
-	if (rc->qp_max_intra > 51) rc->qp_max_intra = 51;
-	if (rc->qp_max_inter < rc->qp_min_inter) rc->qp_max_inter = rc->qp_min_inter;
-	if (rc->qp_max_intra < rc->qp_min_intra) rc->qp_max_intra = rc->qp_min_intra;
+	apply_qp_range(rc, params->qp_min_inter, params->qp_max_inter,
+	               params->qp_min_intra, params->qp_max_intra);
 
 	/* How hard the bucket level pulls the target around, and the level it is
 	 * held at.
@@ -670,6 +679,44 @@ void ext_rate_control_set_bitrate(ExtRateControl *rc, unsigned int bitrate_bps)
 	 *
 	 * The complexity terms are in bits and were learned at the old rate, but
 	 * they describe the content, not the budget - they stay valid. */
+}
+
+
+void ext_rate_control_set_buffer(ExtRateControl *rc, unsigned int buffer_bits)
+{
+	if ((rc == NULL) || (buffer_bits == 0))
+		return;
+
+	rc->bucket_cap = (double)buffer_bits;
+	if (rc->bucket > rc->bucket_cap)
+		rc->bucket = rc->bucket_cap;
+	/* Per-picture ceilings and the valve's room are all derived from
+	 * bucket_cap when they are used, so nothing else needs recomputing. */
+}
+
+
+void ext_rate_control_set_qp_range(ExtRateControl *rc,
+                                   unsigned int qp_min_inter, unsigned int qp_max_inter,
+                                   unsigned int qp_min_intra, unsigned int qp_max_intra)
+{
+	if (rc == NULL)
+		return;
+
+	apply_qp_range(rc, qp_min_inter, qp_max_inter, qp_min_intra, qp_max_intra);
+
+	/* Inter, because nearly every picture is one; an intra picture is
+	 * clamped into its own range by ext_rate_control_pre() anyway. -1 means
+	 * nothing has been coded yet and stays. */
+	if (rc->prev_qp >= 0)
+	{
+		if (rc->prev_qp < rc->qp_min_inter) rc->prev_qp = rc->qp_min_inter;
+		if (rc->prev_qp > rc->qp_max_inter) rc->prev_qp = rc->qp_max_inter;
+	}
+	if (rc->current_qp < rc->qp_min_inter) rc->current_qp = rc->qp_min_inter;
+	if (rc->current_qp > rc->qp_max_inter) rc->current_qp = rc->qp_max_inter;
+
+	/* The ceiling report is per excursion; a new ceiling is a new one. */
+	rc->qp_max_reported = 0;
 }
 
 

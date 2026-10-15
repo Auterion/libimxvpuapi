@@ -261,11 +261,50 @@ typedef struct
 ImxVpuApiIntraRefreshPlan;
 
 
+/* The period a request resolves to: period, else the deprecated
+ * gdr_refresh_period, else for the rolling modes roll_size clamped to
+ * gop_size, else gop_size. imx_vpu_api_intra_refresh_plan() uses it, and a
+ * caller resolving a live period of 0 should too, so that 0 means the same
+ * thing it meant when the encoder was opened. */
+int imx_vpu_api_intra_refresh_period(ImxVpuApiIntraRefreshRequest const *req);
+
 /* Map a request onto a config and a plan. The config is resolved, so it can be
  * handed straight to imx_vpu_api_intra_refresh_init(). */
 void imx_vpu_api_intra_refresh_plan(ImxVpuApiIntraRefreshRequest const *req,
                                     ImxVpuApiIntraRefreshCfg *cfg,
                                     ImxVpuApiIntraRefreshPlan *plan);
+
+/* A new shape for a sweep that is already running: period, duration and band
+ * height as the intra_refresh_* fields spell them (duration 0 = period, rows
+ * 0 = the codec default), with everything else - picture geometry, coding
+ * unit, column split - kept from current. period must already be resolved,
+ * i.e. at least 1; the caller knows what 0 stands for and this does not.
+ *
+ * Fills plan's step geometry and wanted_steps the way
+ * imx_vpu_api_intra_refresh_plan() does; slicing is not part of a sweep and
+ * plan's slice fields are left at 0. Pure, like the rest of the scheduler:
+ * nothing changes until the caller adopts cfg and restarts the sweep with
+ * imx_vpu_api_intra_refresh_restart(). */
+void imx_vpu_api_intra_refresh_replan(ImxVpuApiIntraRefreshCfg const *current,
+                                      int period, int duration, int rows,
+                                      ImxVpuApiIntraRefreshCfg *cfg,
+                                      ImxVpuApiIntraRefreshPlan *plan);
+
+/* Abandon the sweep in progress and start a new one at the top on the next
+ * picture, under cfg.
+ *
+ * This is what a change of schedule wants. Carrying the old sweep's position
+ * over would place the first band of the new schedule wherever the old one
+ * had got to - a period-30 sweep twenty pictures in, switched to a period of
+ * eight, would wait out the rest of a sweep it no longer has, and the bands
+ * the receiver chains would jump. Restarting gives the receiver an unbroken
+ * chain from row 0, and the first band carries a recovery_count, so the
+ * caller emits a recovery point SEI for it exactly as for any sweep start.
+ *
+ * Only the sweep restarts. Requested regions are the caller's queue and are
+ * unaffected; they are served on the pictures the new sweep leaves free. */
+void imx_vpu_api_intra_refresh_restart(ImxVpuApiIntraRefreshState *state,
+                                       ImxVpuApiIntraRefreshCfg const *cfg);
 
 /* Slice height in CTB rows for a requested slice count, and the count that
  * height actually produces. Only the height is programmable - the hardware
