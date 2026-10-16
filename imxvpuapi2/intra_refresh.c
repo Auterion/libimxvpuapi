@@ -263,6 +263,27 @@ void imx_vpu_api_intra_refresh_step(ImxVpuApiIntraRefreshState *state,
 }
 
 
+int imx_vpu_api_intra_refresh_period(ImxVpuApiIntraRefreshRequest const *req)
+{
+	int period = req->period;
+
+	if (period == 0)
+		period = req->gdr_refresh_period;
+	/* The rolling modes took their period from roll_size, and clamped it to
+	 * gop_size because the wave was front loaded into each GOP. */
+	if ((period == 0) && ((req->num_rolling_slices > 0) || (req->num_rolling_tiles > 0)))
+	{
+		period = req->roll_size;
+		if ((period == 0) || (period > req->gop_size))
+			period = req->gop_size;
+	}
+	if (period == 0)
+		period = req->gop_size;
+
+	return period;
+}
+
+
 void imx_vpu_api_intra_refresh_plan(ImxVpuApiIntraRefreshRequest const *req,
                                     ImxVpuApiIntraRefreshCfg *cfg,
                                     ImxVpuApiIntraRefreshPlan *plan)
@@ -295,19 +316,7 @@ void imx_vpu_api_intra_refresh_plan(ImxVpuApiIntraRefreshRequest const *req,
 
 	if (plan->active)
 	{
-		period = req->period;
-		if (period == 0)
-			period = req->gdr_refresh_period;
-		/* The rolling modes took their period from roll_size, and clamped it to
-		 * gop_size because the wave was front loaded into each GOP. */
-		if ((period == 0) && ((num_rolling_slices > 0) || (num_rolling_tiles > 0)))
-		{
-			period = req->roll_size;
-			if ((period == 0) || (period > req->gop_size))
-				period = req->gop_size;
-		}
-		if (period == 0)
-			period = req->gop_size;
+		period = imx_vpu_api_intra_refresh_period(req);
 
 		rows = req->rows;
 		columns = 0;
@@ -360,6 +369,39 @@ void imx_vpu_api_intra_refresh_plan(ImxVpuApiIntraRefreshRequest const *req,
 		plan->slice_size = imx_vpu_api_slice_height_for_count(cfg->ctb_rows, slice_count,
 		                                                      &(plan->slice_count));
 	}
+}
+
+
+void imx_vpu_api_intra_refresh_replan(ImxVpuApiIntraRefreshCfg const *current,
+                                      int period, int duration, int rows,
+                                      ImxVpuApiIntraRefreshCfg *cfg,
+                                      ImxVpuApiIntraRefreshPlan *plan)
+{
+	*cfg = *current;
+	memset(plan, 0, sizeof(*plan));
+
+	cfg->period = period;
+	cfg->duration = duration;
+	/* resolve() turns 0 into the default and clamps a resolved height to the
+	 * picture, so the request has to go in as asked rather than as the
+	 * height the old schedule resolved to. */
+	cfg->rows = rows;
+
+	imx_vpu_api_intra_refresh_resolve(cfg, &(plan->num_steps), &(plan->row_steps),
+	                                  &(plan->col_steps));
+	plan->active = 1;
+	plan->wanted_steps = ((cfg->ctb_rows + cfg->rows - 1) / cfg->rows) * plan->col_steps;
+}
+
+
+void imx_vpu_api_intra_refresh_restart(ImxVpuApiIntraRefreshState *state,
+                                       ImxVpuApiIntraRefreshCfg const *cfg)
+{
+	/* The state after init is exactly "no band of this sweep coded yet, at
+	 * its first picture", and the first step it produces carries the
+	 * recovery count. A separate entry point anyway, because what it means
+	 * to a caller - drop the old sweep mid-way - is not what init means. */
+	imx_vpu_api_intra_refresh_init(state, cfg);
 }
 
 

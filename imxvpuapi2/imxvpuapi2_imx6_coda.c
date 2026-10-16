@@ -3674,6 +3674,12 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_set_bitrate(ImxVpuApiEncoder *encoder, u
 
 	assert(encoder != NULL);
 
+	if (bitrate == 0)
+	{
+		IMX_VPU_API_ERROR("bitrate 0 is not a bitrate: constant quantization can only be chosen at open");
+		return IMX_VPU_API_ENC_RETURN_CODE_INVALID_PARAMS;
+	}
+
 	if (encoder->open_params.bitrate == 0)
 	{
 		IMX_VPU_API_ERROR("rate control disabled in the imx_vpu_api_enc_open() parameters");
@@ -3691,6 +3697,19 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_set_bitrate(ImxVpuApiEncoder *encoder, u
 	}
 	else
 		return IMX_VPU_API_ENC_RETURN_CODE_OK;
+}
+
+
+/* Live reconfiguration needs the rate control and the refresh sweep to be the
+ * library's to steer between pictures, which so far is only the case on the
+ * VC8000E at rate_control_mode 1. */
+ImxVpuApiEncReturnCodes imx_vpu_api_enc_reconfigure(ImxVpuApiEncoder *encoder, ImxVpuApiEncReconfigParams const *params)
+{
+	IMX_VPU_API_UNUSED_PARAM(encoder);
+	IMX_VPU_API_UNUSED_PARAM(params);
+	IMX_VPU_API_ERROR("reconfigure is not supported on this encoder (CODA960); "
+	                  "only the VC8000E implements it");
+	return IMX_VPU_API_ENC_RETURN_CODE_INVALID_CALL;
 }
 
 
