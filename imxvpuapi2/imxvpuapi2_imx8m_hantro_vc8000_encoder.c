@@ -3075,6 +3075,18 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 	 * encoder does not perform any kind of delay or reordering, this is
 	 * appropriate, because in that case, one input frame always immediately
 	 * leads to one output frame. */
+	switch (encoder_output.codingType)
+	{
+		case VCENC_INTRA_FRAME:
+			encoder->encoded_frame_type = is_idr ? IMX_VPU_API_FRAME_TYPE_IDR : IMX_VPU_API_FRAME_TYPE_I;
+			break;
+		case VCENC_BIDIR_PREDICTED_FRAME:
+			encoder->encoded_frame_type = IMX_VPU_API_FRAME_TYPE_B;
+			break;
+		default:
+			encoder->encoded_frame_type = IMX_VPU_API_FRAME_TYPE_P;
+			break;
+	}
 	encoder->encoded_frame_context = encoder->staged_raw_frame.context;
 	encoder->encoded_frame_pts = encoder->staged_raw_frame.pts;
 	encoder->encoded_frame_dts = encoder->staged_raw_frame.dts;
@@ -3208,7 +3220,7 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_get_encoded_frame_ext(ImxVpuApiEncoder *
 		 * non-IDR I-frame instead of an IDR) to preroll correctly in
 		 * GStreamer and be used as valid decoder entry points. */
 
-		switch (encoder->encoded_frame_type)
+		switch (encoder->open_params.compression_format)
 		{
 			case IMX_VPU_API_COMPRESSION_FORMAT_H264:
 			case IMX_VPU_API_COMPRESSION_FORMAT_H265:
