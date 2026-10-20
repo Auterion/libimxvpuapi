@@ -283,6 +283,13 @@ struct _ImxVpuApiEncoder
 	 * it is cleared only once the picture carrying it has been coded - so
 	 * the refresh cannot be lost to the rate control deferring a frame. */
 	BOOL pending_full_refresh;
+	/* The picture being coded is that full refresh: every coding unit of it
+	 * intra, a recovery point of 0, and the parameter sets alongside. It is
+	 * a decoder entry point, and is reported as one - without that,
+	 * GstVideoEncoder never retires the force-key-unit that asked for it and
+	 * drops every later request. Cleared with has_header, once the picture
+	 * carrying it has been handed out. */
+	BOOL full_refresh_coded;
 	/* A sync point the caller asked for is outstanding; see the provenance
 	 * note in imx_vpu_api_enc_encode(). */
 	BOOL pending_forced_sync;
@@ -2722,6 +2729,7 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 			 * slices every slice of it comes out intra. */
 			imx_vpu_api_intra_refresh_full(&(encoder->refresh_cfg), &band);
 			imx_vpu_api_intra_refresh_realign(&(encoder->refresh_state));
+			encoder->full_refresh_coded = TRUE;
 
 			IMX_VPU_API_DEBUG("out-of-order full refresh: rows %d..%d cols %d..%d "
 			                  "(ctb grid %dx%d), apply %d",
@@ -3218,14 +3226,24 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_get_encoded_frame_ext(ImxVpuApiEncoder *
 		 * (has_header=TRUE), which happens at stream start and after a
 		 * flush.  This allows refresh-mode streams (which begin with a
 		 * non-IDR I-frame instead of an IDR) to preroll correctly in
-		 * GStreamer and be used as valid decoder entry points. */
+		 * GStreamer and be used as valid decoder entry points.
+		 *
+		 * A full refresh is the third one. Sweeping, a keyframe request is
+		 * answered with a predicted picture whose every coding unit is
+		 * intra, carrying a recovery point of 0 and the parameter sets, so
+		 * a decoder can start there even though the picture is coded P.
+		 * Reporting it is what lets the request that asked for it retire:
+		 * GstVideoEncoder holds a force-key-unit pending until a sync point
+		 * comes out, and in refresh mode none otherwise ever does, so the
+		 * first request would be the only one ever served. */
 
 		switch (encoder->open_params.compression_format)
 		{
 			case IMX_VPU_API_COMPRESSION_FORMAT_H264:
 			case IMX_VPU_API_COMPRESSION_FORMAT_H265:
 				*is_sync_point = (encoder->encoded_frame_type == IMX_VPU_API_FRAME_TYPE_IDR)
-				              || (encoder->encoded_frame_type == IMX_VPU_API_FRAME_TYPE_I && encoder->has_header);
+				              || (encoder->encoded_frame_type == IMX_VPU_API_FRAME_TYPE_I && encoder->has_header)
+				              || encoder->full_refresh_coded;
 				break;
 			default:
 				*is_sync_point = (encoder->encoded_frame_type == IMX_VPU_API_FRAME_TYPE_I);
@@ -3239,6 +3257,7 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_get_encoded_frame_ext(ImxVpuApiEncoder *
 	encoder->encoded_frame_available = FALSE;
 	encoder->num_bytes_in_stream_buffer = 0;
 	encoder->has_header = FALSE;
+	encoder->full_refresh_coded = FALSE;
 
 
 	return IMX_VPU_API_ENC_RETURN_CODE_OK;
