@@ -2927,6 +2927,16 @@ static ImxVpuApiEncReturnCodes h1_h264_encode_frame(void *h1_encoder, ImxVpuApiF
 				imx_vpu_api_intra_refresh_realign(&(encoder->refresh_state));
 				encoder->recovery_sei_size = imx_vpu_api_build_recovery_point_sei(
 					encoder->recovery_sei, 0, 1);
+
+				/* Coded P, but every macroblock of it is intra and it
+				 * carries a recovery point of 0 and the parameter sets:
+				 * a decoder can start here, so it is a sync point. The
+				 * blanket FALSE above is for the sweep's own bands, which
+				 * are not. Reporting this one is what retires the
+				 * force-key-unit that asked for it - GstVideoEncoder keeps
+				 * one pending until a sync point comes out, and would
+				 * otherwise serve the first request and no other. */
+				encoder->base->encoded_frame_is_sync_point = TRUE;
 			}
 			else
 			{
