@@ -33,10 +33,10 @@ extern "C" {
 #define IMX_VPU_API_ENC_SESSION_VERSION 1
 
 /* How many distinct resolutions get an id of their own before ids start being
- * reused. h.265 allows 16 SPS ids and 64 PPS ids, h.264 32 and 256, so eight
- * fits both with room to spare; a session that visits more than eight
- * resolutions gets the id of the one it saw eight switches ago, by which point
- * no decoder is still holding that one's parameter sets. */
+ * reused. h.265 allows 16 VPS and SPS ids and 64 PPS ids, h.264 32 SPS and
+ * 256 PPS ids, so eight fits both with room to spare; a session that visits
+ * more than eight resolutions gets the id of the one it saw eight switches
+ * ago, by which point no decoder is still holding that one's parameter sets. */
 #define IMX_VPU_API_ENC_MAX_PARAM_SET_IDS 8
 
 
