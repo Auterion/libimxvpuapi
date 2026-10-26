@@ -95,6 +95,10 @@ void imx_vpu_api_enc_session_restore_rc(ImxVpuApiEncSession const *session, ExtR
 void imx_vpu_api_enc_session_pack(ImxVpuApiEncSession const *session, ImxVpuApiEncSessionState *state);
 int imx_vpu_api_enc_session_unpack(ImxVpuApiEncSession *session, ImxVpuApiEncSessionState const *state);
 
+/* The smallest HRD buffer the rate control in ext_rate_control.c is given, in
+ * frame budgets. The hardware HRD keeps its own floor. */
+#define IMX_VPU_API_ENC_RC_MIN_FRAME_BUDGETS 2.5
+
 /* The HRD buffer size in bits, with 0 resolved to one second of bitrate and a
  * floor of min_frame_budgets frame budgets applied.
  *
@@ -106,6 +110,13 @@ int imx_vpu_api_enc_session_unpack(ImxVpuApiEncSession *session, ImxVpuApiEncSes
  * to work with and spends the stream reacting instead of tracking. */
 unsigned int imx_vpu_api_enc_hrd_buffer_bits(ImxVpuApiEncOpenParams const *open_params,
                                              double min_frame_budgets);
+
+/* The same, from the values themselves rather than from open_params, for a
+ * buffer or a bitrate that changes while the encoder runs. */
+unsigned int imx_vpu_api_enc_buffer_bits(unsigned int hrd_buffer_kbits, unsigned int bitrate_kbps,
+                                         unsigned int frame_rate_numerator,
+                                         unsigned int frame_rate_denominator,
+                                         double min_frame_budgets);
 
 /* The rate control's parameters, as the unified open_params spell them. */
 void imx_vpu_api_enc_session_rc_params(ExtRateControlParams *params,
