@@ -2475,11 +2475,11 @@ ImxVpuApiEncStreamInfo;
  *   and a new instance starts it at empty. The first pictures at the new
  *   resolution are then budgeted as if the buffer were free, on top of what is
  *   still in flight - which is exactly how a CPB/HRD buffer overflows.
- * - The parameter set ids. A new instance numbers its SPS and PPS from zero
- *   again, so the parameter sets of the new resolution have the same ids as
- *   the ones of the old. A decoder that loses them at the switch point keeps
- *   using the ids it already has and decodes the new stream with the old
- *   frame size, which it cannot detect.
+ * - The parameter set ids. A new instance numbers its VPS (h.265), SPS and
+ *   PPS from zero again, so the parameter sets of the new resolution have the
+ *   same ids as the ones of the old. A decoder that loses them at the switch
+ *   point keeps using the ids it already has and decodes the new stream with
+ *   the old frame size, which it cannot detect.
  *
  * The caller carries both across the gap: read the state out of the old
  * encoder with imx_vpu_api_enc_get_session_state() before closing it, and hand

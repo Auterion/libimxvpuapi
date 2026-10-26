@@ -647,7 +647,17 @@ static void vc8000_h264_force_no_reorder(uint8_t *data,size_t *size)
  * have and drops cleanly - but one that receives the SPS and not the PPS still
  * has the previous PPS, which now points at the wrong SPS, and that is worse
  * than before the change. With the PPS id moved too, both cases end in a
- * reference the decoder cannot resolve, which is what it can act on. */
+ * reference the decoder cannot resolve, which is what it can act on.
+ *
+ * In h.265 the SPS names a VPS as well, and that one moves with the other two,
+ * for the same reason one level up: every resolution writes a VPS of its own -
+ * they differ in general_level_idc at least - and all of them as VPS 0. A
+ * decoder then sees every switch as VPS 0 changing, and a VPS that changes
+ * takes every SPS and PPS that refers to it along (ffmpeg drops them), so the
+ * sets of the other resolutions never survive a switch and returning to one
+ * is not free after all; and one that loses the new VPS pairs the new SPS with
+ * the old resolution's. With the VPS id moved, each resolution's VPS, SPS and
+ * PPS are a set of their own that nothing of another resolution replaces. */
 
 /* Position of the rbsp_stop_one_bit, i.e. of the end of the syntax. 0 if the
  * data does not end in one. */
@@ -677,6 +687,20 @@ static size_t vc_restamp_tail(VcBR *br, VcBW *bw, size_t stop_bit)
 	return bw->bit >> 3;
 }
 
+static size_t vc_h265_vps_restamp(const uint8_t *in, size_t in_len, uint8_t *out, size_t out_cap, unsigned id)
+{
+	size_t const stop_bit = vc_rbsp_stop_bit(in, in_len);
+	VcBR br = { in, in_len, 0 };
+	VcBW bw = { out, out_cap, 0 };
+
+	if (stop_bit == 0) return 0;
+	memset(out, 0, out_cap);
+
+	(void)vc_br_un(&br, 4); vc_bw_un(&bw, id, 4); /* vps_video_parameter_set_id */
+
+	return vc_restamp_tail(&br, &bw, stop_bit);
+}
+
 static size_t vc_h265_sps_restamp(const uint8_t *in, size_t in_len, uint8_t *out, size_t out_cap, unsigned id)
 {
 	size_t const stop_bit = vc_rbsp_stop_bit(in, in_len);
@@ -687,7 +711,7 @@ static size_t vc_h265_sps_restamp(const uint8_t *in, size_t in_len, uint8_t *out
 	if (stop_bit == 0) return 0;
 	memset(out, 0, out_cap);
 
-	vc_cp_un(&br, &bw, 4);                     /* sps_video_parameter_set_id */
+	(void)vc_br_un(&br, 4); vc_bw_un(&bw, id, 4); /* sps_video_parameter_set_id */
 	max_sub = vc_cp_un(&br, &bw, 3);           /* sps_max_sub_layers_minus1 */
 	vc_cp_un(&br, &bw, 1);                     /* sps_temporal_id_nesting_flag */
 	/* profile_tier_level() is 96 bits only with a single sub layer, which is
@@ -734,9 +758,9 @@ static size_t vc_pps_restamp(const uint8_t *in, size_t in_len, uint8_t *out, siz
 	return vc_restamp_tail(&br, &bw, stop_bit);
 }
 
-/* Restamps the SPS and PPS of a cached annex B header with id. Everything else
- * in the header - the start codes, whatever their length, the nal unit headers,
- * the VPS - is copied through byte for byte.
+/* Restamps the VPS (h.265), SPS and PPS of a cached annex B header with id.
+ * Everything else in the header - the start codes, whatever their length, the
+ * nal unit headers - is copied through byte for byte.
  *
  * An id costs more bits than the 0 it replaces, so this cannot be done in
  * place; on success *header_data points at a new buffer and the old one has
@@ -751,7 +775,7 @@ static int vc8000_restamp_param_set_ids(uint8_t **header_data, size_t *header_si
 	uint8_t *out;
 	size_t out_len = 0;
 	size_t p = 0;
-	int num_sps = 0, num_pps = 0;
+	int num_vps = 0, num_sps = 0, num_pps = 0;
 
 	if ((in == NULL) || (in_size < 4)) return 0;
 
@@ -787,7 +811,7 @@ static int vc8000_restamp_param_set_ids(uint8_t **header_data, size_t *header_si
 		payload_len = (nal_end - pad > nal + hdr_len) ? (nal_end - pad - nal - hdr_len) : 0;
 
 		if ((payload_len > 0) &&
-		    ((is_h264 && ((type == 7) || (type == 8))) || (!is_h264 && ((type == 33) || (type == 34)))))
+		    ((is_h264 && ((type == 7) || (type == 8))) || (!is_h264 && ((type == 32) || (type == 33) || (type == 34)))))
 		{
 			uint8_t rbsp[512], stamped[544], em[640];
 			size_t rl;
@@ -806,6 +830,8 @@ static int vc8000_restamp_param_set_ids(uint8_t **header_data, size_t *header_si
 				if (is_h264)
 					sl = (type == 7) ? vc_h264_sps_restamp(rbsp, rl, stamped, sizeof(stamped), id)
 					                 : vc_pps_restamp(rbsp, rl, stamped, sizeof(stamped), id);
+				else if (type == 32)
+					sl = vc_h265_vps_restamp(rbsp, rl, stamped, sizeof(stamped), id);
 				else
 					sl = (type == 33) ? vc_h265_sps_restamp(rbsp, rl, stamped, sizeof(stamped), id)
 					                  : vc_pps_restamp(rbsp, rl, stamped, sizeof(stamped), id);
@@ -830,7 +856,9 @@ static int vc8000_restamp_param_set_ids(uint8_t **header_data, size_t *header_si
 				rewritten = 1;
 			}
 
-			if ((is_h264 && (type == 7)) || (!is_h264 && (type == 33)))
+			if (!is_h264 && (type == 32))
+				num_vps++;
+			else if ((is_h264 && (type == 7)) || (!is_h264 && (type == 33)))
 				num_sps++;
 			else
 				num_pps++;
@@ -847,10 +875,15 @@ static int vc8000_restamp_param_set_ids(uint8_t **header_data, size_t *header_si
 		p = nal_end;
 	}
 
-	if ((num_sps != 1) || (num_pps != 1))
+	if ((num_sps != 1) || (num_pps != 1) || (!is_h264 && (num_vps != 1)))
 	{
-		IMX_VPU_API_WARNING("header carries %d SPS and %d PPS; expected one of each", num_sps, num_pps);
-		if ((num_sps == 0) || (num_pps == 0))
+		if (is_h264)
+			IMX_VPU_API_WARNING("header carries %d SPS and %d PPS; expected one of each", num_sps, num_pps);
+		else
+			IMX_VPU_API_WARNING("header carries %d VPS, %d SPS and %d PPS; expected one of each", num_vps, num_sps, num_pps);
+		/* An SPS restamped to a VPS id that no VPS carries would name a
+		 * VPS the decoder does not have. */
+		if ((num_sps == 0) || (num_pps == 0) || (!is_h264 && (num_vps == 0)))
 			goto fail;
 	}
 
