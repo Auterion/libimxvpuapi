@@ -9,7 +9,6 @@
 #include <inttypes.h>
 #include <math.h>
 #include <unistd.h>
-#include <fcntl.h>
 
 #include <imxdmabuffer/imxdmabuffer.h>
 
@@ -2180,44 +2179,6 @@ static void resolve_param_set_id(ImxVpuApiEncoder *encoder)
 }
 
 
-/* The Hantro VC8000E blob prints unconditional stdout debug while assembling the
- * bitstream ("RecoveryPoint sei size=%d", "PicTiming sei size=%d", "BufferingSei
- * sei size=%d", "UserDataUnreg sei size=%d", ...). With a per-picture recovery SEI
- * (use-intra-refresh / gdr_refresh_period) and/or use-hrd timing SEIs this is several
- * lines per frame, flooding the service journal. The blob has no trace toggle (it does
- * not link getenv) and reports real errors via return codes + stderr, not these prints,
- * so mute only fd 1 (stdout) for the duration of this one call.
- * NOTE: fd 1 is process-global. This is safe because the encode loop is single-threaded
- * per encoder instance; concurrent encoder instances in one process would need a shared
- * lock around the swap to avoid clobbering each other's saved fd. */
-static VCEncRet encode_one_picture(ImxVpuApiEncoder *encoder, VCEncIn *encoder_input, VCEncOut *encoder_output)
-{
-	VCEncRet enc_ret;
-	int saved_stdout_fd = -1;
-	int devnull_fd = open("/dev/null", O_WRONLY);
-
-	if (devnull_fd >= 0)
-	{
-		fflush(stdout);
-		saved_stdout_fd = dup(STDOUT_FILENO);
-		(void)dup2(devnull_fd, STDOUT_FILENO);
-	}
-
-	enc_ret = VCEncStrmEncode(encoder->encoder, encoder_input, encoder_output, NULL, NULL);
-
-	if (saved_stdout_fd >= 0)
-	{
-		fflush(stdout);
-		(void)dup2(saved_stdout_fd, STDOUT_FILENO);
-		close(saved_stdout_fd);
-	}
-	if (devnull_fd >= 0)
-		close(devnull_fd);
-
-	return enc_ret;
-}
-
-
 /* Applies what imx_vpu_api_enc_reconfigure() staged.
  *
  * Called once per picture, ahead of everything the picture does - the valve,
@@ -2791,7 +2752,7 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 
 	/* Perform the actual frame encoding. */
 	memset(&encoder_output, 0, sizeof(encoder_output));
-	enc_ret = encode_one_picture(encoder, encoder_input, &encoder_output);
+	enc_ret = VCEncStrmEncode(encoder->encoder, encoder_input, &encoder_output, NULL, NULL);
 
 	/* New CBR: a picture past the ceiling is re-encoded coarser. Only the
 	 * attempt that is kept is reported to the rate control, so its model
@@ -2818,7 +2779,7 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 
 			VCEncDiscardPicture(encoder->encoder);
 			memset(&retry_output, 0, sizeof(retry_output));
-			if (encode_one_picture(encoder, encoder_input, &retry_output) != VCENC_FRAME_READY)
+			if (VCEncStrmEncode(encoder->encoder, encoder_input, &retry_output, NULL, NULL) != VCENC_FRAME_READY)
 				break;
 
 			encoder_output = retry_output;
