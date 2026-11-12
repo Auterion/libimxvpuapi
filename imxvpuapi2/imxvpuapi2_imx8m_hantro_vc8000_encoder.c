@@ -2760,7 +2760,8 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 	if (encoder->new_cbr_active)
 	{
 		ext_rate_control_set_band(&encoder->new_cbr, rc_band_top, rc_band_blocks,
-		                          encoder->refresh_cfg.period);
+		                          encoder->refresh_cfg.period,
+		                          encoder->refresh_active ? encoder->refresh_state.num_steps : 0);
 		int qp = ext_rate_control_pre(&encoder->new_cbr, (encoder_input->codingType == VCENC_INTRA_FRAME), overhead_bits);
 
 		encoder->cached_rate_ctrl.qpHdr = qp;

@@ -394,10 +394,40 @@ int ext_rate_control_init(ExtRateControl *rc, ExtRateControlParams const *params
 }
 
 
-void ext_rate_control_set_band(ExtRateControl *rc, int top, unsigned int band_blocks, int period)
+void ext_rate_control_set_band(ExtRateControl *rc, int top, unsigned int band_blocks, int period, int band_pictures)
 {
+	int dense;
+
 	if ((rc == NULL) || !rc->plan_enable)
 		return;
+
+	/* With a band in every picture there is no band-free picture to hold a
+	 * floor against, and keeping the band pictures out of the content model
+	 * would leave it nothing to learn from: the QP stays wherever the first
+	 * pictures left it. video-service's ladder16 profiles (period 6, 6 bands)
+	 * got 44% of the target at QP 40 from a camera, and QP 48..51 on test
+	 * clips. There the planner stands down and every picture is an ordinary
+	 * one, as with EXT_RC_PLAN=0. A live reconfiguration can change the
+	 * refresh, so this is decided per picture. */
+	dense = (period > 0) && (band_pictures >= period);
+	if (dense != rc->plan_dense)
+	{
+		rc->plan_dense = dense;
+		rc->plan_static = 0;
+		rc->plan_intra_n = 0;
+		rc->plan_intra_head = 0;
+		rc->plan_share_n = 0;
+		IMX_VPU_API_INFO("new CBR: refresh planning %s - %d of every %d pictures carry a band",
+		                 dense ? "off" : "back on", band_pictures, period);
+	}
+	if (dense)
+	{
+		rc->cur_band_top = -1;
+		rc->cur_band_blocks = 0;
+		rc->cur_band_ceiling = 0.0;
+		return;
+	}
+
 	rc->cur_band_top = (top >= 64) ? -2 : top;
 	rc->cur_band_blocks = band_blocks;
 	rc->cur_band_period = (period > 0) ? period : 30;
@@ -1583,7 +1613,7 @@ void ext_rate_control_post(ExtRateControl *rc, size_t bits, size_t overhead_bits
 			rc->plan_free_pic = rc->num_pictures;
 		}
 	}
-	if (rc->plan_enable)
+	if (rc->plan_enable && !rc->plan_dense)
 		plan_observe(rc, is_intra, cu_stats, b);
 	rc->cur_band_top = -1;
 	rc->cur_band_blocks = 0;

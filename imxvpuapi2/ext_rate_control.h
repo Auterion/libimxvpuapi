@@ -388,6 +388,7 @@ typedef struct
 	/* --- Refresh band planning: plan the intra refresh band ahead ---
 	 * On unless EXT_RC_PLAN=0; see ext_rate_control_set_band(). */
 	int plan_enable;
+	int plan_dense;     /* every picture carries a band: planner stood down */
 	double plan_band_share;
 	double plan_slope;
 	int plan_gap;
@@ -441,9 +442,10 @@ int ext_rate_control_target(ExtRateControl const *rc);
  * planned (a requested region or a full refresh). band_blocks is the band's
  * area in the 8x8 units of ExtRateControlStats - the forced intra the encoder
  * will report, which the content detector must not mistake for motion.
- * period is the refresh period in pictures. A no-op with planning off
- * (EXT_RC_PLAN=0). */
-void ext_rate_control_set_band(ExtRateControl *rc, int top, unsigned int band_blocks, int period);
+ * period is the refresh period in pictures and band_pictures how many of
+ * them carry a band; with a band in every picture the planner stands down.
+ * A no-op with planning off (EXT_RC_PLAN=0). */
+void ext_rate_control_set_band(ExtRateControl *rc, int top, unsigned int band_blocks, int period, int band_pictures);
 
 /* Call with the size of the picture just encoded, and with whatever the
  * caller will prepend to it on the way to the link. Returns a QP to re-encode
