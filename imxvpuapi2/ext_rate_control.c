@@ -341,7 +341,226 @@ int ext_rate_control_init(ExtRateControl *rc, ExtRateControlParams const *params
 	rc->prev_target = 0.0;
 	rc->intra_bootstrap_pending = 1;
 
+	/* Plan the refresh band in static content (EXT_RC_PLAN=0 turns it off).
+	 *
+	 * In static content the band-free pictures are mostly skipped, so the
+	 * rows keep the quality of the best picture that last coded them, and
+	 * the intra band - held to a single picture's share of the buffer -
+	 * cannot match it: the band is coded several QP coarser than the rows
+	 * around it and is visible as a wave down the picture. Measured on
+	 * village 960x720 at 1600 kbps: the band's QP sits 4.9 above the
+	 * minimum QP of the preceding 30 pictures and drops 3.9 dB.
+	 *
+	 * Static content is recognised from the intra share of the pictures,
+	 * with the forced band subtracted: motion brings new content in and
+	 * forces some intra, static content needs none (median 0.000% against
+	 * 0.31% on fast content). There, the band picture is given a forecast
+	 * QP - the same rows were refreshed one period ago, so their cost then,
+	 * scaled to today's QP, predicts it to ~9% - aimed at plan_band_share of
+	 * the buffer instead of the discretionary cap, and band-free pictures
+	 * are not coded more than plan_gap below the band the forecast expects. */
+	rc->plan_enable = env_int("EXT_RC_PLAN", 1);
+	rc->plan_band_share = env_double("EXT_RC_PLAN_BAND", 0.70);
+	rc->plan_slope = env_double("EXT_RC_PLAN_SLOPE", 4.5);
+	rc->plan_gap = env_int("EXT_RC_PLAN_GAP", 1);
+	rc->plan_static_on = env_double("EXT_RC_PLAN_STATIC_ON", 0.0005);
+	rc->plan_static_off = env_double("EXT_RC_PLAN_STATIC_OFF", 0.0010);
+	rc->cur_band_top = -1;
+	/* A scene cut makes the history above wrong: every position still to be
+	 * refreshed carries the old scene's rows. Measured on 93 random-phase
+	 * cuts (slow, mid and fast content both sides, same-movie cuts too), the
+	 * cut picture is 74..99% intra outside the band (median 98%) and at least
+	 * 42 points above the highest of the 3 pictures before it; no ordinary
+	 * picture above 50% was more than 29 points above them - a fast FPV roll
+	 * climbs to 94% intra, but over 4 pictures. The level alone cannot tell
+	 * the two apart, the jump can. Until a position is refreshed again, its
+	 * band picture is forecast as the band's share of the cut picture (all
+	 * intra) plus the rest of the latest band-free picture: 25% median error,
+	 * against 68% keeping the old history. */
+	rc->plan_cut_enable = env_int("EXT_RC_PLAN_CUT", 1);
+	rc->plan_cut_level = env_double("EXT_RC_PLAN_CUT_LEVEL", 0.50);
+	rc->plan_cut_jump = env_double("EXT_RC_PLAN_CUT_JUMP", 0.35);
+	rc->plan_free_slope = env_double("EXT_RC_PLAN_FREE_SLOPE", 2.0);
+	if (rc->plan_enable)
+		IMX_VPU_API_INFO("new CBR: refresh planning on - band %.2f of the buffer, "
+		                 "slope %.2f, gap %d, static below %.3f%% / above %.3f%%, "
+		                 "cut reset %s (intra above %.0f%% and %.0f points over the previous 3, rest slope %.2f)",
+		                 rc->plan_band_share, rc->plan_slope, rc->plan_gap,
+		                 rc->plan_static_on * 100.0, rc->plan_static_off * 100.0,
+		                 rc->plan_cut_enable ? "on" : "off", rc->plan_cut_level * 100.0,
+		                 rc->plan_cut_jump * 100.0, rc->plan_free_slope);
+
 	return 0;
+}
+
+
+void ext_rate_control_set_band(ExtRateControl *rc, int top, unsigned int band_blocks, int period)
+{
+	if ((rc == NULL) || !rc->plan_enable)
+		return;
+	rc->cur_band_top = (top >= 64) ? -2 : top;
+	rc->cur_band_blocks = band_blocks;
+	rc->cur_band_period = (period > 0) ? period : 30;
+	rc->cur_band_ceiling = 0.0;
+}
+
+
+static double plan_allowance(ExtRateControl const *rc, double overhead_bits, int assume_empty)
+{
+	double a = rc->bucket_cap * rc->plan_band_share;
+	double room = rc->bucket_cap - (assume_empty ? 0.0 : rc->bucket);
+
+	if (room < 0.0) room = 0.0;
+	if (room < a) a = room;
+	a -= overhead_bits;
+	return (a < 1.0) ? 1.0 : a;
+}
+
+
+/* The size the band picture at rows top.. (blocks of the 8x8 units) is
+ * forecast to have at qp when its own history predates the last cut. */
+static double plan_seed_bits(ExtRateControl const *rc, unsigned int blocks, int qp)
+{
+	double const a = (double)blocks / (double)(rc->plan_seed_blocks);
+	int const use_free = rc->plan_free_valid && (rc->plan_free_pic >= rc->plan_cut_pic);
+	int const rest_qp = use_free ? rc->plan_free_qp : rc->plan_seed_qp;
+	double const rest_bits = use_free ? rc->plan_free_bits : rc->plan_seed_bits;
+
+	return rc->plan_seed_bits * a * pow(2.0, (double)(rc->plan_seed_qp - qp) / rc->plan_slope)
+	     + rest_bits * (1.0 - a) * pow(2.0, (double)(rest_qp - qp) / rc->plan_free_slope);
+}
+
+
+static int plan_forecast_qp(ExtRateControl const *rc, int top, unsigned int blocks, double allowance, int *seeded)
+{
+	if (seeded != NULL)
+		*seeded = 0;
+	if ((top < 0) || (top >= 64) || !rc->plan_hist[top].valid)
+		return -1;
+
+	/* Same rows, refreshed since the last cut: their cost then, scaled. */
+	if (!rc->plan_cut_valid || (rc->plan_hist[top].pic > rc->plan_cut_pic))
+	{
+		if ((rc->num_pictures - rc->plan_hist[top].pic) > (unsigned long)(2 * rc->cur_band_period))
+			return -1;
+		return (int)ceil((double)(rc->plan_hist[top].qp)
+		               + rc->plan_slope * log2(rc->plan_hist[top].bits / allowance));
+	}
+
+	/* Not refreshed since the cut: forecast from the cut picture. The
+	 * smallest QP whose forecast fits; the sum has no closed form. */
+	if ((rc->num_pictures - rc->plan_cut_pic) > (unsigned long)(2 * rc->cur_band_period))
+		return -1;
+	if ((blocks == 0) || (blocks >= rc->plan_seed_blocks))
+		return -1;
+	{
+		int lo = 0, hi = 51;
+		if (plan_seed_bits(rc, blocks, hi) > allowance)
+			lo = hi;
+		while (lo < hi)
+		{
+			int const mid = (lo + hi) / 2;
+			if (plan_seed_bits(rc, blocks, mid) <= allowance)
+				hi = mid;
+			else
+				lo = mid + 1;
+		}
+		if (seeded != NULL)
+			*seeded = 1;
+		return lo;
+	}
+}
+
+
+static int plan_floor(ExtRateControl const *rc)
+{
+	double const a = plan_allowance(rc, 0.0, 1);
+	int k, f = -1;
+
+	for (k = 0; k < 64; ++k)
+	{
+		int const q = plan_forecast_qp(rc, k, rc->plan_hist[k].blocks, a, NULL);
+		if (q > f) f = q;
+	}
+	return (f < 0) ? -1 : (f - rc->plan_gap);
+}
+
+
+static void plan_observe(ExtRateControl *rc, int is_intra, ExtRateControlStats const *cu_stats, double bits)
+{
+	double sorted[32], med;
+	unsigned int i, j;
+
+	if (is_intra || (cu_stats == NULL) || (cu_stats->total_blocks <= rc->cur_band_blocks))
+		return;
+
+	{
+		double const total = (double)(cu_stats->total_blocks - rc->cur_band_blocks);
+		double intra = (double)(cu_stats->intra_blocks) - (double)(rc->cur_band_blocks);
+		double share;
+		if (intra < 0.0) intra = 0.0;
+		share = intra / total;
+		rc->plan_intra_win[rc->plan_intra_head % 32u] = share;
+		rc->plan_intra_head++;
+		if (rc->plan_intra_n < 32u) rc->plan_intra_n++;
+
+		/* Scene cut: see ext_rate_control_init(). */
+		if (rc->plan_cut_enable)
+		{
+			double prev = 0.0;
+			int cut;
+
+			for (i = 0; i < rc->plan_share_n; ++i)
+				if (rc->plan_share_last[i] > prev) prev = rc->plan_share_last[i];
+			cut = (rc->plan_share_n >= 3u) && (share > rc->plan_cut_level)
+			   && ((share - prev) > rc->plan_cut_jump) && (bits > 0.0);
+
+			rc->plan_share_last[2] = rc->plan_share_last[1];
+			rc->plan_share_last[1] = rc->plan_share_last[0];
+			rc->plan_share_last[0] = share;
+			if (rc->plan_share_n < 3u) rc->plan_share_n++;
+
+			if (cut)
+			{
+				rc->plan_cut_valid = 1;
+				rc->plan_cut_pic = rc->num_pictures;
+				rc->plan_seed_qp = rc->current_qp;
+				rc->plan_seed_bits = bits;
+				rc->plan_seed_blocks = cu_stats->total_blocks;
+				rc->plan_num_cuts++;
+				/* The static detector's window is the old scene too: start
+				 * it again, keeping its verdict until 8 new pictures. */
+				rc->plan_intra_n = 0;
+				rc->plan_intra_head = 0;
+				IMX_VPU_API_LOG("new CBR: plan: picture %lu cut (intra %.1f%%, %.1f points over the previous 3) - "
+				                "band history reset, seed qp %d %.0f bits",
+				                rc->num_pictures, share * 100.0, (share - prev) * 100.0, rc->current_qp, bits);
+				return;
+			}
+		}
+	}
+	if (rc->plan_intra_n < 8u)
+		return;
+
+	for (i = 0; i < rc->plan_intra_n; ++i) sorted[i] = rc->plan_intra_win[i];
+	for (i = 1; i < rc->plan_intra_n; ++i)
+	{
+		double const v = sorted[i];
+		for (j = i; (j > 0) && (sorted[j - 1] > v); --j) sorted[j] = sorted[j - 1];
+		sorted[j] = v;
+	}
+	med = sorted[rc->plan_intra_n / 2u];
+
+	if (!rc->plan_static && (med < rc->plan_static_on))
+	{
+		rc->plan_static = 1;
+		IMX_VPU_API_LOG("new CBR: plan: picture %lu static (intra median %.4f%%)", rc->num_pictures, med * 100.0);
+	}
+	else if (rc->plan_static && (med > rc->plan_static_off))
+	{
+		rc->plan_static = 0;
+		IMX_VPU_API_LOG("new CBR: plan: picture %lu moving (intra median %.4f%%)", rc->num_pictures, med * 100.0);
+	}
 }
 
 
@@ -601,8 +820,11 @@ void ext_rate_control_skip(ExtRateControl *rc, int is_intra, size_t bits, ExtRat
 	 * are not going anywhere: it is what the next picture's QP is predicted
 	 * from, and throwing it away would mean paying for the encode twice.
 	 * The bucket above is the only thing the bits must not touch. */
-	if (bits > 0)
+	if ((bits > 0) && !(rc->plan_enable && (rc->cur_band_top != -1)))
 		observe_complexity(rc, (double)bits, is_intra, cu_stats);
+	rc->cur_band_top = -1;
+	rc->cur_band_blocks = 0;
+	rc->cur_band_ceiling = 0.0;
 
 	/* Arm or sustain the drain. An intra picture that was encoded and then
 	 * discarded tells us exactly what it costs, which is a better forecast
@@ -860,6 +1082,41 @@ int ext_rate_control_pre(ExtRateControl *rc, int is_intra, size_t overhead_bits)
 		}
 	}
 
+	/* Refresh band planning: see ext_rate_control_init(). */
+	if (rc->plan_enable && rc->plan_static && !is_intra)
+	{
+		if (rc->cur_band_top >= 0)
+		{
+			double const allowance = plan_allowance(rc, (double)overhead_bits, 0);
+			int seeded;
+			int const q = plan_forecast_qp(rc, rc->cur_band_top, rc->cur_band_blocks, allowance, &seeded);
+
+			rc->cur_band_ceiling = allowance + (double)overhead_bits;
+			if (q >= 0)
+			{
+				IMX_VPU_API_LOG("new CBR: plan: band picture rows %d.. qp %d -> %d for %.0f bits%s",
+				                rc->cur_band_top, rc->current_qp, (q > rc->current_qp) ? q : rc->current_qp, allowance,
+				                seeded ? " (seeded from the cut)" : "");
+				if (q > rc->current_qp)
+					rc->current_qp = q;
+				rc->plan_num_planned++;
+				if (seeded)
+					rc->plan_num_seeded++;
+			}
+		}
+		else if (rc->cur_band_top == -1)
+		{
+			int const f = plan_floor(rc);
+			if (f > rc->current_qp)
+			{
+				rc->current_qp = f;
+				rc->plan_num_floored++;
+			}
+		}
+	}
+	if (rc->plan_enable && rc->plan_static)
+		rc->plan_static_pics++;
+
 	{
 		int const lo = is_intra ? rc->qp_min_intra : rc->qp_min_inter;
 		int const hi = is_intra ? rc->qp_max_intra : rc->qp_max_inter;
@@ -1052,7 +1309,11 @@ int ext_rate_control_check(ExtRateControl *rc, size_t bits, size_t overhead_bits
 		                rc->cap_attempts, rc->current_qp, bits, rc->current_qp, qmax_now);
 	}
 
-	slope_observe(rc, bits);
+	/* Refresh band planning: a band picture halves every ~4.5 QP and a
+	 * band-free one every ~1.6, so learning one slope from both makes it
+	 * wrong for both. */
+	if (!(rc->plan_enable && (rc->cur_band_top != -1)))
+		slope_observe(rc, bits);
 
 	qp_max = is_intra ? rc->qp_max_intra : rc->qp_max_inter;
 	if (rc->current_qp >= qp_max)
@@ -1101,7 +1362,11 @@ int ext_rate_control_check(ExtRateControl *rc, size_t bits, size_t overhead_bits
 	 * to the overflow limit alone. */
 	if (!is_intra && !rc->forced_sync_point && (rc->cap_share > 0.0))
 	{
-		double const soft = rc->bucket_cap * rc->cap_share;
+		double soft = rc->bucket_cap * rc->cap_share;
+		/* Refresh band planning: a planned band picture gets its allowance
+		 * instead; the overflow ceiling above still applies. */
+		if (rc->plan_enable && (rc->cur_band_top >= 0) && (rc->cur_band_ceiling > soft))
+			soft = rc->cur_band_ceiling;
 		if (soft < ceiling) ceiling = soft;
 	}
 
@@ -1204,7 +1469,8 @@ int ext_rate_control_check(ExtRateControl *rc, size_t bits, size_t overhead_bits
 		 * the second step lands on qp 45, which fits. */
 		double const g = local_slope(rc, bits);
 
-		qp = rc->current_qp + (int)lround((g > 0.0 ? g : rc->slope) * log2(wire / ceiling));
+		double const first = (rc->plan_enable && (rc->cur_band_top != -1)) ? rc->plan_slope : rc->slope;
+		qp = rc->current_qp + (int)lround((g > 0.0 ? g : first) * log2(wire / ceiling));
 		if (qp <= rc->current_qp) qp = rc->current_qp + 1;
 		if (qp > qp_max) qp = qp_max;
 	}
@@ -1291,7 +1557,37 @@ void ext_rate_control_post(ExtRateControl *rc, size_t bits, size_t overhead_bits
 	if (rc == NULL)
 		return;
 
-	observe_complexity(rc, b, is_intra, cu_stats);
+	/* Refresh band planning: the band picture's cost is the band's, not
+	 * the content's - keep it out of the content model, remember it for the
+	 * same rows one period from now, and feed the detector. */
+	if (rc->plan_enable && (rc->cur_band_top != -1))
+	{
+		if ((rc->cur_band_top >= 0) && !is_intra && (bits > 0))
+		{
+			rc->plan_hist[rc->cur_band_top].qp = rc->current_qp;
+			rc->plan_hist[rc->cur_band_top].bits = b;
+			rc->plan_hist[rc->cur_band_top].pic = rc->num_pictures;
+			rc->plan_hist[rc->cur_band_top].blocks = rc->cur_band_blocks;
+			rc->plan_hist[rc->cur_band_top].valid = 1;
+		}
+	}
+	else
+	{
+		observe_complexity(rc, b, is_intra, cu_stats);
+		/* the rest of a seeded band picture is forecast from this */
+		if (rc->plan_enable && !is_intra && (bits > 0))
+		{
+			rc->plan_free_valid = 1;
+			rc->plan_free_qp = rc->current_qp;
+			rc->plan_free_bits = b;
+			rc->plan_free_pic = rc->num_pictures;
+		}
+	}
+	if (rc->plan_enable)
+		plan_observe(rc, is_intra, cu_stats, b);
+	rc->cur_band_top = -1;
+	rc->cur_band_blocks = 0;
+	rc->cur_band_ceiling = 0.0;
 
 	/* The forecast for the next keyframe, and the end of any drain that was
 	 * waiting for this one. Recorded from the picture rather than the whole
