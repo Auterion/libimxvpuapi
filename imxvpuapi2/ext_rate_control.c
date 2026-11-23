@@ -341,6 +341,23 @@ int ext_rate_control_init(ExtRateControl *rc, ExtRateControlParams const *params
 	rc->prev_target = 0.0;
 	rc->intra_bootstrap_pending = 1;
 
+	/* Centre QP fill; off until the caller calls ext_rate_control_set_fill().
+	 * The aims sit below the ceiling by the measured error of a re-encode's
+	 * size prediction (1440x1080 aerial replay, 1600 kbps): steering by the
+	 * learned slope lands 0.20 log2 low with spread 0.35, by the picture's own
+	 * gradient on target with spread 0.13. At 0.92 about 7 in 8 later steps
+	 * fit; aiming at the ceiling itself cost more encodes than it gained. */
+	rc->fill_req = (env_int("EXT_RC_FILL", 0) != 0);
+	rc->fill_steps = 0;
+	rc->fill_aim1 = env_double("EXT_RC_FILL_AIM1", 0.92);
+	rc->fill_aim2 = env_double("EXT_RC_FILL_AIM2", 0.92);
+	if (rc->fill_aim1 < 0.5) rc->fill_aim1 = 0.5;
+	if (rc->fill_aim1 > 1.0) rc->fill_aim1 = 1.0;
+	if (rc->fill_aim2 < 0.5) rc->fill_aim2 = 0.5;
+	if (rc->fill_aim2 > 1.0) rc->fill_aim2 = 1.0;
+	rc->fill_step = 0;
+	rc->prev_attempt_fill = 0;
+
 	return 0;
 }
 
@@ -513,7 +530,8 @@ int ext_rate_control_should_drop(ExtRateControl const *rc, size_t bits, int is_i
 	 * this situation, so the ceiling is always reachable and this stays
 	 * live. */
 	if ((rc->bucket <= 0.0)
-	 && (rc->current_qp >= (is_intra ? rc->qp_max_intra : rc->qp_max_inter)))
+	 && (rc->current_qp >= (is_intra ? rc->qp_max_intra : rc->qp_max_inter))
+	 && (rc->fill_step == 0))
 		return 0;
 
 	/* The quantiser must have no moves left, and there are two ways to run
@@ -534,7 +552,8 @@ int ext_rate_control_should_drop(ExtRateControl const *rc, size_t bits, int is_i
 	 * taking it here would trade frame rate for something quality could
 	 * have bought. */
 	if (!(rc->forced_sync_point && is_intra && !rc->intra_bootstrap_pending)
-	 && (rc->current_qp < (is_intra ? rc->qp_max_intra : rc->qp_max_inter))
+	 && ((rc->current_qp < (is_intra ? rc->qp_max_intra : rc->qp_max_inter))
+	  || (rc->fill_step > 0))
 	 && (rc->cap_attempts < rc->cap_attempt_limit))
 		return 0;
 
@@ -720,9 +739,111 @@ void ext_rate_control_set_qp_range(ExtRateControl *rc,
 }
 
 
+static int fill_on(ExtRateControl const *rc)
+{
+	return rc->fill_steps > 0;
+}
+
+
+static double fill_share(ExtRateControl const *rc, int step)
+{
+	if (step <= 0)
+		return 0.0;
+	if (step > rc->fill_steps)
+		step = rc->fill_steps;
+	return rc->fill_share_tab[step - 1];
+}
+
+
+/* log2 of how much bigger the picture is with region step one QP finer than
+ * uniform at the picture QP: log2(1 + share * (2^(1/slope) - 1)). Subtracting
+ * it from a measured size gives the uniform picture the model describes. Area
+ * share stands in for bit share; the centre is often busier, so this runs a
+ * little low, and the later re-encode steps correct for it. */
+static double fill_l(ExtRateControl const *rc, int step, double slope)
+{
+	if (!fill_on(rc) || (step <= 0))
+		return 0.0;
+	return log2(1.0 + fill_share(rc, step) * (pow(2.0, 1.0 / slope) - 1.0));
+}
+
+
+/* The step nearest to making the whole QP q as big as uniform at the real QP
+ * qf <= q: share = (2^((q - qf)/slope) - 1) / (2^(1/slope) - 1). 0 for none,
+ * and always 0 when q - 1 would fall below qp_min. Inter pictures only. */
+static int fill_step_for(ExtRateControl const *rc, int q, double qf, double slope)
+{
+	double frac = (double)q - qf;
+	double f, best;
+	int k, step;
+
+	if (!fill_on(rc) || (frac <= 0.0) || ((q - 1) < rc->qp_min_inter))
+		return 0;
+	if (frac > 1.0) frac = 1.0;
+
+	f = (pow(2.0, frac / slope) - 1.0) / (pow(2.0, 1.0 / slope) - 1.0);
+
+	best = f;
+	step = 0;
+	for (k = 1; k <= rc->fill_steps; ++k)
+	{
+		double const d = fabs(rc->fill_share_tab[k - 1] - f);
+		if (d < best)
+		{
+			best = d;
+			step = k;
+		}
+	}
+	return step;
+}
+
+
+int ext_rate_control_fill_requested(ExtRateControl const *rc)
+{
+	return (rc != NULL) ? rc->fill_req : 0;
+}
+
+
+void ext_rate_control_set_fill(ExtRateControl *rc, int steps, double const *shares)
+{
+	int k;
+
+	if (rc == NULL)
+		return;
+	if ((shares == NULL) || (steps <= 0))
+		steps = 0;
+	if (steps > EXT_RATE_CONTROL_FILL_MAX_STEPS)
+		steps = EXT_RATE_CONTROL_FILL_MAX_STEPS;
+
+	/* Increasing and within (0, 1), or the table stops there. A region of
+	 * the whole picture is excluded: one QP finer everywhere is the next whole
+	 * QP down, and as a step it would let a re-encode repeat the attempt. */
+	for (k = 0; k < steps; ++k)
+	{
+		if ((shares[k] <= 0.0) || (shares[k] >= 1.0) || ((k > 0) && (shares[k] <= shares[k - 1])))
+		{
+			steps = k;
+			break;
+		}
+		rc->fill_share_tab[k] = shares[k];
+	}
+
+	rc->fill_steps = steps;
+	rc->fill_step = 0;
+	rc->prev_attempt_fill = 0;
+}
+
+
+int ext_rate_control_fill_step(ExtRateControl const *rc)
+{
+	return (rc != NULL) ? rc->fill_step : 0;
+}
+
+
 int ext_rate_control_pre(ExtRateControl *rc, int is_intra, size_t overhead_bits)
 {
-	double fill, scale, target, qp;
+	double fill, scale, target, qp = 0.0;
+	int have_model_qp = 0;
 
 	if (rc == NULL)
 		return -1;
@@ -810,7 +931,9 @@ int ext_rate_control_pre(ExtRateControl *rc, int is_intra, size_t overhead_bits)
 	if (rc->have_complexity_x && !is_intra)
 	{
 		qp = rc->slope * (rc->complexity_x - log2(target));
-		rc->current_qp = (int)lround(qp);
+		have_model_qp = 1;
+		/* With the fill, round up; the fraction becomes the region below. */
+		rc->current_qp = fill_on(rc) ? (int)ceil(qp - 1e-6) : (int)lround(qp);
 	}
 	else
 		rc->current_qp = (rc->prev_qp >= 0) ? rc->prev_qp : 32;
@@ -870,6 +993,13 @@ int ext_rate_control_pre(ExtRateControl *rc, int is_intra, size_t overhead_bits)
 	rc->cap_attempts = 0;
 	rc->prev_attempt_qp = -1;
 	rc->prev_attempt_bits = 0;
+
+	/* The fraction, unless a clamp moved the whole part away from the model's. */
+	rc->fill_step = 0;
+	rc->prev_attempt_fill = 0;
+	if (fill_on(rc) && have_model_qp && !is_intra
+	 && (rc->current_qp == (int)ceil(qp - 1e-6)))
+		rc->fill_step = fill_step_for(rc, rc->current_qp, qp, rc->slope);
 
 	return rc->current_qp;
 }
@@ -971,14 +1101,16 @@ static double local_slope(ExtRateControl const *rc, size_t bits)
 		return 0.0;
 
 	dqp = (double)(rc->current_qp) - (double)(rc->prev_attempt_qp);
-	ratio = (double)(rc->prev_attempt_bits) / (double)bits;
+	/* In log2, with each attempt's fill region taken out. */
+	ratio = log2((double)(rc->prev_attempt_bits) / (double)bits)
+	      - fill_l(rc, rc->prev_attempt_fill, rc->slope) + fill_l(rc, rc->fill_step, rc->slope);
 
 	/* At least one quantiser step and a size that actually moved: below that
 	 * the logarithm turns rounding into an arbitrary gradient. */
-	if ((dqp < 1.0) || (ratio < 1.1))
+	if ((dqp < 1.0) || (ratio < log2(1.1)))
 		return 0.0;
 
-	obs = dqp / log2(ratio);
+	obs = dqp / ratio;
 	return ((obs < 0.2) || (obs > 12.0)) ? 0.0 : obs;
 }
 
@@ -1015,6 +1147,7 @@ int ext_rate_control_check(ExtRateControl *rc, size_t bits, size_t overhead_bits
 	double ceiling, remaining;
 	double wire;
 	int qp, qp_max;
+	int step = 0;
 
 	if (rc == NULL)
 		return 0;
@@ -1040,22 +1173,24 @@ int ext_rate_control_check(ExtRateControl *rc, size_t bits, size_t overhead_bits
 		                      ? (rc->bucket_cap - rc->bucket) : 0.0;
 		int const qmax_now = is_intra ? rc->qp_max_intra : rc->qp_max_inter;
 
-		if (!((rc->bucket <= 0.0) && (wire > room_now) && (rc->current_qp < qmax_now)))
+		if (!((rc->bucket <= 0.0) && (wire > room_now)
+		      && ((rc->current_qp < qmax_now) || (rc->fill_step > 0))))
 		{
 			IMX_VPU_API_LOG("new CBR:   attempt %d qp %d bits %zu - attempt limit, accepted",
 			                rc->cap_attempts, rc->current_qp, bits);
 			return 0;
 		}
-		IMX_VPU_API_LOG("new CBR:   attempt %d qp %d bits %zu - past the attempt limit, but "
-		                "the buffer is empty and qp %d is still below %d, so accepting would "
-		                "overflow for certain",
-		                rc->cap_attempts, rc->current_qp, bits, rc->current_qp, qmax_now);
+		IMX_VPU_API_LOG("new CBR:   attempt %d qp %d fill %d bits %zu - past the attempt limit, "
+		                "but the buffer is empty and the picture can still shrink (qp_max %d), "
+		                "so accepting would overflow for certain",
+		                rc->cap_attempts, rc->current_qp, rc->fill_step, bits, qmax_now);
 	}
 
 	slope_observe(rc, bits);
 
 	qp_max = is_intra ? rc->qp_max_intra : rc->qp_max_inter;
-	if (rc->current_qp >= qp_max)
+	/* A fill region still applied is a move left even at qp_max. */
+	if ((rc->current_qp >= qp_max) && (rc->fill_step == 0))
 	{
 		IMX_VPU_API_LOG("new CBR:   attempt %d qp %d bits %zu - at qp_max, accepted",
 		                rc->cap_attempts, rc->current_qp, bits);
@@ -1186,6 +1321,41 @@ int ext_rate_control_check(ExtRateControl *rc, size_t bits, size_t overhead_bits
 	 * to the coarsest quantiser allowed and let the guard end it. */
 	if (ceiling < 1.0)
 		qp = qp_max;
+	else if (fill_on(rc) && !is_intra)
+	{
+		/* The same step with a real QP: qe is the attempt in hand as a
+		 * uniform QP, qt the one that lands at aim * ceiling; its whole part
+		 * is the QP, its fraction the region. Keyframes keep the whole-QP
+		 * ladder below, as in pre(). */
+		double const g = local_slope(rc, bits);
+		double const gg = (g > 0.0) ? g : rc->slope;
+		double const aim = (g > 0.0) ? rc->fill_aim2 : rc->fill_aim1;
+		double const qe = (double)(rc->current_qp) - gg * fill_l(rc, rc->fill_step, gg);
+		double const qt = qe + gg * log2(wire / (aim * ceiling));
+
+		qp = (int)ceil(qt - 1e-6);
+		if (qp < rc->current_qp) qp = rc->current_qp;
+		if (qp >= qp_max)
+		{
+			qp = qp_max;
+			step = (qt < (double)qp_max) ? fill_step_for(rc, qp, qt, gg) : 0;
+		}
+		else
+			step = fill_step_for(rc, qp, qt, gg);
+
+		/* Always smaller than the attempt in hand: one step, or one QP. */
+		if ((qp == rc->current_qp) && (step >= rc->fill_step))
+		{
+			if (rc->fill_step > 0)
+				step = rc->fill_step - 1;
+			else
+			{
+				qp = rc->current_qp + 1;
+				if (qp > qp_max) qp = qp_max;
+				step = 0;
+			}
+		}
+	}
 	else
 	{
 		/* Steer by this picture's own gradient once it has one, and fall back
@@ -1209,13 +1379,17 @@ int ext_rate_control_check(ExtRateControl *rc, size_t bits, size_t overhead_bits
 		if (qp > qp_max) qp = qp_max;
 	}
 
-	IMX_VPU_API_LOG("new CBR:   attempt %d qp %d bits %zu ceiling %.0f - over by %.2fx, re-encoding at qp %d",
-	                rc->cap_attempts, rc->current_qp, bits, ceiling, wire / ceiling, qp);
+	IMX_VPU_API_LOG("new CBR:   attempt %d qp %d fill %d bits %zu ceiling %.0f - over by %.2fx, "
+	                "re-encoding at qp %d fill %d",
+	                rc->cap_attempts, rc->current_qp, rc->fill_step, bits, ceiling, wire / ceiling,
+	                qp, step);
 
 	rc->prev_attempt_qp = rc->current_qp;
 	rc->prev_attempt_bits = bits;
+	rc->prev_attempt_fill = rc->fill_step;
 
 	rc->current_qp = qp;
+	rc->fill_step = step;
 	rc->cap_attempts++;
 	rc->num_reencodes++;
 
@@ -1232,6 +1406,9 @@ static void observe_complexity(ExtRateControl *rc, double b, int is_intra, ExtRa
 	{
 		double coded = (double)(rc->total_blocks);
 		double per_block, x;
+
+		/* Learn from the uniform picture, not the finer region as content. */
+		b /= pow(2.0, fill_l(rc, rc->fill_step, rc->slope));
 
 		if ((cu_stats != NULL) && (cu_stats->total_blocks > cu_stats->skip_blocks))
 			coded = (double)(cu_stats->total_blocks - cu_stats->skip_blocks);
@@ -1292,6 +1469,17 @@ void ext_rate_control_post(ExtRateControl *rc, size_t bits, size_t overhead_bits
 		return;
 
 	observe_complexity(rc, b, is_intra, cu_stats);
+
+	if (rc->fill_step > 0)
+	{
+		rc->num_fill_pics++;
+		rc->sum_fill_share += fill_share(rc, rc->fill_step);
+	}
+	if (fill_on(rc) && !is_intra && (rc->cap_share > 0.0) && (rc->bucket_cap > 0.0))
+	{
+		rc->sum_fill_land += wire / (rc->cap_share * rc->bucket_cap);
+		rc->num_fill_land++;
+	}
 
 	/* The forecast for the next keyframe, and the end of any drain that was
 	 * waiting for this one. Recorded from the picture rather than the whole
