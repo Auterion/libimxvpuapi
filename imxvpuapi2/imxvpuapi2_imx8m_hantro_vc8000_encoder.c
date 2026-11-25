@@ -316,6 +316,14 @@ struct _ImxVpuApiEncoder
 	ExtRateControl new_cbr;
 	VCEncRateCtrl cached_rate_ctrl;
 
+	/* Centre QP fill (EXT_RC_FILL): roi2Area, enabled before the stream
+	 * starts and then moved over fill_rect (in CTBs) with delta -1, or left
+	 * with delta 0. fill_applied_step is what the encoder holds, 0 for none. */
+	BOOL fill_active;
+	int fill_steps;
+	int fill_applied_step;
+	struct { int left, right, top, bottom; } fill_rect[EXT_RATE_CONTROL_FILL_MAX_STEPS];
+
 	/* Stream continuity across encoder instances - see
 	 * ImxVpuApiEncSessionState. Only filled in at rate_control_mode 1, where
 	 * a resolution change must not restart either the rate control or the
@@ -684,6 +692,154 @@ static void init_encoder_input(ImxVpuApiEncoder *encoder)
 }
 
 
+/* Builds the fill's regions for any resolution: up to 32 nested centred
+ * rectangles of the picture's aspect, side sqrt(k/32) of the CTB grid (64 px
+ * h.265, 16 px h.264), share measured in pixels with partial CTBs clipped.
+ * Rectangles that do not grow the share or contain the one before are
+ * skipped, as is the whole picture (that is just the next QP down).
+ *
+ * roi2Area is enabled here with delta 0 because that is what puts
+ * cu_qp_delta_enabled_flag in the PPS (hevcencapi.c:2324), and the vendor
+ * refuses to toggle an area once the stream runs (hevcencapi.c:1397). roi2Qp
+ * -1, since a non-negative value is an absolute area QP
+ * (encasiccontroller.c:787-789). On failure the fill stays off. */
+static void setup_centre_fill(ImxVpuApiEncoder *encoder)
+{
+	ImxVpuApiEncOpenParams const *open_params = &encoder->open_params;
+	int const unit = (open_params->compression_format == IMX_VPU_API_COMPRESSION_FORMAT_H264) ? 16 : 64;
+	int const width = (int)(open_params->frame_width);
+	int const height = (int)(open_params->frame_height);
+	int const cols = (width + unit - 1) / unit;
+	int const rows = (height + unit - 1) / unit;
+	double shares[EXT_RATE_CONTROL_FILL_MAX_STEPS];
+	int n = 0, k;
+	VCEncRet enc_ret;
+
+	/* The vendor GDR rewrites the areas every picture; mode 1 never runs it. */
+	if (encoder->vendor_gdr_active)
+	{
+		IMX_VPU_API_WARNING("centre QP fill: not available with the encoder's own GDR; off");
+		ext_rate_control_set_fill(&encoder->new_cbr, 0, NULL);
+		return;
+	}
+
+	for (k = 1; (k <= 32) && (n < EXT_RATE_CONTROL_FILL_MAX_STEPS); ++k)
+	{
+		double const f = sqrt((double)k / 32.0);
+		int wc = (int)lround(cols * f), hc = (int)lround(rows * f);
+		int left, top, px_w, px_h;
+		double share;
+
+		if (wc < 1) wc = 1;
+		if (hc < 1) hc = 1;
+		if (wc > cols) wc = cols;
+		if (hc > rows) hc = rows;
+		/* Integer halving keeps the rectangles nested. */
+		left = (cols - wc) / 2;
+		top = (rows - hc) / 2;
+
+		px_w = (left + wc) * unit;
+		px_h = (top + hc) * unit;
+		if (px_w > width) px_w = width;
+		if (px_h > height) px_h = height;
+		px_w -= left * unit;
+		px_h -= top * unit;
+		share = ((double)px_w * (double)px_h) / ((double)width * (double)height);
+
+		if (share >= 1.0 - 1e-9)
+			break;
+		if ((n > 0) && ((share <= shares[n - 1] + 1e-9)
+		             || (left > encoder->fill_rect[n - 1].left) || (top > encoder->fill_rect[n - 1].top)))
+			continue;
+
+		shares[n] = share;
+		encoder->fill_rect[n].left = left;
+		encoder->fill_rect[n].right = left + wc - 1;
+		encoder->fill_rect[n].top = top;
+		encoder->fill_rect[n].bottom = top + hc - 1;
+		n++;
+	}
+
+	if (n == 0)
+	{
+		ext_rate_control_set_fill(&encoder->new_cbr, 0, NULL);
+		return;
+	}
+
+	encoder->cached_coding_ctrl.roi2Area.enable = 1;
+	encoder->cached_coding_ctrl.roi2Area.left = (u32)(encoder->fill_rect[0].left);
+	encoder->cached_coding_ctrl.roi2Area.right = (u32)(encoder->fill_rect[0].right);
+	encoder->cached_coding_ctrl.roi2Area.top = (u32)(encoder->fill_rect[0].top);
+	encoder->cached_coding_ctrl.roi2Area.bottom = (u32)(encoder->fill_rect[0].bottom);
+	encoder->cached_coding_ctrl.roi2DeltaQp = 0;
+	encoder->cached_coding_ctrl.roi2Qp = -1;
+
+	enc_ret = VCEncSetCodingCtrl(encoder->encoder, &(encoder->cached_coding_ctrl));
+	if (enc_ret != VCENC_OK)
+	{
+		IMX_VPU_API_ERROR("centre QP fill: the encoder refused roi2Area: %s (%d); off",
+		                  vcenc_retval_to_string(enc_ret), (int)enc_ret);
+		encoder->cached_coding_ctrl.roi2Area.enable = 0;
+		VCEncSetCodingCtrl(encoder->encoder, &(encoder->cached_coding_ctrl));
+		ext_rate_control_set_fill(&encoder->new_cbr, 0, NULL);
+		return;
+	}
+
+	ext_rate_control_set_fill(&encoder->new_cbr, n, shares);
+	encoder->fill_active = TRUE;
+	encoder->fill_steps = n;
+	encoder->fill_applied_step = 0;
+
+	IMX_VPU_API_INFO("centre QP fill: %d nested centred regions one QP finer, %.1f%% to %.1f%% of the picture",
+	                 n, 100.0 * shares[0], 100.0 * shares[n - 1]);
+}
+
+
+/* Hands the controller's fill step to the encoder if it changed. On refusal
+ * the old area stays and the controller is told so. */
+static void apply_centre_fill(ImxVpuApiEncoder *encoder)
+{
+	VCEncPictureArea *area = &(encoder->cached_coding_ctrl.roi2Area);
+	int step = ext_rate_control_fill_step(&encoder->new_cbr);
+	int const old_step = encoder->fill_applied_step;
+	VCEncRet enc_ret;
+
+	if (!encoder->fill_active || (step == old_step))
+		return;
+
+	if (step > encoder->fill_steps)
+		step = encoder->fill_steps;
+
+	/* With no step the area stays where it was and only the delta goes. */
+	if (step > 0)
+	{
+		area->left = (u32)(encoder->fill_rect[step - 1].left);
+		area->right = (u32)(encoder->fill_rect[step - 1].right);
+		area->top = (u32)(encoder->fill_rect[step - 1].top);
+		area->bottom = (u32)(encoder->fill_rect[step - 1].bottom);
+	}
+	encoder->cached_coding_ctrl.roi2DeltaQp = (step > 0) ? -1 : 0;
+
+	enc_ret = VCEncSetCodingCtrl(encoder->encoder, &(encoder->cached_coding_ctrl));
+	if (enc_ret != VCENC_OK)
+	{
+		IMX_VPU_API_ERROR("centre QP fill: could not set region %d: %s (%d)",
+		                  step, vcenc_retval_to_string(enc_ret), (int)enc_ret);
+		if (old_step > 0)
+		{
+			area->left = (u32)(encoder->fill_rect[old_step - 1].left);
+			area->right = (u32)(encoder->fill_rect[old_step - 1].right);
+			area->top = (u32)(encoder->fill_rect[old_step - 1].top);
+			area->bottom = (u32)(encoder->fill_rect[old_step - 1].bottom);
+		}
+		encoder->cached_coding_ctrl.roi2DeltaQp = (old_step > 0) ? -1 : 0;
+		encoder->new_cbr.fill_step = old_step;
+		return;
+	}
+	encoder->fill_applied_step = step;
+}
+
+
 static ImxVpuApiEncReturnCodes init_vcenc_instance(ImxVpuApiEncoder *encoder,
                                                    VCEncPictureType encoder_pixel_format,
                                                    ImxVpuApiFramebufferMetrics const *fb_metrics)
@@ -989,6 +1145,14 @@ static ImxVpuApiEncReturnCodes init_vcenc_instance(ImxVpuApiEncoder *encoder,
 		 * VCEncGetRateCtrl happens to fill in. */
 		encoder->cached_rate_ctrl = rate_control_config;
 	}
+
+
+	/* Centre QP fill: after the rate control exists, before the PPS is written. */
+	encoder->fill_active = FALSE;
+	encoder->fill_steps = 0;
+	encoder->fill_applied_step = 0;
+	if (encoder->new_cbr_active && ext_rate_control_fill_requested(&encoder->new_cbr))
+		setup_centre_fill(encoder);
 
 
 	/* Set up preprocessing configuration. */
@@ -1501,6 +1665,14 @@ void imx_vpu_api_enc_close(ImxVpuApiEncoder *encoder)
 			rc->rate_err_ema * 100.0,
 			(rc->num_debt_lifts > 0) ? (rc->sum_fill_used / (double)(rc->num_debt_lifts)) : 0.0
 		);
+
+		if (rc->fill_steps > 0)
+			IMX_VPU_API_INFO(
+				"new CBR summary: centre QP fill on %lu of %lu pictures (mean %.1f%% of the picture "
+				"one QP finer); inter pictures landed at %.2f of the per-picture cap on average",
+				rc->num_fill_pics, rc->num_pictures,
+				(rc->num_fill_pics > 0) ? (100.0 * rc->sum_fill_share / (double)(rc->num_fill_pics)) : 0.0,
+				(rc->num_fill_land > 0) ? (rc->sum_fill_land / (double)(rc->num_fill_land)) : 0.0);
 
 		/* Only when the buffer was actually breached, and worth two different
 		 * sentences: the permitted case is an operating point the content
@@ -2739,6 +2911,8 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 	{
 		int qp = ext_rate_control_pre(&encoder->new_cbr, (encoder_input->codingType == VCENC_INTRA_FRAME), overhead_bits);
 
+		apply_centre_fill(encoder);
+
 		encoder->cached_rate_ctrl.qpHdr = qp;
 		enc_ret = VCEncSetRateCtrl(encoder->encoder, &(encoder->cached_rate_ctrl));
 		if (enc_ret != VCENC_OK)
@@ -2767,11 +2941,15 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 	{
 		int const is_intra = (encoder_output.codingType == VCENC_INTRA_FRAME);
 		int kept_qp = encoder->cached_rate_ctrl.qpHdr;
+		int kept_fill = encoder->fill_applied_step;
 		int qp;
 
 		while ((qp = ext_rate_control_check(&encoder->new_cbr, (size_t)(encoder_output.streamSize) * 8, overhead_bits, is_intra)) > 0)
 		{
 			VCEncOut retry_output;
+
+			/* Also when the QP did not move: a re-encode may change the region alone. */
+			apply_centre_fill(encoder);
 
 			encoder->cached_rate_ctrl.qpHdr = qp;
 			if (VCEncSetRateCtrl(encoder->encoder, &(encoder->cached_rate_ctrl)) != VCENC_OK)
@@ -2784,12 +2962,14 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 
 			encoder_output = retry_output;
 			kept_qp = qp;
+			kept_fill = encoder->fill_applied_step;
 		}
 
 		/* An attempt that was proposed but never produced output must not be
 		 * what the model learns from - the QP the kept bits were coded at is
-		 * the only one that describes them. */
+		 * the only one that describes them, and likewise the fill region. */
 		encoder->new_cbr.current_qp = kept_qp;
+		encoder->new_cbr.fill_step = kept_fill;
 
 		/* The ladder's last rung. The picture is at qp_max and still does
 		 * not fit in the buffer, so it is not sent: there is nothing left
@@ -2918,7 +3098,8 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 		);
 
 		IMX_VPU_API_LOG(
-			"new CBR: picture %" PRId32 " qp %d target %d bits %u (%+d%%) HRD buffer %.0f/%.0f kbit coded %u/%u",
+			"new CBR: picture %" PRId32 " qp %d target %d bits %u (%+d%%) HRD buffer %.0f/%.0f kbit coded %u/%u "
+			"fill %d",
 			encoder->num_encoded_pictures,
 			encoder->new_cbr.current_qp,
 			ext_rate_control_target(&encoder->new_cbr),
@@ -2928,7 +3109,8 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 				        * 100.0 / ext_rate_control_target(&encoder->new_cbr))
 				: 0,
 			encoder->new_cbr.bucket / 1000.0, encoder->new_cbr.bucket_cap / 1000.0,
-			total_blocks - cu_stats.skip_blocks, total_blocks
+			total_blocks - cu_stats.skip_blocks, total_blocks,
+			encoder->new_cbr.fill_step
 		);
 	}
 

@@ -56,6 +56,9 @@
 extern "C" {
 #endif
 
+/* Most steps a caller may give the centre QP fill; see ext_rate_control_set_fill(). */
+#define EXT_RATE_CONTROL_FILL_MAX_STEPS 64
+
 /* Per-picture block statistics the controller budgets against. Counts are in
  * whatever fixed-size block the encoder reports, so long as the unit is
  * consistent: only ratios of these are used. */
@@ -384,6 +387,30 @@ typedef struct
 	double sum_bits;
 	double sum_fill;
 	double max_fill;
+
+	/* --- Centre QP fill (EXT_RC_FILL, opt-in).
+	 *
+	 * One whole QP step changes the size ~x1.6 here (it doubles every ~1.4
+	 * QP), so a whole-step re-encode lands at a median 0.76 of the ceiling.
+	 * The fill uses the model QP as a real number: the whole part is the
+	 * picture QP, the fraction a centred region coded one QP finer. Whatever
+	 * the model learns is first corrected back to the uniform picture. */
+	int fill_req;
+	/* Area share of each region, increasing and below 1: step k (1..fill_steps)
+	 * is fill_share_tab[k - 1]. fill_steps 0 is off. */
+	int fill_steps;
+	double fill_share_tab[EXT_RATE_CONTROL_FILL_MAX_STEPS];
+	/* Share of the ceiling a re-encode aims at, steering by the learned slope
+	 * (aim1) or by the picture's own gradient (aim2). */
+	double fill_aim1;
+	double fill_aim2;
+	/* The step of the attempt in hand (0: none), and of the attempt before. */
+	int fill_step;
+	int prev_attempt_fill;
+	unsigned long num_fill_pics;
+	double sum_fill_share;
+	double sum_fill_land;
+	unsigned long num_fill_land;
 }
 ExtRateControl;
 
@@ -402,9 +429,21 @@ int ext_rate_control_pre(ExtRateControl *rc, int is_intra, size_t overhead_bits)
  * for logging and diagnostics only. */
 int ext_rate_control_target(ExtRateControl const *rc);
 
+/* Centre QP fill. If ext_rate_control_fill_requested(), the caller builds
+ * nested centred regions it can code one QP finer and passes their area
+ * shares, increasing and below 1, to ext_rate_control_set_fill(); steps 0
+ * leaves the fill off. ext_rate_control_fill_step() is the region for the
+ * next attempt (1..steps, 0: none), set by ext_rate_control_pre() and by every
+ * ext_rate_control_check() that asks for a re-encode. */
+int ext_rate_control_fill_requested(ExtRateControl const *rc);
+void ext_rate_control_set_fill(ExtRateControl *rc, int steps, double const *shares);
+int ext_rate_control_fill_step(ExtRateControl const *rc);
+
 /* Call with the size of the picture just encoded, and with whatever the
  * caller will prepend to it on the way to the link. Returns a QP to re-encode
- * it at, or 0 to keep it. Loop until it returns 0.
+ * it at, or 0 to keep it. Loop until it returns 0. With the fill on, a
+ * re-encode may keep the QP and only shrink the region, so the caller applies
+ * ext_rate_control_fill_step() before every attempt.
  *
  * The ceiling is applied to the two together, because that is what the buffer
  * has to hold; the QP gradient is learned from the picture alone. */
