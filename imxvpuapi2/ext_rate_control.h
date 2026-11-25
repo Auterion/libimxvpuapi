@@ -384,6 +384,40 @@ typedef struct
 	double sum_bits;
 	double sum_fill;
 	double max_fill;
+
+	/* --- Refresh band planning: plan the intra refresh band ahead ---
+	 * On unless EXT_RC_PLAN=0; see ext_rate_control_set_band(). */
+	int plan_enable;
+	int plan_dense;     /* every picture carries a band: planner stood down */
+	double plan_band_share;
+	double plan_slope;
+	int plan_gap;
+	double plan_static_on, plan_static_off;
+	int plan_static;
+	double plan_intra_win[32];
+	unsigned int plan_intra_n, plan_intra_head;
+	int cur_band_top;
+	unsigned int cur_band_blocks;
+	int cur_band_period;
+	double cur_band_ceiling;
+	struct { int qp; double bits; unsigned long pic; unsigned int blocks; int valid; } plan_hist[64];
+	unsigned long plan_num_planned, plan_num_floored, plan_static_pics;
+	/* Scene cuts (EXT_RC_PLAN_CUT): a cut invalidates the band history; the
+	 * positions not refreshed since are forecast from the cut picture (the
+	 * band's area of it) plus the latest band-free picture (the rest). */
+	int plan_cut_enable;
+	double plan_cut_level, plan_cut_jump, plan_free_slope;
+	double plan_share_last[3];
+	unsigned int plan_share_n;
+	int plan_cut_valid;
+	unsigned long plan_cut_pic;
+	int plan_seed_qp;
+	double plan_seed_bits;
+	unsigned int plan_seed_blocks;
+	int plan_free_valid, plan_free_qp;
+	double plan_free_bits;
+	unsigned long plan_free_pic;
+	unsigned long plan_num_cuts, plan_num_seeded;
 }
 ExtRateControl;
 
@@ -401,6 +435,17 @@ int ext_rate_control_pre(ExtRateControl *rc, int is_intra, size_t overhead_bits)
 /* Bits the rate control aimed for. Valid after ext_rate_control_pre();
  * for logging and diagnostics only. */
 int ext_rate_control_target(ExtRateControl const *rc);
+
+/* Refresh band planning. Tell the controller about the refresh band of the
+ * next picture, before ext_rate_control_pre(). top is the band's first CTB
+ * row, -1 for a picture without a band, -2 for a band that must not be
+ * planned (a requested region or a full refresh). band_blocks is the band's
+ * area in the 8x8 units of ExtRateControlStats - the forced intra the encoder
+ * will report, which the content detector must not mistake for motion.
+ * period is the refresh period in pictures and band_pictures how many of
+ * them carry a band; with a band in every picture the planner stands down.
+ * A no-op with planning off (EXT_RC_PLAN=0). */
+void ext_rate_control_set_band(ExtRateControl *rc, int top, unsigned int band_blocks, int period, int band_pictures);
 
 /* Call with the size of the picture just encoded, and with whatever the
  * caller will prepend to it on the way to the link. Returns a QP to re-encode

@@ -1502,6 +1502,13 @@ void imx_vpu_api_enc_close(ImxVpuApiEncoder *encoder)
 			(rc->num_debt_lifts > 0) ? (rc->sum_fill_used / (double)(rc->num_debt_lifts)) : 0.0
 		);
 
+		if (rc->plan_enable)
+			IMX_VPU_API_INFO("new CBR summary: plan: static on %lu pictures, "
+			                 "%lu band pictures planned (%lu seeded from a cut), %lu pictures held at the floor, "
+			                 "%lu cuts",
+			                 rc->plan_static_pics, rc->plan_num_planned, rc->plan_num_seeded,
+			                 rc->plan_num_floored, rc->plan_num_cuts);
+
 		/* Only when the buffer was actually breached, and worth two different
 		 * sentences: the permitted case is an operating point the content
 		 * cannot meet, and anything beyond it is the rule failing. */
@@ -2587,6 +2594,10 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 	}
 
 	int sei_refresh = 0, sei_top = 0, sei_bottom = 0;
+	/* Refresh band planning: the band this picture carries, for the rate
+	 * control - -1 none, -2 a band it must not plan (requested or full). */
+	int rc_band_top = -1;
+	unsigned int rc_band_blocks = 0;
 
 	/* One refresh scheduler for what used to be three modes. An IDR
 	 * refreshes the whole picture by itself, so the sweep sits that picture
@@ -2664,6 +2675,17 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 
 		if (band.apply)
 		{
+			{
+				int const unit = (encoder->refresh_cfg.unit_pixels > 0) ? encoder->refresh_cfg.unit_pixels : 64;
+				int lines = (band.bottom + 1) * unit;
+				int cols = (band.right + 1) * unit;
+				if (lines > (int)(encoder->open_params.frame_height)) lines = (int)(encoder->open_params.frame_height);
+				if (cols > (int)(encoder->open_params.frame_width)) cols = (int)(encoder->open_params.frame_width);
+				lines -= band.top * unit;
+				cols -= band.left * unit;
+				rc_band_blocks = (lines > 0 && cols > 0) ? (unsigned int)((lines / 8) * (cols / 8)) : 0;
+				rc_band_top = (band.forced || encoder->full_refresh_coded) ? -2 : band.top;
+			}
 			encoder->cached_coding_ctrl.intraArea.enable = 1;
 			encoder->cached_coding_ctrl.intraArea.left   = band.left;
 			encoder->cached_coding_ctrl.intraArea.right  = band.right;
@@ -2737,6 +2759,9 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 	/* New CBR: pick this picture's QP before handing it to the encoder. */
 	if (encoder->new_cbr_active)
 	{
+		ext_rate_control_set_band(&encoder->new_cbr, rc_band_top, rc_band_blocks,
+		                          encoder->refresh_cfg.period,
+		                          encoder->refresh_active ? encoder->refresh_state.num_steps : 0);
 		int qp = ext_rate_control_pre(&encoder->new_cbr, (encoder_input->codingType == VCENC_INTRA_FRAME), overhead_bits);
 
 		encoder->cached_rate_ctrl.qpHdr = qp;
@@ -2918,7 +2943,7 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 		);
 
 		IMX_VPU_API_LOG(
-			"new CBR: picture %" PRId32 " qp %d target %d bits %u (%+d%%) HRD buffer %.0f/%.0f kbit coded %u/%u",
+			"new CBR: picture %" PRId32 " qp %d target %d bits %u (%+d%%) HRD buffer %.0f/%.0f kbit coded %u/%u intra %u rd %u",
 			encoder->num_encoded_pictures,
 			encoder->new_cbr.current_qp,
 			ext_rate_control_target(&encoder->new_cbr),
@@ -2928,7 +2953,8 @@ ImxVpuApiEncReturnCodes imx_vpu_api_enc_encode(ImxVpuApiEncoder *encoder, size_t
 				        * 100.0 / ext_rate_control_target(&encoder->new_cbr))
 				: 0,
 			encoder->new_cbr.bucket / 1000.0, encoder->new_cbr.bucket_cap / 1000.0,
-			total_blocks - cu_stats.skip_blocks, total_blocks
+			total_blocks - cu_stats.skip_blocks, total_blocks,
+			cu_stats.intra_blocks, cu_stats.rd_cost
 		);
 	}
 
